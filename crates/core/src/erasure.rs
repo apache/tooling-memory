@@ -1,11 +1,12 @@
 //! What remains after an erasure. Demotion keeps the body behind a tombstone and can be
 //! undone; erasure removes the body from every version and cannot. The record keeps
-//! three things in its place: the stub, the entry's frontmatter with an empty body and
-//! `status: erased`; the erasure record, who asked, why as a reason class, and when; and
-//! the receipt, what was covered and what could not be reached. The last two are this
-//! file, kept beside the record as `.erasures/<id>.yaml` in the entry's domain.
+//! three things in its place: the stub, an id, `status: erased` and the access label,
+//! with no body; the erasure record, who asked, why as a reason class, and when; and
+//! the receipt, what was covered, what was withheld downstream, the sends that left, and
+//! what could not be reached. The last two are this file, kept beside the record as
+//! `.erasures/<id>.yaml` in the entry's domain.
 
-use crate::{Entry, Status};
+use crate::{Entry, Reach, Status, TrustTier};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -51,23 +52,32 @@ impl std::fmt::Display for Reason {
     }
 }
 
-/// The stub that stands where the entry was: its frontmatter with no body, no summary,
-/// and `status: erased`. When the erasure was asked for by the person it concerns, the
-/// stub keeps neither the author nor the sources, since those are about that person too;
-/// the title goes with them, and goes too when the material was above what the record
-/// may hold, since a title says what the body said.
+/// The stub that stands where the entry was: an id, the erased marker and the access
+/// label, with the audit metadata that repeats nothing of the entry. It keeps `id`,
+/// `type`, `domain`, `created`, `classification`, `supersedes` and `session`, and
+/// `status: erased`. The author becomes `erased` and the tier raw. The title, the
+/// summary, the citations, the origin, the confidence, the review date, the policy
+/// context and the body go, for every reason class: a title says what the body said, a
+/// citation or an origin can be a link that carries a credential, and an author is
+/// about a person. The owner goes, because an owner is a person too. The reach becomes the fleet's and the held task goes: a stub has
+/// nothing to keep from a reader, and its domain, its label and its status still decide
+/// who reads it. The reason stays on the receipt.
 #[must_use]
-pub fn stub(entry: &Entry, reason: Reason) -> Entry {
+pub fn stub(entry: &Entry, _reason: Reason) -> Entry {
     let mut front = entry.front.clone();
     front.status = Some(Status::Erased);
+    front.author = "erased".into();
+    front.trust_tier = TrustTier::Raw;
+    front.cites.clear();
+    front.title = None;
     front.summary = None;
-    if matches!(reason, Reason::Requested | Reason::Sensitive) {
-        front.title = None;
-    }
-    if reason == Reason::Requested {
-        front.author = "erased".into();
-        front.cites.clear();
-    }
+    front.origin = None;
+    front.confidence = None;
+    front.review_by = None;
+    front.policy_context.clear();
+    front.reach = Reach::Fleet;
+    front.owner = None;
+    front.task = None;
     Entry {
         front,
         body: String::new(),
@@ -94,6 +104,24 @@ pub fn body_digest(body: &str) -> String {
     crate::digest(body.trim())
 }
 
+/// The sends of one session to one destination, as the log of one domain holds them:
+/// what lineage gives for content that left the perimeter and cannot be called back.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Sent {
+    /// The domain whose log holds the send events.
+    pub domain: String,
+    /// Where they went.
+    pub to: String,
+    /// The session that sent.
+    pub session: String,
+    /// How many send events.
+    pub count: u64,
+    /// The sequence number of the first of them in that log.
+    pub first: u64,
+    /// The sequence number of the last.
+    pub last: u64,
+}
+
 /// The erasure record and the receipt, together.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Receipt {
@@ -110,9 +138,25 @@ pub struct Receipt {
     pub reason: Reason,
     /// Every version whose body was removed, the current one first.
     pub removed: Vec<Removed>,
-    /// Entries that cite the erased one, flagged for review rather than re-derived here.
-    #[serde(default)]
+    /// What a binary from before entries were withheld wrote: the entries that cite the
+    /// erased one, which it flagged for review. Read from a receipt on disk, and written
+    /// by no erasure now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub flagged: Vec<String>,
+    /// The entries this erasure withheld from retrieval: each names the erased one, or
+    /// was written by a session after that session read it. A write that such a session
+    /// makes after the erasure is added here when it lands.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub withheld: Vec<String>,
+    /// The entries downstream that the erasure did not withhold, listed for whoever
+    /// follows up: those two steps of lineage or more from the erased one, and a
+    /// verified rule of the policy one step away, which stays in force.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub further: Vec<String>,
+    /// The sends in the lineage forward of the erased entry, at any depth: copies that
+    /// left the perimeter and cannot be called back, with where each went.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sends: Vec<Sent>,
     /// Copies this erasure could not reach, named so nobody believes it did.
     #[serde(default)]
     pub unresolved: Vec<String>,
@@ -177,6 +221,9 @@ mod tests {
             reason: Reason::Legal,
             removed: vec![],
             flagged: vec![],
+            withheld: vec![],
+            further: vec![],
+            sends: vec![],
             unresolved: vec![],
             promotion_whys_removed: 0,
             promotion_tasks_cleared: 0,
@@ -200,7 +247,10 @@ mod tests {
                 digest: "ab".repeat(32),
                 body_digest: Some(body_digest("The body.\n")),
             }],
-            flagged: vec!["mem-me-00000002".into()],
+            flagged: vec![],
+            withheld: vec!["mem-me-00000002".into()],
+            further: vec![],
+            sends: vec![],
             unresolved: vec!["exports issued before the erasure".into()],
             promotion_whys_removed: 0,
             promotion_tasks_cleared: 0,
@@ -216,25 +266,115 @@ mod tests {
         assert!(Receipt::from_yaml("nope: [").is_err());
     }
 
-    #[test]
-    fn a_stub_keeps_the_frontmatter_and_nothing_the_body_said() {
-        let text = "---\nid: mem-me-1\ntype: fact\ndomain: dom-me\nauthor: human:test:me\ncreated: 2026-10-01T10:00:00Z\ncites:\n- https://example.test/x\nsummary: the secret summary\ntitle: Alice's diagnosis\n---\nThe secret body.\n";
-        let e = Entry::parse(text).unwrap();
-        let s = stub(&e, Reason::Mistaken);
+    /// An entry with every field set: what a stub must not repeat is each findable.
+    const FULL: &str = "---\nid: mem-me-1\ntype: decision\ndomain: dom-me\nauthor: human:test:alice\nowner: human:test:bob\ncreated: 2026-10-01T10:00:00Z\ncites:\n- https://example.test/x?token=s3cret\n- mem-me-0\nsession: sess-abc@7\nreach: tap\ntask: task-me-9\nconfidence: high\ntrust_tier: verified\nreview_by: 2027-04-01\nsupersedes: mem-me-0\npolicy_context:\n- pol-L2-031\nclassification: restricted\norigin: github:example/repo#12\nsummary: the secret summary\ntitle: Alice's diagnosis\n---\nThe secret body.\n";
+
+    /// What a stub holds of `e`: the id, the marker and the label, and the audit
+    /// metadata, which repeats nothing of the entry.
+    fn holds_the_id_the_marker_the_label_and_the_audit_fields(s: &Entry, e: &Entry) {
+        assert_eq!(s.front.id, "mem-me-1");
         assert_eq!(s.front.status, Some(Status::Erased));
-        assert_eq!(s.body, "");
-        assert_eq!(s.front.summary, None);
-        assert_eq!(s.front.author, "human:test:me");
-        assert_eq!(s.front.cites.len(), 1);
-        assert_eq!(s.front.title.as_deref(), Some("Alice's diagnosis"));
-        let rendered = s.render();
-        assert!(!rendered.contains("secret"), "{rendered}");
-        assert_eq!(Entry::parse(&rendered).unwrap(), s, "a stub round-trips");
-        let r = stub(&e, Reason::Requested);
-        assert_eq!(r.front.author, "erased");
-        assert!(r.front.cites.is_empty());
-        assert_eq!(r.front.title, None, "a title is about the person too");
-        assert_eq!(stub(&e, Reason::Sensitive).front.title, None);
-        assert!(stub(&e, Reason::Legal).front.title.is_some());
+        assert_eq!(s.front.classification, crate::Label::Restricted);
+        assert_eq!(s.front.entry_type, e.front.entry_type);
+        assert_eq!(s.front.domain, "dom-me");
+        assert_eq!(s.front.created, e.front.created);
+        assert_eq!(s.front.supersedes.as_deref(), Some("mem-me-0"));
+        assert_eq!(s.front.session.as_deref(), Some("sess-abc@7"));
+    }
+
+    /// What a stub does not hold, whatever the reason.
+    fn holds_nothing_else_of_the_entry(s: &Entry, reason: Reason) {
+        assert_eq!(s.body, "", "{reason}");
+        assert_eq!(s.front.title, None, "{reason}: a title");
+        assert_eq!(s.front.summary, None, "{reason}: a summary");
+        assert!(s.front.cites.is_empty(), "{reason}: a citation");
+        assert_eq!(s.front.origin, None, "{reason}: an origin");
+        assert_eq!(s.front.author, "erased", "{reason}: an author");
+        assert_eq!(s.front.trust_tier, TrustTier::Raw, "{reason}: a tier");
+        assert_eq!(s.front.confidence, None, "{reason}");
+        assert_eq!(s.front.review_by, None, "{reason}");
+        assert!(s.front.policy_context.is_empty(), "{reason}");
+        assert_eq!(s.front.reach, Reach::Fleet, "{reason}: a reach");
+        assert_eq!(s.front.task, None, "{reason}: a held task");
+        assert_eq!(s.front.owner, None, "{reason}: an owner");
+    }
+
+    #[test]
+    fn a_stub_holds_the_id_the_marker_and_the_label_and_nothing_else_of_the_entry() {
+        let e = Entry::parse(FULL).unwrap();
+        assert_eq!(
+            (e.front.reach, e.front.task.as_deref()),
+            (Reach::Tap, Some("task-me-9"))
+        );
+        assert_eq!(e.front.owner.as_deref(), Some("human:test:bob"));
+        for reason in [
+            Reason::Requested,
+            Reason::Mistaken,
+            Reason::Sensitive,
+            Reason::Legal,
+        ] {
+            let s = stub(&e, reason);
+            holds_the_id_the_marker_the_label_and_the_audit_fields(&s, &e);
+            holds_nothing_else_of_the_entry(&s, reason);
+            let rendered = s.render();
+            for gone in [
+                "secret", "Alice", "alice", "example", "token", "github", "pol-L2", "2027",
+                "reach", "task", "owner", "bob",
+            ] {
+                assert!(!rendered.contains(gone), "{reason}: {gone} in {rendered}");
+            }
+            assert_eq!(Entry::parse(&rendered).unwrap(), s, "a stub round-trips");
+        }
+    }
+
+    #[test]
+    fn a_stub_written_before_the_stub_was_made_smaller_still_reads() {
+        // as the stub of an entry erased for the reason `mistaken` was written: with its
+        // title, its author and its citations
+        let text = "---\nid: mem-me-1\ntype: fact\ndomain: dom-me\nauthor: human:test:me\ncreated: 2026-10-01T10:00:00Z\ncites:\n- https://example.test/x\ntrust_tier: curated\nclassification: internal\nstatus: erased\ntitle: A title\n---\n";
+        let old = Entry::parse(text).unwrap();
+        assert_eq!(old.front.status, Some(Status::Erased));
+        assert_eq!(old.front.title.as_deref(), Some("A title"));
+        assert_eq!(old.front.cites.len(), 1);
+        assert_eq!(old.render(), text, "and is written again as it was");
+    }
+
+    #[test]
+    fn a_receipt_written_before_entries_were_withheld_still_reads() {
+        // as a binary from before wrote it: `flagged`, and none of the new fields
+        let text = "id: mem-me-00000001\ndomain: dom-me\nerased_at: 1970-01-01T00:00:00Z\nerased_by: human:test:me\nreason: requested\nremoved:\n- version: current\n  digest: abab\nflagged:\n- mem-me-00000002\nunresolved:\n- exports issued before the erasure\n";
+        let r = Receipt::from_yaml(text).unwrap();
+        assert_eq!(r.flagged, ["mem-me-00000002"]);
+        assert!(r.withheld.is_empty() && r.further.is_empty() && r.sends.is_empty());
+        assert!(r.is_finished());
+        assert_eq!(r.to_yaml(), text, "and is written again as it was");
+    }
+
+    #[test]
+    fn a_receipt_names_what_it_withheld_what_is_further_and_each_send_and_no_empty_list() {
+        let mut r = Receipt::from_yaml(
+            "id: mem-me-1\ndomain: dom-me\nerased_at: 1970-01-01T00:00:00Z\nerased_by: human:test:me\nreason: legal\nremoved: []\n",
+        )
+        .unwrap();
+        let bare = r.to_yaml();
+        for absent in ["flagged", "withheld", "further", "sends"] {
+            assert!(!bare.contains(absent), "{absent} in {bare}");
+        }
+        r.withheld = vec!["mem-me-2".into()];
+        r.further = vec!["mem-me-3".into()];
+        r.sends = vec![Sent {
+            domain: "dom-me".into(),
+            to: "export:internal".into(),
+            session: "sess-a".into(),
+            count: 2,
+            first: 7,
+            last: 9,
+        }];
+        let text = r.to_yaml();
+        assert!(text.contains("withheld:\n- mem-me-2\n"), "{text}");
+        assert!(text.contains("further:\n- mem-me-3\n"), "{text}");
+        assert!(text.contains("to: export:internal"), "{text}");
+        assert!(!text.contains("flagged"), "{text}");
+        assert_eq!(Receipt::from_yaml(&text).unwrap(), r);
     }
 }

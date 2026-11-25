@@ -19,6 +19,8 @@ mod curator;
 mod deputy;
 mod doctor;
 mod drift;
+mod duties;
+mod eval;
 mod eventlog;
 mod gofannon;
 mod golden;
@@ -33,6 +35,7 @@ mod mine;
 mod model;
 mod open;
 mod platform;
+mod positions;
 mod profiles;
 mod reenact;
 mod replay;
@@ -123,6 +126,7 @@ enum Kind {
     Method,
     Handoff,
     Policy,
+    Position,
 }
 
 impl From<Kind> for EntryType {
@@ -134,6 +138,7 @@ impl From<Kind> for EntryType {
             Kind::Method => EntryType::Method,
             Kind::Handoff => EntryType::Handoff,
             Kind::Policy => EntryType::Policy,
+            Kind::Position => EntryType::Position,
         }
     }
 }
@@ -306,6 +311,19 @@ enum Command {
         /// Capabilities this session carries, matched against task requirements.
         #[arg(long = "cap")]
         manifest: Vec<String>,
+        /// The position this session fills, `pos-<name>`, before it serves. A launcher
+        /// sets it; a session does not choose its own position.
+        #[arg(long, env = "MEMORY_POSITION")]
+        position: Option<String>,
+        /// The evaluation arm whose settings this session gets, before it serves:
+        /// no-memory, transcript-replay, t0-only, raw-only or full. A launcher sets it;
+        /// a session does not choose its own settings.
+        #[arg(long, env = "MEMORY_ARM")]
+        arm: Option<String>,
+        /// The snapshot this session reads at, an RFC 3339 time: an entry created
+        /// later is not read.
+        #[arg(long, env = "MEMORY_AS_OF")]
+        as_of: Option<String>,
     },
     /// Run a harness confined: no network except the egress, the memory server attached,
     /// model calls forwarded and metered. Credentials come from this process's
@@ -377,6 +395,30 @@ enum Command {
         /// record's telemetry, not this one's.
         #[arg(long)]
         empty_memory: bool,
+        /// Run as an evaluation arm: no-memory, transcript-replay, t0-only, raw-only or
+        /// full. The arm fixes the session's settings, which narrow what it reads; the
+        /// record, the sandbox, the egress and the tools stay the same.
+        #[arg(long, conflicts_with = "empty_memory")]
+        arm: Option<String>,
+        /// Read the record as of this RFC 3339 time: an entry created later is not
+        /// read. The tasks, the policy and the grants are read as they are now.
+        #[arg(long)]
+        as_of: Option<String>,
+        /// Run as one run of an evaluation: the plan, an evaluation set file with a
+        /// `[plan]` table. The prompt is the plan's, the tape of the session names the
+        /// digest of the plan, and `amem eval score` reads the run from that tape.
+        #[arg(
+            long,
+            requires_all = ["arm", "as_of", "eval_task", "eval_seed"],
+            conflicts_with_all = ["prompt", "prompt_file", "empty_memory"]
+        )]
+        eval_plan: Option<PathBuf>,
+        /// With --eval-plan: the id of the task in the plan.
+        #[arg(long, requires = "eval_plan")]
+        eval_task: Option<String>,
+        /// With --eval-plan: the seed, the number of the repeated run, from 0.
+        #[arg(long, requires = "eval_plan")]
+        eval_seed: Option<u32>,
         /// After the run, mine the session's transcript for entries with a small model
         /// through the same destination; they land raw, low confidence, with the
         /// transcript as source.
@@ -468,6 +510,16 @@ enum Command {
         /// Work this task rather than the next one, and stop after it.
         #[arg(long)]
         task: Option<String>,
+        /// Fill this position, `pos-<name>`, before the first claim: the session then
+        /// claims the tasks pinned to the position and the ones its charter covers. Not
+        /// on the `wslc` backend.
+        #[arg(long)]
+        position: Option<String>,
+        /// Before each claim, fill a position that waits for a session under this
+        /// harness's agent definition, and leave it when the task is settled. With
+        /// none that waits, nothing is claimed. Not on the `wslc` backend.
+        #[arg(long, conflicts_with_all = ["position", "task"])]
+        wake: bool,
     },
     /// The curator's survey: what in a domain needs curation, from the record and
     /// the read log, as proposals; with --file, each becomes a task for a run to do with
@@ -595,9 +647,25 @@ enum Command {
         #[command(subcommand)]
         op: QuarantineOp,
     },
-    /// What an entry may have reached: the sessions that read it and the entries they
-    /// wrote after; where to look when an entry turns out to be poison.
-    Taint { id: String },
+    /// The lineage of an entry, from the event logs: what was written and sent after a
+    /// session read it, and what cites it; with --back, what it was made from. Where to
+    /// look when an entry turns out to be poison. For the owner and the security role.
+    Lineage {
+        /// An entry id, or with --back `<domain>@<seq>` for a send event.
+        of: String,
+        /// Follow the edges back: what the entry or the send may have been made from.
+        #[arg(long)]
+        back: bool,
+        /// The most steps to follow. Without it, until a step reaches nothing new.
+        #[arg(long)]
+        depth: Option<u32>,
+    },
+    /// The entries an erasure withheld, which no read serves until each is derived
+    /// again, released or erased: list them, or release one.
+    Withheld {
+        #[command(subcommand)]
+        op: eventlog::WithheldOp,
+    },
     /// Promote an entry's trust tier. To curated at once, by anyone but its author; to
     /// verified by proposal only, a task a person who did not propose it approves.
     Promote {
@@ -608,6 +676,53 @@ enum Command {
         /// What was checked, and against what. Required: the ledger keeps it.
         #[arg(long)]
         why: String,
+    },
+    /// Demote an entry behind a tombstone: retrieval no longer serves it, `get` says
+    /// that it was demoted, and the archive keeps its text. A person demotes for either
+    /// reason. An agent demotes only a dead entry, on a task of a curator or the auditor.
+    Demote {
+        id: String,
+        /// dead or wrong: a code, and never a text.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Restore a demoted entry, so that retrieval serves it again. Only a person.
+    Restore { id: String },
+    /// The dead entries: older than the window, not read inside it, named by no active
+    /// entry, not verified, and not a handoff, a policy entry, a position or a canary.
+    Dead {
+        #[arg(long)]
+        domain: Option<String>,
+        /// The window in days.
+        #[arg(long, default_value_t = dm_server::duties::DEAD_WINDOW_DAYS)]
+        days: i64,
+    },
+    /// The convention checks over a domain: freshness, ownership, cross-links and
+    /// citations of a replaced entry. With --file, one task for each failure: for a
+    /// person, or for a curator when an entry cites a replaced entry.
+    Conventions {
+        #[arg(long)]
+        domain: Option<String>,
+        /// Days past its review date after which an entry fails the freshness check.
+        #[arg(long, default_value_t = 30)]
+        overdue_days: i64,
+        #[arg(long)]
+        file: bool,
+    },
+    /// The corrections of a domain: each task whose result a person corrected, rejected
+    /// or reverted. With --file, one task for a curator for each, or for a person when
+    /// the people who judged the result disagree.
+    Corrections {
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        file: bool,
+    },
+    /// The auditor: its mode, its qualification on the planted cases, and what it
+    /// checks besides summaries.
+    Auditor {
+        #[command(subcommand)]
+        op: duties::AuditorOp,
     },
     /// Approve what a task asks a person for. A proposal to promote an entry to verified
     /// is promoted: the approver did not propose it, and is a person. A sign-off task
@@ -920,6 +1035,9 @@ enum Command {
         cites: Vec<String>,
         #[arg(long)]
         supersedes: Option<String>,
+        /// The person who answers for the entry, as `human:...`.
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Ranked search, summaries only.
     Search {
@@ -979,14 +1097,27 @@ enum Command {
         #[command(subcommand)]
         op: platform::PlatformOp,
     },
+    /// The evaluation: the arms of the comparison, the plan that is fixed before the
+    /// runs, the scorer, and the scorecards that the record keeps.
+    Eval {
+        #[command(subcommand)]
+        op: eval::EvalOp,
+    },
+    /// Positions: the standing roles of a domain, what is pinned to each, and which
+    /// wait for a session. A position is in force once a person verified its entry.
+    Position {
+        #[command(subcommand)]
+        op: positions::PositionOp,
+    },
     /// Gofannon's deployed agents: list them, or work the ledger's tasks with one, its
     /// result filed as each task's handoff. Through the `gofannon` tool's grant.
     Gofannon {
         #[command(subcommand)]
         op: gofannon::GofannonOp,
     },
-    /// The event log of a domain, the order of record of its entries, and the
-    /// materializer that builds the index from it.
+    /// The event log of a domain, the order of record of its entries; the feed of the
+    /// index from it, measured against the published bound; and the materializer that
+    /// builds the index from it.
     Log {
         #[command(subcommand)]
         op: eventlog::LogOp,
@@ -1056,8 +1187,8 @@ enum Command {
     /// Rebuild the index from the record and the ledger from its events.
     Reindex,
     /// Erase an entry: the body leaves every version and the index, a stub and a receipt
-    /// remain, and entries that cite it are flagged for review. Irreversible. It runs
-    /// only under an approval of the owner for this version of the entry, and the
+    /// remain, and entries downstream of it are withheld from retrieval. Irreversible. It
+    /// runs only under an approval of the owner for this version of the entry, and the
     /// owner's own call here is that approval.
     Erase {
         id: String,
@@ -1173,6 +1304,16 @@ enum PolicyOp {
         #[arg(long)]
         domain: Option<String>,
     },
+    /// What a curator finds in the policy and in the done work: the pairs of rules in
+    /// force in one layer whose sentences overlap, and the work done three times or
+    /// more with no task definition. With --file, a proposal to the owners for each
+    /// pair, and a task to write a task definition for each repeated work.
+    Curate {
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        file: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1208,44 +1349,56 @@ enum CanaryOp {
     },
 }
 
+// What `task create` takes. Boxed in `TaskOp`: it is several times the size of any other
+// task command.
+#[derive(clap::Args)]
+struct NewTask {
+    title: String,
+    #[arg(long, default_value = "")]
+    body: String,
+    #[arg(long)]
+    domain: Option<String>,
+    #[arg(long = "require")]
+    requirements: Vec<String>,
+    #[arg(long = "after")]
+    depends_on: Vec<String>,
+    #[arg(long, default_value_t = 0)]
+    priority: i64,
+    /// The task definition this kind of work runs under, by name.
+    #[arg(long)]
+    definition: Option<String>,
+    /// A check that says this task is done; repeat for more. Without one, the task
+    /// takes those of its definition.
+    #[arg(long = "accept")]
+    acceptance: Vec<String>,
+    /// The task this one is split from.
+    #[arg(long)]
+    parent: Option<String>,
+    /// A decision this task carries out, as an entry id; repeat for more.
+    #[arg(long = "implements")]
+    implements: Vec<String>,
+    /// Whether what the task does can be undone: `reversible` or `irreversible`.
+    #[arg(long)]
+    reversibility: Option<dm_ledger::Reversibility>,
+    /// An owned path the task changes, as a glob; repeat for more.
+    #[arg(long = "touches")]
+    artifacts_touched: Vec<String>,
+    /// What triage scored it: `value,urgency,effort`, three whole numbers.
+    #[arg(long)]
+    scores: Option<String>,
+    /// Pin the task to this position, `pos-<name>`: only a session that fills the
+    /// position claims it. Give --pin-reason with it.
+    #[arg(long)]
+    position: Option<String>,
+    /// Why the task is pinned: continuity, relationship or separation.
+    #[arg(long)]
+    pin_reason: Option<dm_ledger::PinReason>,
+}
+
 #[derive(Subcommand)]
 enum TaskOp {
     /// File a task. It is born proposed.
-    Create {
-        title: String,
-        #[arg(long, default_value = "")]
-        body: String,
-        #[arg(long)]
-        domain: Option<String>,
-        #[arg(long = "require")]
-        requirements: Vec<String>,
-        #[arg(long = "after")]
-        depends_on: Vec<String>,
-        #[arg(long, default_value_t = 0)]
-        priority: i64,
-        /// The task definition this kind of work runs under, by name.
-        #[arg(long)]
-        definition: Option<String>,
-        /// A check that says this task is done; repeat for more. Without one, the task
-        /// takes those of its definition.
-        #[arg(long = "accept")]
-        acceptance: Vec<String>,
-        /// The task this one is split from.
-        #[arg(long)]
-        parent: Option<String>,
-        /// A decision this task carries out, as an entry id; repeat for more.
-        #[arg(long = "implements")]
-        implements: Vec<String>,
-        /// Whether what the task does can be undone: `reversible` or `irreversible`.
-        #[arg(long)]
-        reversibility: Option<dm_ledger::Reversibility>,
-        /// An owned path the task changes, as a glob; repeat for more.
-        #[arg(long = "touches")]
-        artifacts_touched: Vec<String>,
-        /// What triage scored it: `value,urgency,effort`, three whole numbers.
-        #[arg(long)]
-        scores: Option<String>,
-    },
+    Create(Box<NewTask>),
     /// Admit a proposed task.
     Admit { id: String },
     /// Tasks with a status.
@@ -1344,11 +1497,22 @@ enum TaskOp {
         #[arg(long)]
         reject: bool,
     },
-    /// Record that the work of a task did not stand: `reverted` or `rejected`. The
-    /// level of the task's definition goes one step down.
+    /// Record what became of the work of a task. Only a person records either form.
+    /// With `reverted` or `rejected`: a work outcome. The work did not stand, and the
+    /// level of the task's definition goes one step down. With `--kind`: an outcome
+    /// event on the task, which the curator reads as a correction. The level does not
+    /// move.
     Outcome {
         id: String,
-        outcome: dm_ledger::WorkOutcome,
+        /// reverted or rejected: a work outcome, on the definition that the task names.
+        #[arg(conflicts_with_all = ["kind", "note"], required_unless_present = "kind")]
+        outcome: Option<dm_ledger::WorkOutcome>,
+        /// accepted, corrected, rejected or reverted: an outcome event.
+        #[arg(long)]
+        kind: Option<String>,
+        /// What was wrong, or what was changed. Only with `--kind`.
+        #[arg(long, default_value = "")]
+        note: String,
     },
     /// Close a task without doing it, and everything still open that was filed from it.
     Invalidate {
@@ -1392,6 +1556,8 @@ enum TaskOp {
         #[arg(long)]
         generation: Option<u64>,
     },
+    /// The outcome events of a task, oldest first.
+    Outcomes { id: String },
 }
 
 type Fallible = Result<(), Box<dyn std::error::Error>>;
@@ -1404,12 +1570,17 @@ fn json<T: serde::Serialize>(v: &T) -> Fallible {
 fn hits_json(hits: &[dm_index::Hit]) -> Vec<serde_json::Value> {
     hits.iter()
         .map(|h| {
-            serde_json::json!({
+            let mut v = serde_json::json!({
                 "id": h.id, "domain": h.domain, "type": h.entry_type.to_string(),
                 "trust_tier": h.trust_tier.to_string(),
                 "classification": h.classification.to_string(),
                 "title": h.title, "summary": h.summary,
-            })
+            });
+            // an entry with fleet reach has no key
+            if !h.reach.is_fleet() {
+                v["reach"] = serde_json::json!(h.reach.to_string());
+            }
+            v
         })
         .collect()
 }
@@ -1586,16 +1757,37 @@ fn refuse_invocation(cli: &Cli, root: &Path) -> Fallible {
 }
 
 /// `amem serve`: the root over MCP on standard input and output, as an author, holding
-/// the task `MEMORY_TASK` names if a launcher set it.
-async fn serve_stdio_cmd(root: &Path, author: Option<String>, manifest: Vec<String>) -> Fallible {
+/// the task `MEMORY_TASK` names if a launcher set it, in the position `position`
+/// names if a launcher gave one, and under the settings a launcher gave. A position
+/// that refuses the session ends the command.
+async fn serve_stdio_cmd(root: &Path, command: Command) -> Fallible {
+    let Command::Serve {
+        author,
+        manifest,
+        position,
+        arm,
+        as_of,
+    } = command
+    else {
+        unreachable!("routed by run_cli")
+    };
+    let settings = eval::settings(arm.as_deref(), as_of.as_deref())?;
+    // serve gives no prompt, so it has nothing to put transcripts in front of
+    eval::needs_prompt(settings.as_ref(), false)?;
     let mut m = Memory::open(root)?.with_manifest(manifest);
     if let Some(a) = author {
         m = m.with_author(a);
     }
+    if let Some(name) = position.filter(|p| !p.is_empty()) {
+        positions::fill(&m, &name, None).await?;
+    }
+    // after the position is filled, which is the launcher's read, and before anything
+    // is served
+    eval::give(&m, settings.as_ref())?;
     // a harness working a task has it in MEMORY_TASK, as the launcher sets it;
     // what this session files or writes is judged against that task
     if let Some(t) = std::env::var("MEMORY_TASK").ok().filter(|t| !t.is_empty()) {
-        m.set_held_task(&t);
+        m.hold_task(&t).await?;
     }
     m.set_tools(taps::TapTools::for_root(root));
     mcp::serve_stdio(Arc::new(m)).await?;
@@ -1660,7 +1852,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         cmd @ (Command::Init { .. } | Command::Usage | Command::Cost { .. }) => {
             bookkeeping_cmd(&root, cmd).await
         }
-        Command::Serve { author, manifest } => serve_stdio_cmd(&root, author, manifest).await,
+        cmd @ Command::Serve { .. } => serve_stdio_cmd(&root, cmd).await,
         cmd @ (Command::Launch { .. } | Command::Work { .. } | Command::Inside { .. }) => {
             launch_cmd(&root, cmd).await
         }
@@ -1699,8 +1891,14 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Transcript { op } => transcripts::cmd(&Memory::open(&root)?, op).await,
         Command::Reenact { op } => reenact::cmd(&root, op).await,
         Command::Log { op } => eventlog::cmd(&Memory::open(&root)?, op).await,
+        Command::Lineage { of, back, depth } => {
+            eventlog::lineage(&Memory::open(&root)?, &of, back, depth).await
+        }
+        Command::Withheld { op } => eventlog::withheld(&Memory::open(&root)?, op).await,
         Command::Gofannon { op } => gofannon::cmd(&root, op).await,
         Command::Platform { op } => platform::cmd(&Memory::open(&root)?, op).await,
+        Command::Eval { op } => eval::cmd(&root, op).await,
+        Command::Position { op } => positions::cmd(&Memory::open(&root)?, op).await,
         Command::Tool { name, args } => sources::call(&root, &name, &args).await,
         Command::ToolServer { listen, token_env } => {
             tool_server::serve(&root, &listen, token_env.as_deref()).await
@@ -1708,6 +1906,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Source { op } => sources::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
         Command::Drift { op } => drift::run(&root, op).await,
+        Command::Auditor { op } => duties::auditor_cmd(&root, op).await,
         other => entries(&Memory::open(&root)?, other).await,
     }
 }
@@ -3040,6 +3239,8 @@ fn wslc_for_launch(
         model,
         subagents,
         no_handoff,
+        arm,
+        as_of,
         args,
         ..
     } = command
@@ -3048,6 +3249,9 @@ fn wslc_for_launch(
     };
     if backend_of(*backend, *unconfined, root, (*harness).into()) != Backend::Wslc {
         return Ok(None);
+    }
+    if arm.is_some() || as_of.is_some() {
+        return Err(eval::NOT_ON_WSLC.into());
     }
     let mut inside_args = run_options_args(model.as_deref(), *subagents);
     inside_args.extend(inside_args_for_launch(
@@ -3097,6 +3301,8 @@ fn wslc_for_work(
         model,
         subagents,
         no_prefetch,
+        position,
+        wake,
         ..
     } = command
     else {
@@ -3104,6 +3310,9 @@ fn wslc_for_work(
     };
     if backend_of(*backend, *unconfined, root, (*harness).into()) != Backend::Wslc {
         return Ok(None);
+    }
+    if position.is_some() || *wake {
+        return Err(positions::NOT_ON_WSLC.into());
     }
     let mut inside_args = work_inside_args(
         run_options_args(model.as_deref(), *subagents),
@@ -3167,6 +3376,11 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         subagents,
         no_handoff,
         empty_memory,
+        arm,
+        as_of,
+        eval_plan,
+        eval_task,
+        eval_seed,
         mine: mine_after,
         mine_model,
         mine_via,
@@ -3178,11 +3392,11 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
     };
     let workdir = resolve_workdir(root, workdir)?;
     refuse_browser_unconfined(unconfined, backend)?;
-    let prompt = match (prompt, prompt_file) {
-        (Some(p), _) => Some(p),
-        (None, Some(f)) => Some(std::fs::read_to_string(&f)?),
-        (None, None) => None,
-    };
+    let (settings, evaluation, prompt) = eval::asked(
+        &eval::RunFlags::new(eval_plan, eval_task, eval_seed, arm, as_of),
+        prompt,
+        prompt_file,
+    )?;
     let (program, args) = split_program(harness.into(), args);
     let stops = stops::Stops::listen()?;
     let session = Session::start(
@@ -3196,7 +3410,10 @@ async fn cmd_launch(root: &Path, command: Command) -> Fallible {
         },
         workdir,
         runner_for(backend_of(backend, unconfined, root, harness.into()), root)?,
-        RunOptions::new(model, subagents, program, None).empty_memory(empty_memory),
+        RunOptions::new(model, subagents, program, None)
+            .empty_memory(empty_memory)
+            .settings(settings)
+            .evaluation(evaluation),
     )
     .await?;
     let code = stops
@@ -3262,6 +3479,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         mine_via,
         no_prefetch,
         task,
+        position,
+        wake,
         ..
     } = command
     else {
@@ -3295,6 +3514,8 @@ async fn cmd_work(root: &Path, command: Command) -> Fallible {
         }),
         prefetch: !no_prefetch,
         task,
+        position,
+        wake,
     };
     let code = stops
         .around(work::run(&session, &options), session.abandon())
@@ -3362,6 +3583,8 @@ async fn cmd_inside(root: &Path, command: Command) -> Fallible {
             mine: None,
             prefetch: !no_prefetch,
             task: None,
+            position: None,
+            wake: false,
         };
         work::run(&session, &options).await?
     } else {
@@ -3407,6 +3630,10 @@ struct RunOptions {
     /// A private home of the run's own, for a re-run, which must not leave its
     /// transcript among the harness's real sessions.
     home: Option<PathBuf>,
+    /// The session's settings, when the launch names an arm or a snapshot.
+    settings: Option<dm_server::arms::Settings>,
+    /// The run of an evaluation that the session is, when the launch names a plan.
+    evaluation: Option<eval::RunPlan>,
 }
 
 impl RunOptions {
@@ -3423,7 +3650,19 @@ impl RunOptions {
             projection,
             empty_memory: false,
             home: None,
+            settings: None,
+            evaluation: None,
         }
+    }
+
+    fn evaluation(mut self, run: Option<eval::RunPlan>) -> RunOptions {
+        self.evaluation = run;
+        self
+    }
+
+    fn settings(mut self, settings: Option<dm_server::arms::Settings>) -> RunOptions {
+        self.settings = settings;
+        self
     }
 
     fn home(mut self, home: PathBuf) -> RunOptions {
@@ -3772,9 +4011,16 @@ impl Session {
             root
         };
         let mut p = prepare_launch(root, harness, creds, socket, None, projected).await?;
+        // before anything is read: the projection is rendered later, under the settings
+        eval::give(&p.memory, options.settings.as_ref())?;
         let mut options = options;
         if options.model.is_none() {
             options.model = platform_model(&p.memory, harness).await;
+        }
+        // a run of an evaluation: the library gives the settings of the arm, and
+        // refuses a harness or a model that is not the plan's
+        if let Some(run) = &options.evaluation {
+            eval::start(&p.memory, run, harness.binary(), options.model.as_deref())?;
         }
         apply_run_options(&mut p, harness, auth, &options);
         if let Some(h) = &options.home {
@@ -3973,7 +4219,7 @@ impl Session {
         let mut env = self.p.harness_env.clone();
         if let Some(t) = task {
             env.push(("MEMORY_TASK".to_string(), t.to_string()));
-            self.p.memory.set_held_task(t);
+            self.p.memory.hold_task(t).await?;
         }
         let mut full: Vec<String> = [self.program.as_slice(), args].concat();
         if let Some(m) = &self.model {
@@ -4323,6 +4569,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
             classification,
             cites,
             supersedes,
+            owner,
         } => {
             let w = m
                 .write(WriteRequest {
@@ -4336,6 +4583,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
                     supersedes,
                     review_by: None,
                     summary: None,
+                    owner,
                 })
                 .await?;
             json(&w)
@@ -4467,8 +4715,8 @@ fn auditor_destination(auth: AuthMode, provider: Option<String>) -> String {
     })
 }
 
-/// How many curation tasks are open: proposed or admitted, filed by the survey, the
-/// auditor or the telemetry.
+/// How many curation tasks are open for a curator run: proposed or admitted, filed by
+/// the survey, the auditor or the telemetry, and not for a person.
 async fn open_curation_tasks(
     m: &Memory,
     domain: &str,
@@ -4483,13 +4731,7 @@ async fn open_curation_tasks(
             .tasks(Some(domain), status)
             .await?
             .iter()
-            .filter(|t| {
-                t.spec.origin.as_deref().is_some_and(|o| {
-                    o.starts_with("curator:")
-                        || o.starts_with("auditor:")
-                        || o.starts_with("telemetry:")
-                })
-            })
+            .filter(|t| duties::curators_work(&t.spec))
             .count();
     }
     Ok(n)
@@ -4536,7 +4778,8 @@ async fn curate_loop(root: &Path, plan: &CuratePlan, every: Option<u64>) -> Fall
     }
 }
 
-/// The auditor's part of a cycle: the sample judged, contradictions hunted, both filed.
+/// The auditor's part of a cycle: the sample judged, contradictions hunted, both filed;
+/// then entries together, the curations and the handoffs, and the sample for a person.
 async fn auditor_pass(
     p: &Prepared,
     plan: &CuratePlan,
@@ -4578,6 +4821,40 @@ async fn auditor_pass(
         cycle.contradictions = found.len();
         auditor::file_contradictions(m, domain, model, &found).await?;
     }
+    let judge = duties::Judge {
+        egress: &p.egress,
+        destination: &p.provider,
+        model,
+        spend: Some(&spend),
+    };
+    let judged = report
+        .checked
+        .into_iter()
+        .map(|v| dm_server::audit::Judged {
+            entry: v.id,
+            ok: v.entails,
+            why: v.why,
+        });
+    duties::auditor_duties(&judge, m, domain, plan.sample, cycle, judged.collect()).await?;
+    quarantine_and_drift(p, plan, domain, model, &spend, cycle).await?;
+    if let Some(t) = p.egress.telemetry().session(m.session_id())? {
+        cycle.calls = t.calls;
+        cycle.tokens_in = t.input_tokens;
+        cycle.tokens_out = t.output_tokens;
+    }
+    Ok(())
+}
+
+/// The quarantine's reader and the drift probes of a cycle, while the budget lasts.
+async fn quarantine_and_drift(
+    p: &Prepared,
+    plan: &CuratePlan,
+    domain: &str,
+    model: &str,
+    spend: &auditor::Spend<'_>,
+    cycle: &mut curation::Cycle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let m = &p.memory;
     if !spend.exhausted() {
         let reviewed = review::review(&p.egress, m, &p.provider, model, plan.sample).await?;
         cycle.reviewed = reviewed.len();
@@ -4598,15 +4875,11 @@ async fn auditor_pass(
                 .unwrap_or_else(|e| Some(format!("probe failed: {e}")));
         }
     }
-    if let Some(t) = p.egress.telemetry().session(m.session_id())? {
-        cycle.calls = t.calls;
-        cycle.tokens_in = t.input_tokens;
-        cycle.tokens_out = t.output_tokens;
-    }
     Ok(())
 }
 
-/// The owner's part of a cycle: the canaries checked and the telemetry's alarms, filed.
+/// The owner's part of a cycle: the canaries checked, the telemetry's alarms, the
+/// convention checks, the corrections and the curation of the policy, each filed.
 async fn owner_pass(
     m: &Memory,
     root: &Path,
@@ -4622,6 +4895,7 @@ async fn owner_pass(
     let t = curation::telemetry(m, Some(domain)).await?;
     cycle.alarms = t.alarms.len();
     curation::file_alarms(m, &t).await?;
+    duties::file_surveys(m, domain, cycle).await?;
     transcripts::sweep(m).await?;
     Ok(())
 }
@@ -4642,7 +4916,12 @@ async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
     let m = &p.memory;
     m.disable_read_log();
     let domain = m.resolve_domain(plan.domain.as_deref())?;
-    let model = model::resolve(&p.egress, &p.provider, plan.model.as_deref()).await;
+    // a qualification on file names the model of the auditor; else the one asked for
+    let mode = m.auditor_mode()?;
+    let model = match &mode.auditor_model {
+        Some(qualified) => qualified.clone(),
+        None => model::resolve(&p.egress, &p.provider, plan.model.as_deref()).await,
+    };
     let mut cycle = curation::Cycle {
         at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -4651,6 +4930,8 @@ async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
         budget_tasks: plan.budget_tasks,
         budget_tokens: plan.budget_tokens,
         auditor_model: model.clone(),
+        auditor_mode: mode.mode.word().to_string(),
+        qualified: mode.qualified,
         ..curation::Cycle::default()
     };
     // the survey, filed up to the budget's gap
@@ -4764,7 +5045,7 @@ async fn approval_cmd(m: &Memory, command: Command) -> Fallible {
     }
 }
 
-/// `amem policy`, `amem quarantine`, `amem taint`, `amem canary`, `amem erase` and
+/// `amem policy`, `amem quarantine`, `amem canary`, `amem erase` and
 /// `amem reindex`: the perimeter's commands and the record's repair.
 async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
     match command {
@@ -4794,6 +5075,9 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Policy {
             op: PolicyOp::Lint { file },
         } => policy_lint(m, file).await,
+        Command::Policy {
+            op: PolicyOp::Curate { domain, file },
+        } => duties::policy_curate(m, domain.as_deref(), file).await,
         Command::Policy { op } => rule_cmd(m, op).await,
         Command::Quarantine {
             op: QuarantineOp::List,
@@ -4828,7 +5112,6 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Quarantine {
             op: QuarantineOp::Drop { id },
         } => json(&m.release_quarantined(&id, false).await?),
-        Command::Taint { id } => json(&m.taint(&id)),
         Command::Promote { id, to, why } => json(&m.promote(&id, to.parse()?, &why).await?),
         Command::Promotions { id } => json(&m.promotions(&id).await?),
         Command::Canary { op } => canary_cmd(m, op).await,
@@ -4901,7 +5184,11 @@ async fn rule_cmd(m: &Memory, op: PolicyOp) -> Fallible {
             }))
         }
         PolicyOp::Reset { domain } => json(&m.reset_rules(domain.as_deref()).await?),
-        PolicyOp::Show | PolicyOp::Eval { .. } | PolicyOp::List | PolicyOp::Lint { .. } => {
+        PolicyOp::Show
+        | PolicyOp::Eval { .. }
+        | PolicyOp::List
+        | PolicyOp::Lint { .. }
+        | PolicyOp::Curate { .. } => {
             unreachable!("routed by perimeter_cmd")
         }
     }
@@ -4985,25 +5272,51 @@ async fn bundle_cmd(m: &Memory, command: Command) -> Fallible {
     }
 }
 
+/// `amem demote`, `restore`, `dead`, `conventions` and `corrections`: the duties of a
+/// curator that need no model.
+async fn duty_cmd(m: &Memory, command: Command) -> Fallible {
+    match command {
+        Command::Demote { id, reason } => duties::demote(m, &id, &reason).await,
+        Command::Restore { id } => duties::restore(m, &id).await,
+        Command::Dead { domain, days } => duties::dead(m, domain.as_deref(), days).await,
+        Command::Conventions {
+            domain,
+            overdue_days,
+            file,
+        } => duties::conventions(m, domain.as_deref(), overdue_days, file).await,
+        Command::Corrections { domain, file } => {
+            duties::corrections(m, domain.as_deref(), file).await
+        }
+        _ => unreachable!("routed by maintain"),
+    }
+}
+
+/// `amem curator`: the survey of what needs curation, or the curator's telemetry.
+async fn survey_cmd(m: &Memory, command: Command) -> Fallible {
+    let Command::Curator {
+        domain,
+        file,
+        stale_days,
+        split_chars,
+        workdir,
+        telemetry,
+    } = command
+    else {
+        unreachable!("routed by maintain")
+    };
+    // the survey's reads are the curator's, not a session's
+    m.disable_read_log();
+    if telemetry {
+        return telemetry_cmd(m, domain.as_deref(), file).await;
+    }
+    let workdir = workdir.or_else(|| std::env::current_dir().ok());
+    curator_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
+}
+
 async fn maintain(m: &Memory, command: Command) -> Fallible {
     match command {
         cmd @ (Command::Export { .. } | Command::Import { .. }) => bundle_cmd(m, cmd).await,
-        Command::Curator {
-            domain,
-            file,
-            stale_days,
-            split_chars,
-            workdir,
-            telemetry,
-        } => {
-            // the survey's reads are the curator's, not a session's
-            m.disable_read_log();
-            if telemetry {
-                return telemetry_cmd(m, domain.as_deref(), file).await;
-            }
-            let workdir = workdir.or_else(|| std::env::current_dir().ok());
-            curator_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
-        }
+        cmd @ Command::Curator { .. } => survey_cmd(m, cmd).await,
         cmd
         @ (Command::Approve { .. } | Command::Approvals { .. } | Command::Declassify { .. }) => {
             approval_cmd(m, cmd).await
@@ -5014,12 +5327,17 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Promotions { .. }
         | Command::Reindex
         | Command::Policy { .. }
-        | Command::Quarantine { .. }
-        | Command::Taint { .. }) => perimeter_cmd(m, cmd).await,
+        | Command::Quarantine { .. }) => perimeter_cmd(m, cmd).await,
         cmd @ (Command::Metrics { .. } | Command::Limits { .. } | Command::Landing { .. }) => {
             measure::cmd(m, cmd).await
         }
+        cmd @ (Command::Demote { .. }
+        | Command::Restore { .. }
+        | Command::Dead { .. }
+        | Command::Conventions { .. }
+        | Command::Corrections { .. }) => duty_cmd(m, cmd).await,
         Command::Init { .. }
+        | Command::Auditor { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
         | Command::Work { .. }
@@ -5045,8 +5363,12 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         | Command::Transcript { .. }
         | Command::Reenact { .. }
         | Command::Log { .. }
+        | Command::Lineage { .. }
+        | Command::Withheld { .. }
         | Command::Gofannon { .. }
         | Command::Platform { .. }
+        | Command::Eval { .. }
+        | Command::Position { .. }
         | Command::Tool { .. }
         | Command::ToolServer { .. }
         | Command::Source { .. }
@@ -5120,12 +5442,20 @@ async fn holds_cmd(m: &Memory, op: TaskOp) -> Fallible {
     }
 }
 
-/// `amem task verdict` and `amem task outcome`: what a person says of work that was
-/// handed in.
+/// `amem task verdict`, `amem task outcome` and `amem task outcomes`: what a person
+/// says of work that was handed in, and what was said.
 async fn judged_cmd(m: &Memory, op: TaskOp) -> Fallible {
     match op {
         TaskOp::Verdict { id, accept, .. } => json(&m.verdict(&id, accept).await?),
-        TaskOp::Outcome { id, outcome } => json(&m.record_outcome(&id, outcome).await?),
+        TaskOp::Outcome {
+            id,
+            outcome: Some(outcome),
+            ..
+        } => json(&m.record_outcome(&id, outcome).await?),
+        TaskOp::Outcome { id, kind, note, .. } => {
+            duties::record_outcome(m, &id, kind.as_deref().unwrap_or_default(), &note).await
+        }
+        TaskOp::Outcomes { id } => duties::outcomes(m, &id).await,
         _ => unreachable!("routed by task"),
     }
 }
@@ -5165,48 +5495,58 @@ async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
     }
 }
 
-async fn task(m: &Memory, op: TaskOp) -> Fallible {
-    match op {
-        TaskOp::Create {
+/// `amem task create`.
+async fn create_cmd(m: &Memory, new: NewTask) -> Fallible {
+    let NewTask {
+        title,
+        body,
+        domain,
+        requirements,
+        depends_on,
+        priority,
+        definition,
+        acceptance,
+        parent,
+        implements,
+        reversibility,
+        artifacts_touched,
+        scores,
+        position,
+        pin_reason,
+    } = new;
+    let scores = scores.as_deref().map(scores_of).transpose()?;
+    let c = m
+        .create_task(TaskSpec {
+            domain: domain.unwrap_or_default(),
             title,
             body,
-            domain,
             requirements,
             depends_on,
+            origin: None,
+            upstream_event: None,
+            created_by: String::new(),
+            classification: Label::Public,
             priority,
             definition,
             acceptance,
+            // the library sets it, from what the session read
+            outside: false,
             parent,
+            scores,
             implements,
             reversibility,
             artifacts_touched,
-            scores,
-        } => {
-            let scores = scores.as_deref().map(scores_of).transpose()?;
-            let c = m
-                .create_task(TaskSpec {
-                    domain: domain.unwrap_or_default(),
-                    title,
-                    body,
-                    requirements,
-                    depends_on,
-                    origin: None,
-                    upstream_event: None,
-                    created_by: String::new(),
-                    classification: Label::Public,
-                    priority,
-                    definition,
-                    acceptance,
-                    parent,
-                    scores,
-                    implements,
-                    reversibility,
-                    artifacts_touched,
-                    ..TaskSpec::default()
-                })
-                .await?;
-            json(&c.task)
-        }
+            position,
+            pin_reason,
+            ..TaskSpec::default()
+        })
+        .await?;
+    json(&c.task)
+}
+
+async fn task(m: &Memory, op: TaskOp) -> Fallible {
+    match op {
+        TaskOp::Create(new) => create_cmd(m, *new).await,
         TaskOp::Admit { id } => json(&m.admit(&id).await?),
         TaskOp::List { status, domain } => json(&m.tasks(domain.as_deref(), status.into()).await?),
         TaskOp::ClaimNext {
@@ -5237,7 +5577,9 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         | TaskOp::Stats { .. }
         | TaskOp::Times { .. }
         | TaskOp::QueueLanding { .. }) => fabric_cmd(m, op).await,
-        op @ (TaskOp::Verdict { .. } | TaskOp::Outcome { .. }) => judged_cmd(m, op).await,
+        op @ (TaskOp::Verdict { .. } | TaskOp::Outcome { .. } | TaskOp::Outcomes { .. }) => {
+            judged_cmd(m, op).await
+        }
         TaskOp::Get { id } => json(&m.get_task(&id).await?),
     }
 }

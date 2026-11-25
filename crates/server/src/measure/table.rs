@@ -634,8 +634,10 @@ impl Memory {
             if handoffs.contains_key(&w.id) {
                 continue;
             }
-            // from the archive: it holds the active entries too, and it logs no read
-            let Ok(entry) = self.archived(&w.id).await else {
+            // from the archive: it holds the active entries too, and the read log takes
+            // no line. The read event in the log of the domain is a survey: a count is
+            // no use of an entry
+            let Ok(entry) = self.archived_for_a_count(&w.id).await else {
                 continue;
             };
             if entry.front.entry_type == dm_core::EntryType::Handoff {

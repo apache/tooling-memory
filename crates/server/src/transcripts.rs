@@ -464,7 +464,11 @@ impl Memory {
         Ok(id)
     }
 
-    async fn put_transcript(&self, t: &Transcript, raw: Option<&str>) -> Result<(), Error> {
+    pub(crate) async fn put_transcript(
+        &self,
+        t: &Transcript,
+        raw: Option<&str>,
+    ) -> Result<(), Error> {
         let text = serde_json::to_string_pretty(t).map_err(|e| bad(&t.session, &e))?;
         if let Some(raw) = raw {
             self.store
@@ -488,7 +492,7 @@ impl Memory {
     }
 
     /// Every transcript header kept in a domain, whatever its state.
-    async fn transcripts_in(&self, domain: &str) -> Result<Vec<Transcript>, Error> {
+    pub(crate) async fn transcripts_in(&self, domain: &str) -> Result<Vec<Transcript>, Error> {
         let mut out = Vec::new();
         for name in self
             .store
@@ -610,6 +614,7 @@ impl Memory {
     ) -> Result<Transcript, Error> {
         let t = self.find_transcript(session).await?;
         if !f.admits(&t.domain, t.classification, TrustTier::Raw, true)
+            || !f.admits_at(t.kept_at)
             || !lock(&self.session).observe(t.classification)
         {
             return Err(Error::NotFound(session.to_string()));
@@ -619,7 +624,9 @@ impl Memory {
 
     /// One turn of a transcript, by citation: served only when an entry this session
     /// may read cites it, under the session's filter, and the session's label rises to
-    /// the transcript's classification as a `get` raises it to an entry's. Once the
+    /// the transcript's classification as a `get` raises it to an entry's. A turn served
+    /// leaves a `read` event in the log of the domain, which names the transcript by its
+    /// session, and for an excerpt the entry that keeps it too. Once the
     /// transcript has expired, the turn is served from the excerpt of a citing entry the
     /// session may read, which is how an excerpt is demoted and erased with its entry.
     ///
@@ -644,7 +651,7 @@ impl Memory {
         turn: usize,
         f: &ReadFilter,
     ) -> Result<Option<TurnRead>, Error> {
-        if !f.admits(&t.domain, t.classification, TrustTier::Raw, true) {
+        if !f.admits(&t.domain, t.classification, TrustTier::Raw, true) || !f.admits_at(t.kept_at) {
             return Ok(None);
         }
         let Some(found) = t.turns.iter().find(|x| x.turn == turn) else {
@@ -662,6 +669,9 @@ impl Memory {
         if cited_by.is_empty() || !lock(&self.session).observe(t.classification) {
             return Ok(None);
         }
+        // a turn served is read: the log names the transcript, so lineage follows what
+        // this session writes after it, and an erasure of the transcript reaches that
+        self.log_read(&t.domain, vec![t.session.clone()], t.classification)?;
         Ok(Some(TurnRead {
             session: t.session.clone(),
             turn,
@@ -706,6 +716,10 @@ impl Memory {
             {
                 continue;
             }
+            // the excerpt is text of the transcript, kept with the entry and erased with
+            // either: the read names both
+            let read = vec![x.entry.clone(), x.session.clone()];
+            self.log_read(&meta.hit.domain, read, x.classification)?;
             return Ok(Some(TurnRead {
                 session: x.session,
                 turn,
@@ -729,12 +743,14 @@ impl Memory {
                     continue;
                 };
                 let front = &e.front;
-                if !f.admits(
+                let admitted = f.admits(
                     &domain,
                     front.classification,
                     front.trust_tier,
                     e.is_active(),
-                ) {
+                );
+                // the record is read here, not the index: the snapshot is asked too
+                if !admitted || !f.admits_at(front.created) {
                     continue;
                 }
                 add_citations(&mut out, &e, &domain);
@@ -843,7 +859,7 @@ impl Memory {
 
     /// Erase a transcript before its clock: its turns, the harness's lines and every
     /// excerpt of it leave the record; a stub, the header with no turns, and a receipt
-    /// remain; and the entries that cite it are flagged for review, as an erased
+    /// remain; and the entries that cite it are withheld from retrieval, as an erased
     /// entry's citers are. The owner's act, and only once.
     ///
     /// # Errors
@@ -882,7 +898,10 @@ impl Memory {
         t.excerpts.clear();
         self.put_transcript(&t, None).await?;
         self.remove_session_excerpts(session).await?;
-        receipt.flagged = self.flag_citers(session).await?;
+        let downstream = self.downstream(session).await?;
+        let near = crate::withhold::onto_receipt(&mut receipt, downstream);
+        self.put_transcript_receipt(&receipt).await?;
+        self.withhold(&near).await?;
         receipt.unresolved = vec![
             "the harness's own copy in its private home under the root's state".into(),
             "exports issued before the erasure".into(),
@@ -891,7 +910,7 @@ impl Memory {
         self.log_transcript(serde_json::json!({
             "at": rfc3339(receipt.erased_at), "action": "erase", "session": session,
             "domain": t.domain, "kept": "", "dropped": ranges(&(1..=t.turn_count).collect::<Vec<_>>()),
-            "flagged": receipt.flagged,
+            "withheld": receipt.withheld,
         }));
         Ok(receipt)
     }
@@ -938,6 +957,9 @@ impl Memory {
             reason,
             removed,
             flagged: Vec::new(),
+            withheld: Vec::new(),
+            further: Vec::new(),
+            sends: Vec::new(),
             unresolved: vec![erasure::UNFINISHED.into()],
             promotion_whys_removed: 0,
             promotion_tasks_cleared: 0,
@@ -946,7 +968,7 @@ impl Memory {
         Ok(pending)
     }
 
-    async fn put_transcript_receipt(&self, r: &Receipt) -> Result<(), Error> {
+    pub(crate) async fn put_transcript_receipt(&self, r: &Receipt) -> Result<(), Error> {
         self.store
             .put_object(
                 &r.domain,
@@ -1813,7 +1835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn early_erasure_leaves_a_stub_and_a_receipt_and_flags_the_citers() {
+    async fn early_erasure_leaves_a_stub_and_a_receipt_and_withholds_the_citers() {
         let dir = tempfile::tempdir().unwrap();
         let m = mem(dir.path());
         let k = m.keep_transcript(keep("a.jsonl")).await.unwrap();
@@ -1829,7 +1851,7 @@ mod tests {
             .unwrap();
         assert!(r.is_finished());
         assert_eq!(r.id, k.session);
-        assert_eq!(r.flagged, vec![h.clone()]);
+        assert_eq!(r.withheld, vec![h.clone()]);
         let versions: Vec<&str> = r.removed.iter().map(|v| v.version.as_str()).collect();
         assert_eq!(versions, vec!["transcript", "turns"]);
         assert_eq!(m.transcript_erasure(&k.session).await.unwrap(), Some(r));
@@ -1844,15 +1866,26 @@ mod tests {
             m.transcript_turn(&k.session, 2).await,
             Err(Error::NotFound(_))
         ));
-        let flagged = m.get(&h).await.unwrap();
-        assert_eq!(
-            flagged.front.review_by,
-            Some(OffsetDateTime::now_utc().date())
+        assert!(
+            matches!(m.get(&h).await, Err(Error::Gone(ref why)) if why.contains("withheld")),
+            "the entry that cites it is withheld"
         );
-        assert_ne!(
-            flagged.front.status,
-            Some(Status::Erased),
-            "flagged, not erased"
+        assert!(
+            m.search("cache", None, 10).await.unwrap().is_empty(),
+            "and no search gives it"
+        );
+        let kept = m.store.get("dom-me", &h).await.unwrap().unwrap();
+        assert_eq!(kept.front.status, Some(Status::Withheld));
+        assert!(
+            kept.body.contains("the cache helps"),
+            "withheld, not erased"
+        );
+        assert_eq!(
+            m.withheld(None).await.unwrap(),
+            [crate::withhold::Withheld {
+                id: h.clone(),
+                because: Some(k.session.clone()),
+            }]
         );
         assert!(matches!(
             m.erase_transcript(&k.session, Reason::Sensitive).await,
@@ -1864,5 +1897,55 @@ mod tests {
         let again = m.keep_transcript(keep("a.jsonl")).await.unwrap();
         assert_eq!(again.session, k.session);
         assert!(holding(&rec, "zanzibar").is_empty());
+    }
+    #[tokio::test]
+    async fn an_erased_transcript_withholds_what_a_reader_of_its_turns_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = mem(dir.path());
+        let k = m.keep_transcript(keep("a.jsonl")).await.unwrap();
+        let h = citing(&m, &k.session, &[2, 4], "Handoff: the cache helps.\n").await;
+        // another session reads a cited turn, and writes from it without a citation
+        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
+        let body = |text: &str| WriteRequest {
+            body: text.into(),
+            ..WriteRequest::default()
+        };
+        let before = reader.write(body("Before the turn.\n")).await.unwrap().id;
+        reader.transcript_turn(&k.session, 2).await.unwrap();
+        let drawn = reader.write(body("The cache is warm.\n")).await.unwrap();
+        assert_eq!(drawn.withheld, None);
+        let status = |id: String| {
+            let m = &m;
+            async move {
+                m.store
+                    .get("dom-me", &id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .front
+                    .status
+            }
+        };
+        let r = m
+            .erase_transcript(&k.session, Reason::Sensitive)
+            .await
+            .unwrap();
+        let mut withheld = r.withheld.clone();
+        withheld.sort();
+        let mut want = vec![h, drawn.id.clone()];
+        want.sort();
+        assert_eq!(withheld, want);
+        assert_eq!(status(drawn.id).await, Some(Status::Withheld));
+        assert_eq!(status(before).await, None, "written before the read");
+        // what the reader writes after the erasure lands withheld, on the same receipt
+        let late = reader.write(body("Still warm.\n")).await.unwrap();
+        assert_eq!(late.withheld.as_deref(), Some(k.session.as_str()));
+        assert_eq!(status(late.id.clone()).await, Some(Status::Withheld));
+        let receipt = m.transcript_erasure(&k.session).await.unwrap().unwrap();
+        assert!(
+            receipt.withheld.contains(&late.id),
+            "{:?}",
+            receipt.withheld
+        );
     }
 }

@@ -32,8 +32,8 @@ pub enum TranscriptOp {
     /// line in state/transcripts.jsonl.
     Sweep,
     /// Erase a transcript before its clock: its turns and their excerpts leave the
-    /// record, a stub and a receipt remain, and the entries citing it are flagged for
-    /// review. Irreversible; the owner only.
+    /// record, a stub and a receipt remain, and the entries citing it are withheld from
+    /// retrieval. Irreversible; the owner only.
     Erase {
         session: String,
         /// Why, as a class: the receipt keeps it.

@@ -21,9 +21,9 @@
 //! [`Memory::candidate_gates`] reports which gates an entry needs, by what its artifacts
 //! reach, and which of them are met.
 
-use crate::evaluation::SUITE_KIND;
+use crate::held_out::SUITE_KIND;
 use crate::platform::{artifacts_in, definition_block, unreadable, Autonomy, TaskDefinition};
-use crate::{lock, Error, Memory};
+use crate::{Error, Memory};
 use dm_core::{Entry, Label, TrustTier};
 use dm_ledger::DefinitionChange;
 use dm_policy::decide::{Class, Decision, Review};
@@ -137,6 +137,9 @@ fn replaced_by<'a>(candidate: &'a Entry, entries: &'a [Entry]) -> BTreeSet<&'a s
     chain
 }
 
+/// A baseline that a comparison tells something of: its entry and its classification.
+type Baseline = (String, Label);
+
 fn listed(items: &BTreeSet<String>) -> String {
     items.iter().cloned().collect::<Vec<_>>().join(", ")
 }
@@ -202,35 +205,42 @@ impl Memory {
         Ok(added.into_iter().collect())
     }
 
-    /// [`Memory::widens`], with the highest classification of the baselines that the
-    /// result tells something of.
-    async fn added_by(&self, entry: &Entry) -> Result<(BTreeSet<String>, Label), Error> {
+    /// [`Memory::widens`], with the baselines that the result tells something of: the
+    /// entry of each, and its classification.
+    async fn added_by(&self, entry: &Entry) -> Result<(BTreeSet<String>, Vec<Baseline>), Error> {
         let mut added = BTreeSet::new();
-        let mut label = Label::default();
+        let mut baselines = Vec::new();
         if !self.in_platform(entry) {
-            return Ok((added, label));
+            return Ok((added, baselines));
         }
         for def in definitions_in(entry) {
             if let Some(base) = self.baseline(entry, &def.name).await? {
                 let more = added_to(&base, &def);
                 if !more.is_empty() {
                     added.extend(more);
-                    label = label.max(base.classification);
+                    baselines.push((base.entry, base.classification));
                 }
             }
         }
-        Ok((added, label))
+        Ok((added, baselines))
     }
 
     /// The added items as this session is told them. The items say what a baseline
     /// does not declare, so a session whose handling is below that baseline is told
-    /// that there is one, and not which. A session that is told has read the baseline,
-    /// and its label is no lower.
-    fn told(&self, added: &BTreeSet<String>, baseline: Label) -> Result<String, Error> {
-        if baseline > self.handling()? {
+    /// that there is one, and not which. A session that is told has read each baseline:
+    /// its label is no lower, and the log of the platform's domain takes a read event
+    /// for each entry.
+    fn told(&self, added: &BTreeSet<String>, baselines: &[Baseline]) -> Result<String, Error> {
+        let handling = self.handling()?;
+        if baselines.iter().any(|(_, label)| *label > handling) {
             return Ok("a permission".into());
         }
-        lock(&self.session).observe(baseline);
+        if let Some(domain) = self.platform_domain() {
+            for (entry, label) in baselines {
+                // a baseline is a verified entry, which is never outside content
+                self.observe_entry(&domain, entry, *label, false)?;
+            }
+        }
         Ok(listed(added))
     }
 
@@ -241,7 +251,7 @@ impl Memory {
         if person_wrote(entry, &self.grants.owner) {
             return Ok(());
         }
-        let (added, baseline) = self.added_by(entry).await?;
+        let (added, baselines) = self.added_by(entry).await?;
         if added.is_empty() {
             return Ok(());
         }
@@ -249,7 +259,7 @@ impl Memory {
         let id = &entry.front.id;
         // the log keeps the decision whole; the session is told what it may read
         let reason = format!("{id} adds {} {rule}", listed(&added));
-        let said = format!("{id} adds {} {rule}", self.told(&added, baseline)?);
+        let said = format!("{id} adds {} {rule}", self.told(&added, &baselines)?);
         let mut input = self.promotion_input(entry, TrustTier::Verified, phase, proposer);
         input.held_task = self.held_task();
         self.log_decision(
@@ -365,7 +375,7 @@ impl Memory {
                 format!("{name} declares no tool, scope or autonomy that the version before it does not"),
             ));
         }
-        let what = self.told(&added, base.classification)?;
+        let what = self.told(&added, &[(base.entry.clone(), base.classification)])?;
         if person_wrote(entry, &self.grants.owner) {
             return Ok((
                 true,
@@ -500,8 +510,10 @@ fn block_reach(kind: &str, name: &str, platform: bool, held_out: bool) -> Option
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::evaluation::Answer;
-    use crate::testing::{as_author, held_out_root, root, verify, written, written_in, EVALUATOR};
+    use crate::held_out::Answer;
+    use crate::testing::{
+        as_author, held_out_root, read_in_log, root, verify, written, written_in, EVALUATOR,
+    };
     use crate::{Promotion, WriteRequest};
     use dm_core::EntryType;
     use dm_ledger::Task;
@@ -1120,5 +1132,30 @@ mod tests {
         let gates = high.candidate_gates(&id).await.unwrap();
         assert!(gates.safety.why.contains("tool:shell"), "{gates:?}");
         assert_eq!(high.label(), Label::Restricted);
+    }
+
+    /// A session that is told what a candidate adds has read the version before it: the
+    /// log of the platform's domain holds a read event of that session for the entry.
+    /// The refusal of a proposal tells it, and the report of the gates tells it.
+    #[tokio::test]
+    async fn a_session_that_is_told_what_a_candidate_adds_has_a_read_event_for_the_baseline() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root(dir.path());
+        let base = written(&owner, &tidy(&["tool:fetch"]), true).await;
+        let wider = tidy(&["tool:fetch", "tool:shell"]);
+        let id = candidate(dir.path(), AGENT, &wider, None).await;
+        let proposer = as_author(dir.path(), AGENT);
+        assert!(!read_in_log(&proposer, "dom-plat").contains(&base));
+        let refused = proposer
+            .promote(&id, TrustTier::Verified, "read against the tree")
+            .await;
+        assert!(denied(&refused, "tool:shell"), "{refused:?}");
+        let read = read_in_log(&proposer, "dom-plat");
+        assert!(read.contains(&base), "the refusal: {read:?}");
+        let viewer = as_author(dir.path(), "agent:b");
+        let gates = viewer.candidate_gates(&id).await.unwrap();
+        assert!(gates.safety.why.contains("tool:shell"), "{gates:?}");
+        let read = read_in_log(&viewer, "dom-plat");
+        assert!(read.contains(&base), "the report: {read:?}");
     }
 }

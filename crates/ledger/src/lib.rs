@@ -40,6 +40,12 @@
 //! event as any waiting task does, and [`Ledger::complete_awaited`] closes it when the
 //! verdict comes.
 //!
+//! A task may name a position, with a reason: it is then pinned. A pinned task goes only
+//! to a claimant that fills that position, and a claimant that fills a position takes an
+//! unpinned task only when the position's charter covers the task's definition. One
+//! function, [`seat_takes`], holds that rule for both backends. Here a position is a
+//! name; the record that describes it is not the ledger's.
+//!
 //! Time comes from a clock the ledger owns, so tests can move it.
 
 mod definition;
@@ -104,6 +110,18 @@ pub enum Error {
     AttemptSpent {
         /// The key.
         key: String,
+    },
+    /// A task was filed with half a pin: a position and no reason, a reason and no
+    /// position, or a position with no name.
+    #[error("a pin names a position and gives a reason: {0}")]
+    BadPin(String),
+    /// The task is pinned to a position the claimant does not fill.
+    #[error("task {id} is pinned to position {position}; only a session that fills that position claims it")]
+    Pinned {
+        /// The task.
+        id: String,
+        /// The position it is pinned to.
+        position: String,
     },
     /// Another connection holds the write-ahead log, so text just removed may still be
     /// in it. Run the operation again.
@@ -176,6 +194,45 @@ impl Status {
     }
 }
 
+/// Why a task is pinned to a position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PinReason {
+    /// The position holds open commitments the task depends on.
+    Continuity,
+    /// Someone outside expects one identity.
+    Relationship,
+    /// Review goes to a position other than the author's.
+    Separation,
+}
+
+impl PinReason {
+    /// The reason as the ledger stores it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PinReason::Continuity => "continuity",
+            PinReason::Relationship => "relationship",
+            PinReason::Separation => "separation",
+        }
+    }
+}
+
+impl std::str::FromStr for PinReason {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<PinReason, Error> {
+        match s {
+            "continuity" => Ok(PinReason::Continuity),
+            "relationship" => Ok(PinReason::Relationship),
+            "separation" => Ok(PinReason::Separation),
+            other => Err(Error::BadPin(format!(
+                "{other:?} is no reason; one of continuity, relationship, separation"
+            ))),
+        }
+    }
+}
+
 /// What a caller files. Everything else on a [`Task`] the ledger fills in.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
@@ -212,6 +269,10 @@ pub struct TaskSpec {
     /// The checks that say this task is done, its own or those its definition gave it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub acceptance: Vec<String>,
+    /// Whether the task is content from authors outside the fleet: a tap filed it, or a
+    /// session that had read such content filed it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub outside: bool,
     /// The task this one was split from.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent: Option<String>,
@@ -230,6 +291,13 @@ pub struct TaskSpec {
     /// The policy in force when the task was filed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub policy_context: Vec<String>,
+    /// The position the task is pinned to: only a claimant that fills it claims the
+    /// task. Absent when any matching claimant may.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<String>,
+    /// Why it is pinned. Present exactly when `position` is.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin_reason: Option<PinReason>,
 }
 
 /// What triage scored a task: the parts its rank is made of.
@@ -300,6 +368,8 @@ struct Extra {
     definition: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     acceptance: Vec<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    outside: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     parent: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,6 +382,10 @@ struct Extra {
     artifacts_touched: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     policy_context: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    position: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pin_reason: Option<PinReason>,
     /// The outside event the task waits on. Not of the spec: events set and clear it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     waits_on: Option<String>,
@@ -366,16 +440,34 @@ impl TaskSpec {
         let extra = Extra {
             definition: self.definition.clone(),
             acceptance: self.acceptance.clone(),
+            outside: self.outside,
             parent: self.parent.clone(),
             scores: self.scores.clone(),
             implements: self.implements.clone(),
             reversibility: self.reversibility,
             artifacts_touched: self.artifacts_touched.clone(),
             policy_context: self.policy_context.clone(),
+            position: self.position.clone(),
+            pin_reason: self.pin_reason,
             waits_on: None,
             effects: Vec::new(),
         };
         serde_json::to_string(&extra).unwrap_or_default()
+    }
+
+    /// Refuse half a pin: a position and a reason come together, and a position has a
+    /// name.
+    fn check_pin(&self) -> Result<(), Error> {
+        match (self.position.as_deref(), self.pin_reason) {
+            (None, None) => Ok(()),
+            (Some(""), _) => Err(Error::BadPin("the position has no name".into())),
+            (Some(_), Some(_)) => Ok(()),
+            (Some(p), None) => Err(Error::BadPin(format!("position {p} has no reason"))),
+            (None, Some(r)) => Err(Error::BadPin(format!(
+                "the reason {} has no position",
+                r.as_str()
+            ))),
+        }
     }
 }
 
@@ -480,12 +572,43 @@ pub struct Claim {
     pub generation: u64,
 }
 
-/// Who claims, and the attempt key it gave: a retry of the same claim carries the same
-/// key, so it is the same claim and not a second one.
+/// The position a claimant fills, and what its charter covers.
 #[derive(Clone, Copy, Debug)]
-pub(crate) struct Claimant<'a> {
-    pub(crate) holder: &'a str,
-    pub(crate) attempt: Option<&'a str>,
+pub struct Seat<'a> {
+    /// The position's name.
+    pub position: &'a str,
+    /// The names of the task definitions the position's charter covers.
+    pub covers: &'a [String],
+}
+
+/// Who claims, and what the ledger matches a task against.
+#[derive(Clone, Copy, Debug)]
+pub struct Claimer<'a> {
+    /// Who holds the task once it is claimed.
+    pub holder: &'a str,
+    /// The capabilities the claimant carries: a task's requirements must all be here.
+    pub manifest: &'a [String],
+    /// The highest classification the claimant handles.
+    pub handling: Label,
+    /// The position the claimant fills, when it fills one.
+    pub seat: Option<Seat<'a>>,
+    /// The attempt key the claimant gave: a retry of the same claim carries the same
+    /// key, so it is the same claim and not a second one.
+    pub attempt: Option<&'a str>,
+}
+
+impl Claimer<'_> {
+    /// The event of a claim this claimant makes: the claim of `generation`, under a lease
+    /// until `until`, from the position it fills.
+    pub(crate) fn claimed(&self, until: OffsetDateTime, generation: u64) -> Event {
+        Event::Claimed {
+            holder: self.holder.to_string(),
+            until,
+            generation,
+            attempt: self.attempt.map(str::to_string),
+            position: self.seat.map(|s| s.position.to_string()),
+        }
+    }
 }
 
 /// What a backend's `claim_next` did: claimed a task, or found the claim the caller's
@@ -514,6 +637,61 @@ pub struct LateHandoff {
     pub generation: u64,
     /// The handoff entry.
     pub handoff: String,
+}
+
+/// What a person said of the result of a task.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OutcomeKind {
+    /// The result was taken as it was.
+    Accepted,
+    /// The result was taken after a person changed it.
+    Corrected,
+    /// The result was not taken.
+    Rejected,
+    /// The result was taken and then undone.
+    Reverted,
+}
+
+impl OutcomeKind {
+    /// The word the ledger and the command line use for it.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            OutcomeKind::Accepted => "accepted",
+            OutcomeKind::Corrected => "corrected",
+            OutcomeKind::Rejected => "rejected",
+            OutcomeKind::Reverted => "reverted",
+        }
+    }
+
+    /// The kind that `word` names, if it names one.
+    #[must_use]
+    pub fn parse(word: &str) -> Option<Self> {
+        [
+            OutcomeKind::Accepted,
+            OutcomeKind::Corrected,
+            OutcomeKind::Rejected,
+            OutcomeKind::Reverted,
+        ]
+        .into_iter()
+        .find(|k| k.word() == word)
+    }
+}
+
+/// An outcome event on a task: what became of its result, who said so, and a note. It
+/// changes nothing of the task, so a closed task takes one too.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutcomeEvent {
+    /// What became of the result.
+    pub outcome: OutcomeKind,
+    /// The person who said so.
+    pub by: String,
+    /// What that person wrote. An erasure of the task puts the redaction here.
+    pub note: String,
+    /// When.
+    #[serde(with = "time::serde::rfc3339")]
+    pub at: OffsetDateTime,
 }
 
 /// What a promotion records: which version of an entry was moved to which tier, by
@@ -640,6 +818,9 @@ enum Event {
         /// The attempt key the caller gave, when it gave one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         attempt: Option<String>,
+        /// The position the claimant filled, when it filled one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        position: Option<String>,
     },
     /// A claim of a named task the ledger refused, and why. Changes nothing; it is the
     /// record that someone tried.
@@ -652,6 +833,15 @@ enum Event {
         holder: String,
         generation: u64,
         handoff: String,
+    },
+    /// What a person said of the result. Changes nothing of the task. The enum is tagged
+    /// with `kind`, so the kind of the outcome is the field `outcome`.
+    Outcome {
+        outcome: OutcomeKind,
+        by: String,
+        note: String,
+        #[serde(with = "time::serde::rfc3339")]
+        at: OffsetDateTime,
     },
     Heartbeat {
         #[serde(with = "time::serde::rfc3339")]
@@ -703,6 +893,13 @@ enum Event {
         priority: i64,
         why: String,
     },
+    /// The pin was taken off a task, so the task is back in matching: the position it
+    /// was pinned to, and why. The why is a sentence the caller builds, not a person's
+    /// text: an erasure does not rewrite it.
+    Unpinned {
+        position: String,
+        why: String,
+    },
     /// An entry was promoted, and why. Appended under [`promotion_key`], never a task id.
     /// An erasure of the entry rewrites it with the why removed and `why_erased` set.
     Promoted {
@@ -732,6 +929,7 @@ impl Event {
             Event::Claimed { .. } => "claimed",
             Event::ClaimRefused { .. } => "claim_refused",
             Event::LateHandoff { .. } => "late_handoff",
+            Event::Outcome { .. } => "outcome",
             Event::Heartbeat { .. } => "heartbeat",
             Event::Released => "released",
             Event::HandoffLeft { .. } => "handoff_left",
@@ -743,6 +941,7 @@ impl Event {
             Event::EffectSettled { .. } => "effect_settled",
             Event::Posted { .. } => "posted",
             Event::Rescored { .. } => "rescored",
+            Event::Unpinned { .. } => "unpinned",
             Event::Promoted { .. } => "promoted",
             Event::Approved(_) => "approved",
             Event::Definition(_) => "definition",
@@ -763,6 +962,191 @@ impl Event {
             what: format!("event payload: {e}"),
         })
     }
+}
+
+/// One event of the ledger as the log of its domain takes it: which task, what happened
+/// to it, who did it and under which attempt key. It has no field for a title, a body, a
+/// handoff, a reason or a why, so no text of a task or of a promotion leaves the ledger
+/// in it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Logged {
+    /// Its place among the ledger's events: the order the ledger appended them in.
+    pub seq: u64,
+    /// The task, or the key that a promotion or an approval of an entry, or a record of
+    /// a task definition, is appended under.
+    pub task: String,
+    /// What happened: `created`, `claimed`, `completed` and the rest, as the ledger's
+    /// `kind` column names them.
+    pub op: String,
+    /// When, as the ledger wrote it.
+    pub at: String,
+    /// Who did it: the filer of a `created`, the holder that a `claimed`, a
+    /// `claim_refused` or a `late_handoff` names, the promoter of a `promoted`, the
+    /// person who said an `outcome`, the
+    /// approver of an `approved`, the grader, the recorder of a work outcome or the
+    /// signer that a `definition` names, and for a
+    /// `heartbeat`, a `released`, a `handoff_left`, a `waiting`, an `effect_begun` and a
+    /// `completed` the holder whose lease was live; for an `effect_settled`, who settled
+    /// it. Absent for the others, for a `completed` that the task's continuation or a
+    /// verdict caused, which no holder did, and for a `definition` that raises a level
+    /// with no sign-off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub principal: Option<String>,
+    /// The attempt key a `claimed` or a `completed` was made under.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt: Option<String>,
+    /// The classification of the task, or of the promotion. An approval and a record of
+    /// a task definition record none, and each is given at the highest label.
+    pub classification: Label,
+}
+
+/// The kinds of event that say who holds a task: a backend gives these for a task from
+/// before the number asked for too, so the holder of a later event can be named.
+pub(crate) const LEASE_KINDS: &str = "'claimed', 'heartbeat', 'released', 'waiting'";
+
+/// A row of the events table, with what the task's row says of the task.
+pub(crate) struct RawEvent {
+    pub(crate) seq: i64,
+    pub(crate) task: String,
+    pub(crate) at: String,
+    pub(crate) payload: String,
+    /// The domain of the task's row. None for an event of no task: a promotion, an
+    /// approval or a record of a task definition.
+    pub(crate) domain: Option<String>,
+    /// The label rank of the task's row.
+    pub(crate) label_rank: Option<i64>,
+}
+
+/// The claim in force on a task, as the events read so far say.
+struct Lease {
+    holder: String,
+    until: OffsetDateTime,
+}
+
+/// Who caused `event`, and the attempt key it was made under. `lease` is the claim in
+/// force on the task before the event, `at` the event's time. An event only the holder
+/// may cause names the holder when the lease was live at that time, which is what the
+/// ledger checked as it appended the event; a time that does not parse names the holder.
+fn who(
+    event: &Event,
+    lease: Option<&Lease>,
+    at: Option<OffsetDateTime>,
+) -> (Option<String>, Option<String>) {
+    let holder = || {
+        lease
+            .filter(|l| at.is_none_or(|at| l.until >= at))
+            .map(|l| l.holder.clone())
+    };
+    match event {
+        Event::Created { spec, .. } => (
+            Some(spec.created_by.clone()).filter(|by| !by.is_empty()),
+            None,
+        ),
+        Event::Claimed {
+            holder, attempt, ..
+        } => (Some(holder.clone()), attempt.clone()),
+        Event::ClaimRefused { holder, .. } | Event::LateHandoff { holder, .. } => {
+            (Some(holder.clone()), None)
+        }
+        Event::Promoted { spec, .. } => (Some(spec.by.clone()), None),
+        Event::Outcome { by, .. } => (Some(by.clone()), None),
+        // the person who approved, as the event records it; never the one it is for
+        Event::Approved(record) => (Some(record.spec.principal.clone()), None),
+        Event::Definition(record) => (definition_by(&record.change), None),
+        Event::Heartbeat { .. }
+        | Event::Released
+        | Event::HandoffLeft { .. }
+        | Event::Waiting { .. }
+        | Event::EffectBegun { .. } => (holder(), None),
+        // the one who settled it is on the event: the holder, or who reconciled after
+        Event::EffectSettled { by, .. } => (Some(by.clone()), None),
+        Event::Completed { attempt, .. } => (holder(), attempt.clone()),
+        Event::Admitted
+        | Event::Blocked { .. }
+        | Event::Unblocked { .. }
+        | Event::Retriaged { .. }
+        | Event::Invalidated { .. }
+        | Event::Posted { .. }
+        | Event::Arrived { .. }
+        | Event::Rescored { .. }
+        // the event names the position the pin was on, and no person
+        | Event::Unpinned { .. } => (None, None),
+    }
+}
+
+/// Who recorded a change to what a task definition earned: the grader of a run, the
+/// person who recorded a work outcome, and the person who signed a raise off. A raise
+/// that needs no sign-off records nobody.
+fn definition_by(change: &DefinitionChange) -> Option<String> {
+    match change {
+        DefinitionChange::Graded { by, .. } | DefinitionChange::Outcome { by, .. } => {
+            Some(by.clone())
+        }
+        DefinitionChange::Raised { signed_by, .. } => signed_by.clone(),
+    }
+}
+
+/// The events of `domain` after sequence number `after`, from `rows` in the ledger's
+/// order. The rows hold the earlier events of [`LEASE_KINDS`] too: they say who held
+/// each task, and none of them is given back.
+fn logged(rows: Vec<RawEvent>, domain: &str, after: u64) -> Result<Vec<Logged>, Error> {
+    let mut held: std::collections::HashMap<String, Lease> = std::collections::HashMap::new();
+    let mut out = Vec::new();
+    for row in rows {
+        let event = Event::parse(&row.task, &row.payload)?;
+        let at = OffsetDateTime::parse(&row.at, &Rfc3339).ok();
+        let (principal, attempt) = who(&event, held.get(&row.task), at);
+        let (own_domain, own_label) = match &event {
+            Event::Claimed { holder, until, .. } => {
+                let lease = Lease {
+                    holder: holder.clone(),
+                    until: *until,
+                };
+                held.insert(row.task.clone(), lease);
+                (None, None)
+            }
+            Event::Heartbeat { until } => {
+                if let Some(lease) = held.get_mut(&row.task) {
+                    lease.until = *until;
+                }
+                (None, None)
+            }
+            // a holder that waits for an outside event gives the task up, as a release does
+            Event::Released | Event::Waiting { .. } => {
+                held.remove(&row.task);
+                (None, None)
+            }
+            // a created event and a promoted one name their own domain and label
+            Event::Created { spec, .. } => (Some(spec.domain.as_str()), Some(spec.classification)),
+            Event::Promoted { spec, .. } => (Some(spec.domain.as_str()), Some(spec.classification)),
+            // an approval names its own domain. It records no label and has no task row,
+            // so it is at the highest label, as an event of a task whose row is gone
+            Event::Approved(record) => (Some(record.spec.domain.as_str()), None),
+            // a definition record names its own domain, and it records no label either
+            Event::Definition(record) => (Some(record.domain.as_str()), None),
+            _ => (None, None),
+        };
+        let seq = u64::try_from(row.seq).unwrap_or(0);
+        if seq <= after || own_domain.or(row.domain.as_deref()) != Some(domain) {
+            continue;
+        }
+        let classification = match (own_label, row.label_rank) {
+            (Some(label), _) => label,
+            (None, Some(rank)) => label_from_rank(&row.task, rank)?,
+            // a task whose row is gone: nothing says what it is, so it is the highest
+            (None, None) => Label::Restricted,
+        };
+        out.push(Logged {
+            seq,
+            task: row.task,
+            op: event.kind().to_string(),
+            at: row.at,
+            principal,
+            attempt,
+            classification,
+        });
+    }
+    Ok(out)
 }
 
 /// What a PostgreSQL ledger keeps of a why after the rows are rewritten: the server, not
@@ -805,6 +1189,17 @@ fn redact_event(id: &str, payload: &str, redaction: &Redaction) -> Result<Option
             holder,
             generation,
             handoff: redaction.reason.clone(),
+        },
+        Event::Outcome {
+            outcome,
+            by,
+            note,
+            at,
+        } if note != redaction.reason => Event::Outcome {
+            outcome,
+            by,
+            note: redaction.reason.clone(),
+            at,
         },
         _ => return Ok(None),
     };
@@ -1025,12 +1420,15 @@ impl RawTask {
                 priority: self.priority,
                 definition: extra.definition,
                 acceptance: extra.acceptance,
+                outside: extra.outside,
                 parent: extra.parent,
                 scores: extra.scores,
                 implements: extra.implements,
                 reversibility: extra.reversibility,
                 artifacts_touched: extra.artifacts_touched,
                 policy_context: extra.policy_context,
+                position: extra.position,
+                pin_reason: extra.pin_reason,
             },
             created: parse_time(&id, &self.created)?,
             status: Status::parse(&id, &self.status)?,
@@ -1074,20 +1472,46 @@ fn filed_from_of(origin: Option<&str>) -> Option<&str> {
         .find_map(|p| origin.strip_prefix(p))
 }
 
-/// Whether a session may claim `task` now: it is admitted, or claimed under a lease
-/// that has run out; the session's manifest carries every requirement; and the
-/// session's handling covers the task's classification. Whether its dependencies are
-/// complete is the backend's question, asked inside the transaction.
-fn claimable(task: &Task, now: OffsetDateTime, manifest: &[String], handling: Label) -> bool {
+/// Whether a claimant in `seat` takes a task filed as `spec`, as far as positions go. A
+/// pinned task goes only to a claimant that fills its position. An unpinned task goes to
+/// a claimant that fills no position, and to one that fills a position whose charter
+/// covers the task's definition: the name before the `@` of `<name>@<version>`.
+fn seat_takes(spec: &TaskSpec, seat: Option<Seat<'_>>) -> bool {
+    match (spec.position.as_deref(), seat) {
+        (Some(pinned), Some(seat)) => seat.position == pinned,
+        (Some(_), None) => false,
+        (None, None) => true,
+        (None, Some(seat)) => spec.definition.as_deref().is_some_and(|d| {
+            let name = d.split_once('@').map_or(d, |(name, _)| name);
+            seat.covers.iter().any(|c| c == name)
+        }),
+    }
+}
+
+/// Whether what `who` carries lets it hold `task`, whatever state the task is in: its
+/// manifest carries every requirement, its handling covers the task's classification,
+/// and its seat takes the task.
+fn matches_task(task: &Task, who: Claimer<'_>) -> bool {
+    task.spec.classification <= who.handling
+        && task
+            .spec
+            .requirements
+            .iter()
+            .all(|r| who.manifest.contains(r))
+        && seat_takes(&task.spec, who.seat)
+}
+
+/// Whether `who` may claim `task` now: it is admitted, or claimed under a lease that has
+/// run out; nothing holds it back, an event it waits on or an effect nobody has settled;
+/// and `who` matches it. Whether its dependencies are complete is the backend's question,
+/// asked inside the transaction.
+fn claimable(task: &Task, now: OffsetDateTime, who: Claimer<'_>) -> bool {
     let lease_live = task.lease_until.is_some_and(|t| t >= now);
     // a blocked task is a candidate too: the backend asks whether its dependencies are
     // done, so one whose last dependency closed without the event reaching it is not lost
     let state = matches!(task.status, Status::Open | Status::Blocked)
         || (task.status == Status::Claimed && !lease_live);
-    state
-        && task.held_back().is_none()
-        && task.spec.classification <= handling
-        && task.spec.requirements.iter().all(|r| manifest.contains(r))
+    state && task.held_back().is_none() && matches_task(task, who)
 }
 
 /// Whether `by` acts under the claim in force: its generation first, since a claim made
@@ -1255,11 +1679,17 @@ impl Ledger {
     /// the domain already has a task with that pair, that task is returned and nothing is
     /// filed; another domain's task with the same pair is not this domain's.
     ///
+    /// A task that names a position is pinned to it, and gives the reason. A continuation
+    /// of a pinned task that names no position takes its parent's pin: the work it
+    /// resumes is the position's. A subagent task and a retry do not.
+    ///
     /// # Errors
     ///
-    /// [`Error::WrongState`], naming the task, when the origin files this one from a
-    /// task whose work is held by an effect that nobody has settled; a database error.
-    pub async fn create(&mut self, spec: TaskSpec) -> Result<Created, Error> {
+    /// [`Error::BadPin`] for a position without a reason, a reason without a position,
+    /// or a position with no name; [`Error::WrongState`], naming the task, when the
+    /// origin files this one from a task whose work is held by an effect that nobody has
+    /// settled; a database error.
+    pub async fn create(&mut self, mut spec: TaskSpec) -> Result<Created, Error> {
         if let (Some(o), Some(u)) = (&spec.origin, &spec.upstream_event) {
             let existing = on_backend!(&self.backend, db => db.find_origin(&spec.domain, o, u))?;
             if let Some(id) = existing {
@@ -1269,6 +1699,7 @@ impl Ledger {
                 });
             }
         }
+        spec.check_pin()?;
         // the work of a task with an effect that nobody has settled goes to nobody else,
         // under another task's name either: no continuation, retry or part of it is filed
         if let Some(from) = filed_from_of(spec.origin.as_deref()) {
@@ -1280,6 +1711,7 @@ impl Ledger {
                 });
             }
         }
+        self.inherit_pin(&mut spec).await?;
         let id = dm_core::id::new_task_id(&spec.domain);
         let now = self.now();
         let event = Event::Created {
@@ -1291,6 +1723,24 @@ impl Ledger {
             task: self.get(&id).await?,
             deduplicated: false,
         })
+    }
+
+    /// Give a continuation that names no position the pin of the task it continues, when
+    /// this ledger holds that task in the same domain and it is pinned.
+    async fn inherit_pin(&self, spec: &mut TaskSpec) -> Result<(), Error> {
+        let parent = match spec.origin.as_deref().map(|o| o.strip_prefix("continues:")) {
+            Some(Some(parent)) if spec.position.is_none() => parent.to_string(),
+            _ => return Ok(()),
+        };
+        match self.get(&parent).await {
+            Ok(p) if p.spec.domain == spec.domain => {
+                spec.position = p.spec.position;
+                spec.pin_reason = p.spec.pin_reason;
+                Ok(())
+            }
+            Ok(_) | Err(Error::NotFound(_)) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 
     /// The task whose unsettled effect holds the work of `id`: `id` itself, or a task
@@ -1379,7 +1829,8 @@ impl Ledger {
     /// manifest satisfies, whose classification `handling` covers, and whose
     /// dependencies are complete. Claimable means admitted, or claimed under a lease
     /// that has expired. One transaction, so one holder; a task above `handling` is
-    /// passed over inside it, so it is never claimed and then given back.
+    /// passed over inside it, so it is never claimed and then given back. The claimant
+    /// fills no position: a pinned task is passed over too.
     ///
     /// # Errors
     ///
@@ -1392,12 +1843,14 @@ impl Ledger {
         manifest: &[String],
         handling: Label,
     ) -> Result<Option<Claim>, Error> {
-        let who = Claimant {
+        let who = Claimer {
             holder,
+            manifest,
+            handling,
+            seat: None,
             attempt: None,
         };
-        self.claim_next_as(domain, who, lease, manifest, handling)
-            .await
+        self.claim_next_by(domain, who, lease).await
     }
 
     /// [`Ledger::claim_next`] under an attempt key. A caller that did not hear the answer
@@ -1418,23 +1871,24 @@ impl Ledger {
         (manifest, handling): (&[String], Label),
         attempt: &str,
     ) -> Result<Option<Claim>, Error> {
-        let who = Claimant {
+        let who = Claimer {
             holder,
+            manifest,
+            handling,
+            seat: None,
             attempt: Some(attempt),
         };
-        self.claim_next_as(domain, who, lease, manifest, handling)
-            .await
+        self.claim_next_by(domain, who, lease).await
     }
 
     /// The claim an attempt key made, if it is still in force and is one this caller
     /// could hold: its holder, its generation and a live lease, within the caller's
-    /// handling and manifest. Anything else is a key that is spent.
+    /// handling and manifest, and from a seat that takes the task. Anything else is a
+    /// key that is spent.
     async fn same_claim(
         &self,
         (id, generation): (&str, u64),
-        who: Claimant<'_>,
-        manifest: &[String],
-        handling: Label,
+        who: Claimer<'_>,
     ) -> Result<Claim, Error> {
         let task = self.get(id).await?;
         let now = self.now();
@@ -1442,8 +1896,7 @@ impl Ledger {
             && task.generation == generation
             && task.holder.as_deref() == Some(who.holder)
             && task.lease_until.is_some_and(|t| t >= now)
-            && task.spec.classification <= handling
-            && task.spec.requirements.iter().all(|r| manifest.contains(r));
+            && matches_task(&task, who);
         match (in_force, task.lease_until) {
             (true, Some(lease_until)) => Ok(Claim {
                 generation: task.generation,
@@ -1456,17 +1909,25 @@ impl Ledger {
         }
     }
 
-    async fn claim_next_as(
+    /// [`Ledger::claim_next`] by a claimant that says all of what it is: its manifest,
+    /// its handling, the position it fills and its attempt key. A claimant that fills a
+    /// position takes the tasks pinned to it, and the unpinned tasks whose definition the
+    /// position's charter covers. With an attempt key, as [`Ledger::claim_next_once`].
+    /// The claim records the position it was made from.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::AttemptSpent`] when the key's claim is over, or is not one this claimant
+    /// could have made; a database error.
+    pub async fn claim_next_by(
         &mut self,
         domain: &str,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         lease: Duration,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<Option<Claim>, Error> {
         let now = self.now();
         let until = now + lease;
-        let taken = on_backend!(&mut self.backend, db => db.claim_next(domain, now, who, until, manifest, handling))?;
+        let taken = on_backend!(&mut self.backend, db => db.claim_next(domain, now, who, until))?;
         match taken {
             Some(Taken::New(id)) => {
                 self.trace("claimed", &id).await;
@@ -1477,10 +1938,9 @@ impl Ledger {
                     lease_until: until,
                 }))
             }
-            Some(Taken::Again { id, generation }) => self
-                .same_claim((&id, generation), who, manifest, handling)
-                .await
-                .map(Some),
+            Some(Taken::Again { id, generation }) => {
+                self.same_claim((&id, generation), who).await.map(Some)
+            }
             None => Ok(None),
         }
     }
@@ -1491,7 +1951,7 @@ impl Ledger {
     ///
     /// [`Error::NotFound`]; [`Error::WrongState`] when it is not claimable, including when
     /// another holder's lease is still live, a dependency is open, or the task is above
-    /// `handling`.
+    /// `handling`; [`Error::Pinned`] when it is pinned.
     pub async fn claim(
         &mut self,
         id: &str,
@@ -1500,16 +1960,40 @@ impl Ledger {
         manifest: &[String],
         handling: Label,
     ) -> Result<Claim, Error> {
-        let now = self.now();
-        let until = now + lease;
-        let who = Claimant {
+        let who = Claimer {
             holder,
+            manifest,
+            handling,
+            seat: None,
             attempt: None,
         };
-        let claimed =
-            on_backend!(&mut self.backend, db => db.claim(id, now, who, until, manifest, handling));
+        self.claim_by(id, who, lease).await
+    }
+
+    /// Claim one named task, under the same rules as [`Ledger::claim_next_by`]. The
+    /// attempt key is recorded with the claim and is not looked up.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]; [`Error::Pinned`] when the task is admitted and pinned to a
+    /// position the claimant does not fill; [`Error::WrongState`] when it is not
+    /// claimable for another reason.
+    pub async fn claim_by(
+        &mut self,
+        id: &str,
+        who: Claimer<'_>,
+        lease: Duration,
+    ) -> Result<Claim, Error> {
+        let now = self.now();
+        let until = now + lease;
+        let claimed = on_backend!(&mut self.backend, db => db.claim(id, now, who, until));
         if matches!(claimed, Err(Error::WrongState { .. })) {
-            self.record_refusal(id, holder, now).await?;
+            if let Some(position) = self.record_refusal(id, who, now).await? {
+                return Err(Error::Pinned {
+                    id: id.to_string(),
+                    position,
+                });
+            }
         }
         claimed?;
         self.trace("claimed", id).await;
@@ -1524,18 +2008,26 @@ impl Ledger {
     /// A claim that lost is part of the task's record, while the task can still be
     /// claimed by someone. The reason names the claim it lost to, so the same holder
     /// refused twice under one claim is on the record once, and again under the next.
+    /// Returns the position, when the pin is why: the task is admitted and pinned to a
+    /// position the claimant does not fill.
     async fn record_refusal(
         &mut self,
         id: &str,
-        holder: &str,
+        who: Claimer<'_>,
         now: OffsetDateTime,
-    ) -> Result<(), Error> {
+    ) -> Result<Option<String>, Error> {
         let task = self.get(id).await?;
         if task.status.is_terminal() {
-            return Ok(());
+            return Ok(None);
         }
         let lease_live = task.lease_until.is_some_and(|t| t >= now);
-        let why = if task.status == Status::Claimed && lease_live {
+        let pinned_away =
+            task.spec.position.clone().filter(|p| {
+                task.status != Status::Proposed && who.seat.map(|s| s.position) != Some(p)
+            });
+        let why = if let Some(position) = &pinned_away {
+            format!("the task is pinned to position {position}, and the session does not fill it")
+        } else if task.status == Status::Claimed && lease_live {
             format!(
                 "the lease of the claim of generation {} was live",
                 task.generation
@@ -1555,14 +2047,113 @@ impl Ledger {
             )
         };
         let last = self.refused_claims(id).await?.pop();
-        if last.as_ref() == Some(&(holder.to_string(), why.clone())) {
-            return Ok(());
+        if last.as_ref() != Some(&(who.holder.to_string(), why.clone())) {
+            let refused = Event::ClaimRefused {
+                holder: who.holder.to_string(),
+                why,
+            };
+            self.append_at(id, now, &refused).await?;
         }
-        let refused = Event::ClaimRefused {
-            holder: holder.to_string(),
-            why,
+        Ok(pinned_away)
+    }
+
+    /// Take the pin off a task, so it returns to matching: any claimant that matches it
+    /// may claim it. `why` is a sentence the caller builds and never a person's own
+    /// text: it is kept in the log, where an erasure does not reach it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`]; [`Error::WrongState`] when the task is terminal or is not
+    /// pinned.
+    pub async fn unpin(&mut self, id: &str, why: &str) -> Result<Task, Error> {
+        let task = self.get(id).await?;
+        let position = match task.spec.position {
+            Some(position) if !task.status.is_terminal() => position,
+            _ => {
+                return Err(Error::WrongState {
+                    id: id.to_string(),
+                    status: task.status,
+                    op: "unpin",
+                })
+            }
         };
-        self.append_at(id, now, &refused).await
+        let unpinned = Event::Unpinned {
+            position,
+            why: why.to_string(),
+        };
+        self.append(id, &unpinned).await?;
+        self.get(id).await
+    }
+
+    /// The tasks of a domain that are pinned to a position and not closed: proposed,
+    /// open, blocked or claimed, ranked as the queue ranks them.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the ledger did not write.
+    pub async fn pinned_to(&self, domain: &str, position: &str) -> Result<Vec<Task>, Error> {
+        let mut out = Vec::new();
+        for status in [
+            Status::Proposed,
+            Status::Open,
+            Status::Blocked,
+            Status::Claimed,
+        ] {
+            let tasks = self.list(domain, status).await?;
+            out.extend(
+                tasks
+                    .into_iter()
+                    .filter(|t| t.spec.position.as_deref() == Some(position)),
+            );
+        }
+        in_queue_order(&mut out);
+        Ok(out)
+    }
+
+    /// Who fills a position in a domain now, as far as the ledger sees: the holders of
+    /// the tasks claimed from that position under a lease that is live. Sorted, each
+    /// once. A session that fills the position and holds no task is not seen.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn seated(&self, domain: &str, position: &str) -> Result<Vec<String>, Error> {
+        let held = self.held_from(domain, position).await?;
+        let mut out: Vec<String> = held.into_iter().filter_map(|t| t.holder).collect();
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    /// The tasks of a domain that a session claimed from a position and holds under a
+    /// lease that is live: each names its holder. A caller that shows who is in the
+    /// position shows the holders of the tasks its reader may see.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn held_from(&self, domain: &str, position: &str) -> Result<Vec<Task>, Error> {
+        let now = self.now();
+        let mut out = Vec::new();
+        for task in self.list(domain, Status::Claimed).await? {
+            let live = task.lease_until.is_some_and(|t| t >= now);
+            if !live || task.holder.is_none() {
+                continue;
+            }
+            let claims = on_backend!(&self.backend, db => db.payloads_of(&task.id, "claimed"))?;
+            let from = match claims
+                .last()
+                .map(|p| Event::parse(&task.id, p))
+                .transpose()?
+            {
+                Some(Event::Claimed { position, .. }) => position,
+                _ => None,
+            };
+            if from.as_deref() == Some(position) {
+                out.push(task);
+            }
+        }
+        Ok(out)
     }
 
     /// What holds `task` back from every claim, in words for its record: the event it
@@ -2110,6 +2701,63 @@ impl Ledger {
         Ok(out)
     }
 
+    /// Keep what a person said of the result of a task: an outcome event. It changes
+    /// nothing of the task, and a task in each state takes one, a closed task too. The
+    /// same outcome (kind, person, note) said twice is on the record once.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`], or a database error.
+    pub async fn record_outcome(
+        &mut self,
+        id: &str,
+        outcome: OutcomeKind,
+        by: &str,
+        note: &str,
+    ) -> Result<Task, Error> {
+        let now = self.now();
+        let task = self.get(id).await?;
+        let said = |o: &OutcomeEvent| o.outcome == outcome && o.by == by && o.note == note;
+        if self.outcomes(id).await?.iter().any(said) {
+            return Ok(task);
+        }
+        let event = Event::Outcome {
+            outcome,
+            by: by.to_string(),
+            note: note.to_string(),
+            at: now,
+        };
+        self.append_at(id, now, &event).await?;
+        self.get(id).await
+    }
+
+    /// The outcome events of a task, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn outcomes(&self, id: &str) -> Result<Vec<OutcomeEvent>, Error> {
+        let payloads = on_backend!(&self.backend, db => db.payloads_of(id, "outcome"))?;
+        let mut out = Vec::new();
+        for p in payloads {
+            if let Event::Outcome {
+                outcome,
+                by,
+                note,
+                at,
+            } = Event::parse(id, &p)?
+            {
+                out.push(OutcomeEvent {
+                    outcome,
+                    by,
+                    note,
+                    at,
+                });
+            }
+        }
+        Ok(out)
+    }
+
     /// The claims of a named task that the ledger refused: who asked, and why not.
     ///
     /// # Errors
@@ -2535,6 +3183,19 @@ impl Ledger {
         on_backend!(&self.backend, db => db.event_count())
     }
 
+    /// The events of `domain` after sequence number `after`, each once, in the order the
+    /// ledger appended them: what the log of the domain copies. `after` is the `seq` of
+    /// the last event a caller has, or zero. A domain the ledger has no event of gives
+    /// none.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn events_after(&self, domain: &str, after: u64) -> Result<Vec<Logged>, Error> {
+        let rows = on_backend!(&self.backend, db => db.events_after(domain, after))?;
+        logged(rows, domain, after)
+    }
+
     /// Drop the projection and replay every event into a fresh one. Returns the number
     /// of events replayed.
     ///
@@ -2718,6 +3379,12 @@ mod tests {
         a_late_handoff_needs_a_lost_lease_and_an_open_task_and_is_kept_once,
         a_refused_claim_is_recorded_once_and_not_on_a_closed_task,
         an_erasure_takes_a_late_handoff_too,
+        an_outcome_is_kept_on_a_task_in_each_state_and_moves_nothing,
+        an_outcome_on_an_unknown_task_is_not_found,
+        the_same_outcome_said_twice_is_kept_once,
+        a_replay_keeps_the_outcomes_and_the_tasks,
+        an_outcome_is_an_event_of_the_domain_that_names_its_person,
+        an_erasure_takes_the_note_of_an_outcome,
         a_task_is_not_admitted_onto_an_invalidated_dependency,
         an_open_task_of_an_older_ledger_is_retriaged_with_its_dependency,
         an_erasure_that_invalidates_a_task_sends_back_what_it_blocked,
@@ -2764,6 +3431,28 @@ mod tests {
         an_approval_is_one_event_and_is_read_back_whole,
         approvals_are_of_one_target_and_one_domain,
         an_approval_is_no_task_and_a_replay_keeps_it,
+        the_event_of_an_approval_names_its_approver_and_its_own_domain,
+        half_a_pin_is_refused_and_nothing_is_filed,
+        a_pinned_task_goes_only_to_a_claimant_that_fills_its_position,
+        a_claim_of_a_pinned_task_from_outside_its_position_is_refused_and_recorded,
+        a_claimant_in_a_position_takes_an_unpinned_task_only_when_its_charter_covers_it,
+        a_claim_asked_again_under_its_key_from_outside_the_position_is_spent,
+        an_unpinned_task_returns_to_matching_and_a_replay_keeps_it_unpinned,
+        only_an_open_pinned_task_is_unpinned,
+        a_continuation_of_a_pinned_task_takes_its_pin,
+        a_position_is_seated_while_a_claim_made_from_it_is_under_a_live_lease,
+        the_tasks_pinned_to_a_position_are_its_open_ones_in_queue_order,
+        a_pinned_task_that_is_held_back_goes_to_nobody_and_keeps_its_pin,
+        an_unpin_leaves_an_effect_that_is_not_settled_and_the_task_stays_held_back,
+        the_event_of_an_unpin_names_no_principal,
+        events_after_gives_each_event_of_a_domain_once_in_the_ledger_s_order,
+        events_after_gives_only_the_events_after_the_number_given,
+        the_events_of_a_wait_and_of_an_effect_name_who_caused_them,
+        each_event_given_names_its_task_its_kind_its_principal_and_its_attempt_key,
+        a_completion_by_a_continuation_names_no_principal,
+        a_completion_after_the_lease_ran_out_names_no_principal,
+        the_events_given_hold_no_text_of_a_task_or_of_a_promotion,
+        a_task_filed_as_outside_keeps_it_and_another_task_does_not,
         a_definition_record_is_one_event_and_is_read_back_whole,
         definition_records_are_of_one_definition_and_one_domain_oldest_first,
         a_definition_record_is_no_task_and_a_replay_keeps_it,
@@ -2772,6 +3461,8 @@ mod tests {
         the_moments_of_a_task_are_in_order_with_the_clock_of_each_call,
         the_moments_of_a_domain_hold_only_the_events_of_its_tasks,
         a_waiting_moment_and_its_arrival_name_the_event,
+        the_event_of_a_definition_record_names_who_recorded_it_and_its_own_domain,
+        a_completion_on_a_verdict_names_no_principal,
     }
 
     fn spec(title: &str) -> TaskSpec {
@@ -3057,6 +3748,163 @@ mod tests {
         assert!(b.payloads().await.iter().all(|p| !p.contains(SECRET)));
     }
 
+    /// A proposed, an open, a claimed, a done and an invalidated task.
+    async fn a_task_in_each_state(l: &mut Ledger) -> Vec<Task> {
+        let proposed = l.create(spec("Proposed")).await.unwrap().task;
+        let open = admitted(l, spec("Open")).await;
+        let claimed = admitted(l, spec("Claimed")).await;
+        claim(l, &claimed.id, "s1", mins(30)).await.unwrap();
+        let done = admitted(l, spec("Done")).await;
+        claim(l, &done.id, "s2", mins(30)).await.unwrap();
+        l.complete(&done.id, held("s2", 1), "mem-a-h")
+            .await
+            .unwrap();
+        let gone = admitted(l, spec("Gone")).await;
+        l.invalidate(&gone.id, "obsolete", None).await.unwrap();
+        let ids = [proposed.id, open.id, claimed.id, done.id, gone.id];
+        get_all(l, &ids.iter().map(String::as_str).collect::<Vec<_>>()).await
+    }
+
+    async fn an_outcome_is_kept_on_a_task_in_each_state_and_moves_nothing(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let before = a_task_in_each_state(&mut l).await;
+        let states: Vec<Status> = before.iter().map(|t| t.status).collect();
+        assert_eq!(
+            states,
+            [
+                Status::Proposed,
+                Status::Open,
+                Status::Claimed,
+                Status::Done,
+                Status::Invalidated
+            ]
+        );
+        *now.lock().unwrap() = T0 + mins(3);
+        for t in &before {
+            let after = l
+                .record_outcome(
+                    &t.id,
+                    OutcomeKind::Corrected,
+                    "human:test:me",
+                    "Wrong unit.",
+                )
+                .await
+                .unwrap();
+            assert_eq!(&after, t, "the outcome moved the task");
+            assert_eq!(&l.get(&t.id).await.unwrap(), t);
+            let want = OutcomeEvent {
+                outcome: OutcomeKind::Corrected,
+                by: "human:test:me".into(),
+                note: "Wrong unit.".into(),
+                at: T0 + mins(3),
+            };
+            assert_eq!(l.outcomes(&t.id).await.unwrap(), [want]);
+        }
+    }
+
+    async fn an_outcome_on_an_unknown_task_is_not_found(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let r = l
+            .record_outcome("task-a-none", OutcomeKind::Accepted, "human:test:me", "")
+            .await;
+        assert!(matches!(r, Err(Error::NotFound(_))), "{r:?}");
+        assert_eq!(l.event_count().await.unwrap(), 0);
+    }
+
+    async fn the_same_outcome_said_twice_is_kept_once(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Said twice")).await;
+        let me = "human:test:me";
+        for at in [1, 2] {
+            *now.lock().unwrap() = T0 + mins(at);
+            l.record_outcome(&t.id, OutcomeKind::Rejected, me, "No.")
+                .await
+                .unwrap();
+        }
+        let kept = l.outcomes(&t.id).await.unwrap();
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert_eq!(kept[0].at, T0 + mins(1));
+        // another kind, another person and another note are each another outcome
+        l.record_outcome(&t.id, OutcomeKind::Reverted, me, "No.")
+            .await
+            .unwrap();
+        l.record_outcome(&t.id, OutcomeKind::Rejected, "human:test:you", "No.")
+            .await
+            .unwrap();
+        l.record_outcome(&t.id, OutcomeKind::Rejected, me, "No, again.")
+            .await
+            .unwrap();
+        assert_eq!(l.outcomes(&t.id).await.unwrap().len(), 4);
+    }
+
+    async fn a_replay_keeps_the_outcomes_and_the_tasks(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let tasks = a_task_in_each_state(&mut l).await;
+        for (t, kind) in tasks.iter().zip([
+            OutcomeKind::Accepted,
+            OutcomeKind::Corrected,
+            OutcomeKind::Rejected,
+            OutcomeKind::Reverted,
+            OutcomeKind::Accepted,
+        ]) {
+            l.record_outcome(&t.id, kind, "human:test:me", "Seen.")
+                .await
+                .unwrap();
+        }
+        let mut said = Vec::new();
+        for t in &tasks {
+            said.push(l.outcomes(&t.id).await.unwrap());
+        }
+        assert_eq!(said[3][0].outcome, OutcomeKind::Reverted);
+        l.rebuild().await.unwrap();
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(get_all(&l, &ids).await, tasks);
+        for (t, before) in tasks.iter().zip(&said) {
+            assert_eq!(&l.outcomes(&t.id).await.unwrap(), before);
+        }
+    }
+
+    async fn an_outcome_is_an_event_of_the_domain_that_names_its_person(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let internal = TaskSpec {
+            classification: Label::Internal,
+            ..spec("Judged")
+        };
+        let t = admitted(&mut l, internal).await;
+        let seen = l.events_after("dom-a", 0).await.unwrap().len();
+        l.record_outcome(&t.id, OutcomeKind::Reverted, "human:test:you", "Undone.")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        assert_eq!(got.len(), seen + 1);
+        let e = &got[seen];
+        assert_eq!(
+            (e.task.as_str(), e.op.as_str(), e.principal.as_deref()),
+            (t.id.as_str(), "outcome", Some("human:test:you"))
+        );
+        assert_eq!(e.classification, Label::Internal);
+        assert!(l.events_after("dom-b", 0).await.unwrap().is_empty());
+    }
+
+    async fn an_erasure_takes_the_note_of_an_outcome(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let quoting = task_quoting_the_secret("promote:mem-a-1", "v1");
+        let t = admitted(&mut l, quoting).await;
+        let note = format!("it said: {SECRET}");
+        l.record_outcome(&t.id, OutcomeKind::Corrected, "human:test:me", &note)
+            .await
+            .unwrap();
+        l.scrub_tasks("dom-a", "promote:mem-a-1", &redaction())
+            .await
+            .unwrap();
+        let kept = l.outcomes(&t.id).await.unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].note, redaction().reason);
+        assert_eq!(kept[0].outcome, OutcomeKind::Corrected);
+        assert_eq!(kept[0].by, "human:test:me");
+        assert!(b.payloads().await.iter().all(|p| !p.contains(SECRET)));
+    }
+
     async fn a_task_is_not_admitted_onto_an_invalidated_dependency(b: &Site) {
         let (mut l, _) = b.ledger().await;
         let gone = admitted(&mut l, spec("Gone")).await;
@@ -3097,6 +3945,26 @@ mod tests {
         assert_eq!(l.get(&rests.id).await.unwrap().status, Status::Proposed);
     }
 
+    async fn a_task_filed_as_outside_keeps_it_and_another_task_does_not(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let mut from_outside = spec("From a tap");
+        from_outside.outside = true;
+        let marked = l.create(from_outside).await.unwrap().task;
+        let plain = l.create(spec("From the fleet")).await.unwrap().task;
+        for after in ["create", "replay"] {
+            assert!(l.get(&marked.id).await.unwrap().spec.outside, "{after}");
+            assert!(!l.get(&plain.id).await.unwrap().spec.outside, "{after}");
+            let listed = l.list("dom-a", Status::Proposed).await.unwrap();
+            let outside: Vec<(&str, bool)> = listed
+                .iter()
+                .map(|t| (t.id.as_str(), t.spec.outside))
+                .collect();
+            assert!(outside.contains(&(marked.id.as_str(), true)), "{after}");
+            assert!(outside.contains(&(plain.id.as_str(), false)), "{after}");
+            l.rebuild().await.unwrap();
+        }
+    }
+
     /// A ledger file from before a task carried a definition: no `extra` column.
     #[tokio::test]
     async fn on_sqlite_a_ledger_from_before_the_extra_column_is_given_it() {
@@ -3112,6 +3980,7 @@ mod tests {
             .unwrap();
         let mut l = Ledger::open(&file).unwrap();
         assert_eq!(l.get(&id).await.unwrap().spec.definition, None);
+        assert!(!l.get(&id).await.unwrap().spec.outside);
         let mut defined = spec("New");
         defined.definition = Some("review-change@mem-p-1".into());
         defined.acceptance = vec!["It is checked.".into()];
@@ -4431,6 +5300,44 @@ mod tests {
         the_same_spec_again_is_another_approval(&mut l, first, events).await;
     }
 
+    /// The log of a domain takes an approval as it takes a promotion: the event names
+    /// the person who approved and never the principal it is for, it is given to its own
+    /// domain alone, and it is at the highest label, since an approval records none.
+    async fn the_event_of_an_approval_names_its_approver_and_its_own_domain(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        for (domain, target) in [("dom-a", "mem-a-1"), ("dom-b", "mem-b-1")] {
+            l.record_approval(&approval(domain, target)).await.unwrap();
+        }
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let seen: Vec<_> = got
+            .iter()
+            .map(|e| {
+                let (who, attempt) = (e.principal.as_deref(), e.attempt.as_deref());
+                (
+                    e.op.as_str(),
+                    e.task.as_str(),
+                    who,
+                    attempt,
+                    e.classification,
+                )
+            })
+            .collect();
+        let approver = Some("human:test:me");
+        let expected = (
+            "approved",
+            "approval:mem-a-1",
+            approver,
+            None,
+            Label::Restricted,
+        );
+        assert_eq!(seen, vec![expected], "{got:?}");
+        let other = l.events_after("dom-b", 0).await.unwrap();
+        let tasks: Vec<&str> = other.iter().map(|e| e.task.as_str()).collect();
+        assert_eq!(tasks, ["approval:mem-b-1"], "{other:?}");
+        let after = l.events_after("dom-a", got[0].seq).await.unwrap();
+        assert!(after.is_empty(), "{after:?}");
+    }
+
     async fn the_same_spec_again_is_another_approval(
         l: &mut Ledger,
         first: ApprovalRecord,
@@ -4710,6 +5617,224 @@ mod tests {
         (a, b)
     }
 
+    /// Each event as the task and what happened to it.
+    fn ops(events: &[Logged]) -> Vec<(&str, &str)> {
+        events
+            .iter()
+            .map(|e| (e.task.as_str(), e.op.as_str()))
+            .collect()
+    }
+
+    async fn events_after_gives_each_event_of_a_domain_once_in_the_ledger_s_order(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let (a, second) = nine_events(&mut l, &now).await;
+        let elsewhere = TaskSpec {
+            domain: "dom-b".into(),
+            ..spec("In b")
+        };
+        let other = admitted(&mut l, elsewhere).await;
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let (a, second) = (a.id.as_str(), second.id.as_str());
+        assert_eq!(
+            ops(&got),
+            [
+                (a, "created"),
+                (a, "admitted"),
+                (a, "claimed"),
+                (a, "heartbeat"),
+                (a, "released"),
+                (a, "claimed"),
+                (a, "completed"),
+                (second, "created"),
+                (second, "invalidated"),
+                ("promotion:mem-a-1", "promoted"),
+            ]
+        );
+        assert!(got.windows(2).all(|w| w[0].seq < w[1].seq), "{got:?}");
+        let got = l.events_after("dom-b", 0).await.unwrap();
+        let other = other.id.as_str();
+        assert_eq!(ops(&got), [(other, "created"), (other, "admitted")]);
+        assert!(l.events_after("dom-none", 0).await.unwrap().is_empty());
+    }
+
+    async fn the_events_of_a_wait_and_of_an_effect_name_who_caused_them(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Post, then wait")).await;
+        let c = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        let by = held("s1", c.generation);
+        l.effect_begun(&t.id, by, "act-1").await.unwrap();
+        l.effect_settled(&t.id, "act-1", Outcome::Applied, ("human:a:x", None))
+            .await
+            .unwrap();
+        l.wait_for(&t.id, by, "check:1", Some("mem-a-h1"))
+            .await
+            .unwrap();
+        l.arrived("dom-a", "check:1").await.unwrap();
+        let events = l.events_after("dom-a", 0).await.unwrap();
+        let by_op = |op: &str| -> Vec<Option<String>> {
+            let of_op = events.iter().filter(|e| e.op == op);
+            of_op.map(|e| e.principal.clone()).collect()
+        };
+        let s1 = Some("s1".to_string());
+        assert_eq!(by_op("effect_begun"), vec![s1.clone()]);
+        assert_eq!(by_op("effect_settled"), vec![Some("human:a:x".to_string())]);
+        // the handoff left before the wait, and the wait: the holder's. What comes
+        // after the wait is nobody's, since the wait gave the task up
+        assert_eq!(by_op("handoff_left"), vec![s1.clone()]);
+        assert_eq!(by_op("waiting"), vec![s1]);
+        assert_eq!(by_op("arrived"), vec![None]);
+        assert_eq!(by_op("unblocked"), vec![None]);
+    }
+
+    async fn events_after_gives_only_the_events_after_the_number_given(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        nine_events(&mut l, &now).await;
+        let all = l.events_after("dom-a", 0).await.unwrap();
+        assert_eq!(all.len(), 9);
+        // from the heartbeat on: the release after it is by the holder of a claim from
+        // before the number given, and is given as it was
+        assert_eq!(all[4].principal.as_deref(), Some("s1"), "{:?}", all[4]);
+        let rest = l.events_after("dom-a", all[3].seq).await.unwrap();
+        assert_eq!(rest, all[4..]);
+        let last = all[8].seq;
+        assert!(l.events_after("dom-a", last).await.unwrap().is_empty());
+    }
+
+    async fn each_event_given_names_its_task_its_kind_its_principal_and_its_attempt_key(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let internal = TaskSpec {
+            classification: Label::Internal,
+            ..spec("Keyed")
+        };
+        let t = admitted(&mut l, internal).await;
+        let c = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        assert_eq!(c.task.id, t.id);
+        assert!(is_wrong_state(&claim(&mut l, &t.id, "s2", mins(5)).await));
+        *now.lock().unwrap() = T0 + mins(2);
+        l.heartbeat_as(&t.id, "s1", mins(30)).await.unwrap();
+        l.complete_once(&t.id, held("s1", 1), "mem-a-h", "done-1")
+            .await
+            .unwrap();
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let named: Vec<(&str, Option<&str>, Option<&str>)> = got
+            .iter()
+            .map(|e| (e.op.as_str(), e.principal.as_deref(), e.attempt.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [
+                ("created", Some("human:test:me"), None),
+                ("admitted", None, None),
+                ("claimed", Some("s1"), Some("key-1")),
+                ("claim_refused", Some("s2"), None),
+                ("heartbeat", Some("s1"), None),
+                ("completed", Some("s1"), Some("done-1")),
+                ("promoted", Some("agent:curator"), None),
+            ]
+        );
+        assert!(got[..6].iter().all(|e| e.task == t.id), "{got:?}");
+        each_event_given_is_classified_as_its_task_is(&mut l, &got).await;
+    }
+
+    /// `got` is of an internal task and an internal promotion.
+    async fn each_event_given_is_classified_as_its_task_is(l: &mut Ledger, got: &[Logged]) {
+        assert!(
+            got.iter().all(|e| e.classification == Label::Internal),
+            "{got:?}"
+        );
+        let public = admitted(l, spec("Public")).await;
+        let after = got.last().unwrap().seq;
+        let got = l.events_after("dom-a", after).await.unwrap();
+        assert_eq!(ops(&got)[0], (public.id.as_str(), "created"));
+        assert!(got.iter().all(|e| e.classification == Label::Public));
+    }
+
+    async fn a_completion_by_a_continuation_names_no_principal(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let (parent, child, cont) = delegated(&mut l).await;
+        claim(&mut l, &child.id, "s2", mins(5)).await.unwrap();
+        l.complete_as(&child.id, "s2", "mem-a-child").await.unwrap();
+        claim(&mut l, &cont.id, "s3", mins(5)).await.unwrap();
+        l.complete_as(&cont.id, "s3", "mem-a-done").await.unwrap();
+        l.complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let of_parent: Vec<(&str, Option<&str>)> = got
+            .iter()
+            .filter(|e| e.task == parent.id)
+            .map(|e| (e.op.as_str(), e.principal.as_deref()))
+            .collect();
+        // s1 held it, left a handoff and released it: the completion after is nobody's
+        assert_eq!(
+            of_parent[2..],
+            [
+                ("claimed", Some("s1")),
+                ("handoff_left", Some("s1")),
+                ("released", Some("s1")),
+                ("completed", None),
+            ]
+        );
+        let by_holder = got
+            .iter()
+            .find(|e| e.task == cont.id && e.op == "completed");
+        assert_eq!(by_holder.unwrap().principal.as_deref(), Some("s3"));
+    }
+
+    async fn a_completion_after_the_lease_ran_out_names_no_principal(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let parent = admitted(&mut l, spec("Compare two decisions")).await;
+        claim(&mut l, &parent.id, "s1", mins(5)).await.unwrap();
+        let cont = admitted(&mut l, resume(&parent, &[])).await;
+        // s1 did not release it: its lease ran out, and the continuation closed the task
+        *now.lock().unwrap() = T0 + mins(10);
+        claim(&mut l, &cont.id, "s3", mins(5)).await.unwrap();
+        l.complete_as(&cont.id, "s3", "mem-a-done").await.unwrap();
+        l.complete_by_continuation(&parent.id, &cont.id, "mem-a-done")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let closed = got
+            .iter()
+            .find(|e| e.task == parent.id && e.op == "completed");
+        assert_eq!(closed.unwrap().principal, None, "{got:?}");
+    }
+
+    async fn the_events_given_hold_no_text_of_a_task_or_of_a_promotion(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Rotate the signing key")).await;
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        l.release_as(&t.id, "s1", Some("mem-a-left")).await.unwrap();
+        claim(&mut l, &t.id, "s1", mins(5)).await.unwrap();
+        l.complete_as(&t.id, "s1", "mem-a-handoff").await.unwrap();
+        let dropped = admitted(&mut l, spec("Second")).await;
+        l.invalidate(&dropped.id, "the vault moved", None)
+            .await
+            .unwrap();
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        assert_eq!(got.len(), 11, "{got:?}");
+        let json = serde_json::to_string(&got).unwrap();
+        for text in [
+            "Rotate the signing key",
+            "Do it.",
+            "mem-a-left",
+            "mem-a-handoff",
+            "the vault moved",
+            "checked against the tree",
+        ] {
+            assert!(!json.contains(text), "{text:?} in {json}");
+        }
+    }
+
     async fn not_found_and_persistence(b: &Site) {
         let (l, _) = b.ledger().await;
         assert!(matches!(
@@ -4920,6 +6045,53 @@ mod tests {
             crate::postgres::schema_for("dom-a.b"),
             crate::postgres::schema_for("dom-a_b")
         );
+    }
+
+    /// PostgreSQL gives an event its number at the insert, and not at the commit. Without
+    /// the lock, the second append here commits number 4 while number 3 is in flight, a
+    /// copy that reads then moves its cursor to 4, and number 3 is never copied.
+    #[tokio::test]
+    async fn on_postgres_an_append_waits_for_the_append_in_flight_in_its_domain() {
+        let Some(server) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let mut l = Ledger::connect(server.url()).await.unwrap();
+        let a = l.create(spec("A")).await.unwrap().task;
+        let b = l.create(spec("B")).await.unwrap().task;
+        // an append in flight, as the ledger makes one: it holds the lock of the domain,
+        // its row has its number, and it has not committed
+        let mut c = pg_client(&server).await;
+        let tx = c.transaction().await.unwrap();
+        crate::postgres::lock_domain(&tx, "dom-a").await.unwrap();
+        let s = crate::postgres::schema_for("dom-a");
+        let admitted = Event::Admitted;
+        tx.execute(
+            &format!("INSERT INTO {s}.events (task_id, kind, at, payload) VALUES ($1, $2, $3, $4)"),
+            &[
+                &a.id,
+                &admitted.kind(),
+                &fmt_time(T0),
+                &admitted.payload(&a.id).unwrap(),
+            ],
+        )
+        .await
+        .unwrap();
+        // another connection appends an event of another task of the domain
+        let mut other = Ledger::connect(server.url()).await.unwrap();
+        let second = other.admit(&b.id);
+        tokio::pin!(second);
+        let early = tokio::time::timeout(std::time::Duration::from_millis(500), &mut second).await;
+        assert!(early.is_err(), "the second append waits for the first");
+        let seqs = |events: Vec<Logged>| events.into_iter().map(|e| e.seq).collect::<Vec<_>>();
+        let seen = seqs(l.events_after("dom-a", 0).await.unwrap());
+        tx.commit().await.unwrap();
+        second.await.unwrap();
+        // a copy that read while the first was in flight goes on from its last number
+        let cursor = seen.last().copied().unwrap_or(0);
+        let rest = seqs(l.events_after("dom-a", cursor).await.unwrap());
+        let all = seqs(l.events_after("dom-a", 0).await.unwrap());
+        assert_eq!(all.len(), 4, "{all:?}");
+        assert_eq!([seen, rest].concat(), all, "and misses no event");
     }
 
     #[tokio::test]
@@ -5957,6 +7129,85 @@ mod tests {
         assert_eq!(l.get(&acted.id).await.unwrap().status, Status::Blocked);
     }
 
+    /// The log of a domain takes a definition record as it takes an approval: the event
+    /// names who graded, who recorded the work outcome or who signed the raise off, it is
+    /// given to its own domain alone, and it is at the highest label, since a definition
+    /// record names none. A raise with no sign-off names nobody.
+    async fn the_event_of_a_definition_record_names_who_recorded_it_and_its_own_domain(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let graded = DefinitionChange::Graded {
+            suite: "mem-held-1".into(),
+            level: Autonomy::Review,
+            passed: 4,
+            of: 5,
+            needed: 4,
+            by: "agent:evaluator".into(),
+        };
+        let signed = DefinitionChange::Raised {
+            to: Autonomy::Checks,
+            run: "def-plat-run".into(),
+            signed_by: Some("human:test:signer".into()),
+        };
+        let outcome = rejected("task-a-1", Autonomy::Review);
+        for change in [graded, raised(Autonomy::Review), signed, outcome] {
+            l.record_definition("dom-plat", TIDY, change).await.unwrap();
+        }
+        l.record_definition("dom-b", OTHER, raised(Autonomy::Review))
+            .await
+            .unwrap();
+        let got = l.events_after("dom-plat", 0).await.unwrap();
+        let seen: Vec<_> = got
+            .iter()
+            .map(|e| (e.op.as_str(), e.task.as_str(), e.principal.as_deref()))
+            .collect();
+        let key = format!("definition:{TIDY}");
+        let by = |who| ("definition", key.as_str(), who);
+        let expected = [
+            by(Some("agent:evaluator")),
+            by(None),
+            by(Some("human:test:signer")),
+            by(Some("human:test:me")),
+        ];
+        assert_eq!(seen, expected, "{got:?}");
+        for e in &got {
+            assert_eq!(
+                (e.attempt.as_deref(), e.classification),
+                (None, Label::Restricted)
+            );
+        }
+        let other = l.events_after("dom-b", 0).await.unwrap();
+        let tasks: Vec<&str> = other.iter().map(|e| e.task.as_str()).collect();
+        assert_eq!(tasks, [format!("definition:{OTHER}")], "{other:?}");
+        let after = l.events_after("dom-plat", got[3].seq).await.unwrap();
+        assert!(after.is_empty(), "{after:?}");
+    }
+
+    /// The holder that handed the work in gave the task up when it began to wait, so the
+    /// completion that a verdict causes is no holder's: its event names nobody.
+    async fn a_completion_on_a_verdict_names_no_principal(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = awaiting(&mut l, "Tidy the importer", "verdict:1", "mem-a-h1").await;
+        l.complete_awaited(&t.id, "verdict:1", "mem-a-h1")
+            .await
+            .unwrap();
+        let got = l.events_after("dom-a", 0).await.unwrap();
+        let of_task: Vec<(&str, Option<&str>)> = got
+            .iter()
+            .filter(|e| e.task == t.id)
+            .map(|e| (e.op.as_str(), e.principal.as_deref()))
+            .collect();
+        assert_eq!(
+            of_task[2..],
+            [
+                ("claimed", Some("s1")),
+                ("handoff_left", Some("s1")),
+                ("waiting", Some("s1")),
+                ("completed", None),
+                ("arrived", None),
+            ]
+        );
+    }
+
     async fn a_closed_task_is_not_closed_again(l: &mut Ledger) {
         let t = awaiting(l, "Closed once", "verdict:2", "mem-a-h2").await;
         l.complete_awaited(&t.id, "verdict:2", "mem-a-h2")
@@ -6076,5 +7327,633 @@ mod tests {
                 ("arrived".to_string(), 9, None, on),
             ]
         );
+    }
+
+    const QA: &str = "pos-a-qa";
+    const DEV: &str = "pos-a-dev";
+
+    /// A task pinned to `position`, for continuity.
+    fn pinned(title: &str, position: &str) -> TaskSpec {
+        TaskSpec {
+            position: Some(position.into()),
+            pin_reason: Some(PinReason::Continuity),
+            ..spec(title)
+        }
+    }
+
+    /// An unpinned task that runs under `definition`.
+    fn defined(title: &str, definition: &str) -> TaskSpec {
+        TaskSpec {
+            definition: Some(definition.into()),
+            ..spec(title)
+        }
+    }
+
+    /// A claimant with an empty manifest and the highest handling, in `seat` or in none.
+    fn claimer<'a>(holder: &'a str, seat: Option<Seat<'a>>) -> Claimer<'a> {
+        Claimer {
+            holder,
+            manifest: &[],
+            handling: Label::Restricted,
+            seat,
+            attempt: None,
+        }
+    }
+
+    /// The seat of a position whose charter covers nothing.
+    fn seat(position: &str) -> Option<Seat<'_>> {
+        Some(Seat {
+            position,
+            covers: &[],
+        })
+    }
+
+    /// `claim_next_by` in `dom-a` from `seat`.
+    async fn next_from(l: &mut Ledger, holder: &str, seat: Option<Seat<'_>>) -> Option<Claim> {
+        l.claim_next_by("dom-a", claimer(holder, seat), mins(30))
+            .await
+            .unwrap()
+    }
+
+    /// `claim_by` from `seat`.
+    async fn claim_from(
+        l: &mut Ledger,
+        id: &str,
+        holder: &str,
+        seat: Option<Seat<'_>>,
+    ) -> Result<Claim, Error> {
+        l.claim_by(id, claimer(holder, seat), mins(30)).await
+    }
+
+    fn is_pinned_to<T>(r: &Result<T, Error>, to: &str) -> bool {
+        matches!(r, Err(Error::Pinned { position, .. }) if position == to)
+    }
+
+    fn is_bad_pin<T>(r: &Result<T, Error>) -> bool {
+        matches!(r, Err(Error::BadPin(_)))
+    }
+
+    async fn half_a_pin_is_refused_and_nothing_is_filed(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let no_reason = TaskSpec {
+            pin_reason: None,
+            ..pinned("No reason", QA)
+        };
+        assert!(is_bad_pin(&l.create(no_reason).await));
+        let no_position = TaskSpec {
+            position: None,
+            ..pinned("No position", QA)
+        };
+        assert!(is_bad_pin(&l.create(no_position).await));
+        assert!(is_bad_pin(&l.create(pinned("No name", "")).await));
+        assert_eq!(l.event_count().await.unwrap(), 0, "nothing is filed");
+        assert!(l.list("dom-a", Status::Proposed).await.unwrap().is_empty());
+        let whole = l.create(pinned("Whole", QA)).await.unwrap().task;
+        assert_eq!(whole.spec.position.as_deref(), Some(QA));
+        assert_eq!(whole.spec.pin_reason, Some(PinReason::Continuity));
+    }
+
+    async fn a_pinned_task_goes_only_to_a_claimant_that_fills_its_position(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, pinned("Review the change", QA)).await;
+        assert!(
+            next_from(&mut l, "s1", None).await.is_none(),
+            "not to a claimant in no position"
+        );
+        assert!(next(&mut l, "s1", mins(30)).await.is_none());
+        assert!(
+            next_from(&mut l, "s2", seat(DEV)).await.is_none(),
+            "not to a claimant in another position"
+        );
+        let c = next_from(&mut l, "s3", seat(QA)).await.unwrap();
+        assert_eq!(c.task.id, t.id);
+        assert_eq!(c.task.holder.as_deref(), Some("s3"));
+        assert_eq!(c.task.spec.position.as_deref(), Some(QA));
+        assert_eq!(c.task.spec.pin_reason, Some(PinReason::Continuity));
+    }
+
+    async fn a_claim_of_a_pinned_task_from_outside_its_position_is_refused_and_recorded(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let filed = l.create(pinned("Review", QA)).await.unwrap().task;
+        let early = claim_from(&mut l, &filed.id, "s1", None).await;
+        assert!(is_wrong_state(&early), "not admitted comes first");
+        let t = l.admit(&filed.id).await.unwrap();
+        for _ in 0..2 {
+            let refused = claim_from(&mut l, &t.id, "s1", None).await;
+            assert!(is_pinned_to(&refused, QA), "{:?}", refused.err());
+        }
+        the_refusal_names_the_position_once(&l, &t).await;
+        let other = claim_from(&mut l, &t.id, "s2", seat(DEV)).await;
+        assert!(is_pinned_to(&other, QA));
+        assert!(is_pinned_to(
+            &claim(&mut l, &t.id, "s3", mins(30)).await,
+            QA
+        ));
+        the_position_s_own_claims_are_judged_as_any_other(&mut l, &t).await;
+    }
+
+    async fn the_refusal_names_the_position_once(l: &Ledger, t: &Task) {
+        let why = format!("the task is pinned to position {QA}, and the session does not fill it");
+        let refused = l.refused_claims(&t.id).await.unwrap();
+        assert_eq!(refused[0].1, "the task was not admitted");
+        assert_eq!(refused[1..], [("s1".to_string(), why)]);
+    }
+
+    /// A claimant that fills the position claims the task, and a second one is refused
+    /// for the live lease, not for the pin.
+    async fn the_position_s_own_claims_are_judged_as_any_other(l: &mut Ledger, t: &Task) {
+        claim_from(l, &t.id, "s4", seat(QA)).await.unwrap();
+        let second = claim_from(l, &t.id, "s5", seat(QA)).await;
+        assert!(is_wrong_state(&second), "{:?}", second.err());
+        let last = l.refused_claims(&t.id).await.unwrap().pop().unwrap();
+        assert_eq!(
+            last,
+            (
+                "s5".to_string(),
+                "the lease of the claim of generation 1 was live".to_string()
+            )
+        );
+    }
+
+    async fn a_claimant_in_a_position_takes_an_unpinned_task_only_when_its_charter_covers_it(
+        b: &Site,
+    ) {
+        let (mut l, _) = b.ledger().await;
+        let covers = ["review".to_string()];
+        let qa = Some(Seat {
+            position: QA,
+            covers: &covers,
+        });
+        let covered = admitted(&mut l, defined("Covered", "review@mem-x")).await;
+        // each of the others ranks above it, so a seat that took them would take them first
+        let high = |s: TaskSpec| TaskSpec { priority: 5, ..s };
+        let bare = admitted(&mut l, high(spec("No definition"))).await;
+        let other = admitted(&mut l, high(defined("Another", "reviewer@mem-y"))).await;
+        let c = next_from(&mut l, "s1", qa).await.unwrap();
+        assert_eq!(c.task.id, covered.id, "the one its charter covers");
+        assert!(next_from(&mut l, "s1", qa).await.is_none(), "and no other");
+        let named = claim_from(&mut l, &bare.id, "s1", qa).await;
+        assert!(is_wrong_state(&named), "{:?}", named.err());
+        // a claimant in no position takes each of the three
+        let again = admitted(&mut l, defined("Covered too", "review@mem-x")).await;
+        let mut taken = Vec::new();
+        while let Some(c) = next_from(&mut l, "s2", None).await {
+            taken.push(c.task.id);
+        }
+        // the two of one priority were filed at one time on the test's clock, so the
+        // queue orders them by id: the test asks which were taken, not in which order
+        let mut all = [bare.id, other.id, again.id];
+        all.sort();
+        taken.sort();
+        assert_eq!(taken, all);
+    }
+
+    async fn a_claim_asked_again_under_its_key_from_outside_the_position_is_spent(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, pinned("Review", QA)).await;
+        let keyed = |holder, seat| Claimer {
+            attempt: Some("key-1"),
+            ..claimer(holder, seat)
+        };
+        let first = l
+            .claim_next_by("dom-a", keyed("s1", seat(QA)), mins(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.task.id, t.id);
+        let again = l
+            .claim_next_by("dom-a", keyed("s1", seat(QA)), mins(30))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, first, "the same claim from the same seat");
+        let unseated = l.claim_next_by("dom-a", keyed("s1", None), mins(30)).await;
+        assert!(is_spent(&unseated), "{:?}", unseated.err());
+        let elsewhere = l
+            .claim_next_by("dom-a", keyed("s1", seat(DEV)), mins(30))
+            .await;
+        assert!(is_spent(&elsewhere), "{:?}", elsewhere.err());
+        assert_eq!(l.get(&t.id).await.unwrap().generation, 1, "one claim");
+    }
+
+    const RETIRED: &str = "position pos-a-qa is retired";
+
+    /// The `unpinned` events of the log, as JSON.
+    async fn unpinned_events(b: &Site) -> Vec<serde_json::Value> {
+        let all = b.payloads().await;
+        let parsed = all.iter().map(|p| serde_json::from_str(p).unwrap());
+        parsed
+            .filter(|e: &serde_json::Value| e["kind"] == "unpinned")
+            .collect()
+    }
+
+    async fn an_unpinned_task_returns_to_matching_and_a_replay_keeps_it_unpinned(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let filed = TaskSpec {
+            definition: Some("review@mem-x".into()),
+            acceptance: vec!["the tests pass".into()],
+            ..pinned("Review", QA)
+        };
+        let t = admitted(&mut l, filed).await;
+        let kept = admitted(&mut l, pinned("Stays pinned", QA)).await;
+        assert!(next_from(&mut l, "s1", None).await.is_none());
+        let unpinned = l.unpin(&t.id, RETIRED).await.unwrap();
+        assert_eq!(unpinned.status, Status::Open);
+        let without_pin = TaskSpec {
+            position: None,
+            pin_reason: None,
+            ..t.spec.clone()
+        };
+        assert_eq!(unpinned.spec, without_pin, "the pin leaves, and no more");
+        the_log_holds_one_unpinned_event(b).await;
+        a_replay_keeps_the_one_unpinned_and_the_other_pinned(&mut l, &t, &kept).await;
+        let c = next_from(&mut l, "s1", None).await.unwrap();
+        assert_eq!(c.task.id, t.id, "back in matching");
+        assert!(next_from(&mut l, "s1", None).await.is_none());
+    }
+
+    async fn the_log_holds_one_unpinned_event(b: &Site) {
+        let events = unpinned_events(b).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["position"], QA);
+        assert_eq!(events[0]["why"], RETIRED);
+    }
+
+    async fn a_replay_keeps_the_one_unpinned_and_the_other_pinned(
+        l: &mut Ledger,
+        unpinned: &Task,
+        pinned: &Task,
+    ) {
+        let before = get_all(l, &[&unpinned.id, &pinned.id]).await;
+        l.rebuild().await.unwrap();
+        let after = get_all(l, &[&unpinned.id, &pinned.id]).await;
+        assert_eq!(before, after);
+        assert_eq!(after[0].spec.position, None);
+        assert_eq!(after[1].spec.position.as_deref(), Some(QA));
+    }
+
+    /// A pinned task that its holder, a session in the position, gave up until the event
+    /// `check:1` comes.
+    async fn pinned_and_waiting(l: &mut Ledger) -> Task {
+        let t = admitted(l, pinned("Announce", QA)).await;
+        let c = claim_from(l, &t.id, "s1", seat(QA)).await.unwrap();
+        l.wait_for(&t.id, held("s1", c.generation), "check:1", None)
+            .await
+            .unwrap();
+        t
+    }
+
+    /// A pinned task with an external action that its holder, a session in the position,
+    /// began and never settled. The lease of that holder ran out.
+    async fn pinned_with_an_effect(l: &mut Ledger, now: &Mutex<OffsetDateTime>) -> Task {
+        let t = admitted(l, pinned("Announce", QA)).await;
+        let c = claim_from(l, &t.id, "s1", seat(QA)).await.unwrap();
+        l.effect_begun(&t.id, held("s1", c.generation), "act-1")
+            .await
+            .unwrap();
+        *now.lock().unwrap() = T0 + mins(31);
+        t
+    }
+
+    /// A claimant in `seat` does not get task `id`: not as the next task, and not by
+    /// name, where the refusal is that of a task nobody may claim now.
+    async fn held_back_from(l: &mut Ledger, id: &str, seat: Option<Seat<'_>>) {
+        assert!(next_from(l, "s2", seat).await.is_none());
+        let asked = claim_from(l, id, "s2", seat).await;
+        assert!(is_wrong_state(&asked));
+    }
+
+    /// Task `id` goes to a claimant that fills `QA`, and to no claimant outside it.
+    async fn only_the_position_gets(l: &mut Ledger, id: &str) {
+        assert!(next_from(l, "s3", None).await.is_none());
+        let outside = claim_from(l, id, "s3", None).await;
+        assert!(is_pinned_to(&outside, QA));
+        let again = next_from(l, "s2", seat(QA)).await.unwrap();
+        assert_eq!(again.task.id, id);
+    }
+
+    async fn a_replay_gives_the_same_task(l: &mut Ledger, id: &str) {
+        let before = l.get(id).await.unwrap();
+        l.rebuild().await.unwrap();
+        assert_eq!(l.get(id).await.unwrap(), before);
+    }
+
+    async fn a_pinned_task_that_is_held_back_goes_to_nobody_and_keeps_its_pin(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = pinned_and_waiting(&mut l).await;
+        // it waits on an event: a session that fills its position does not get it
+        held_back_from(&mut l, &t.id, seat(QA)).await;
+        l.arrived("dom-a", "check:1").await.unwrap();
+        // the event came, and the task is pinned as it was filed
+        let back = l.get(&t.id).await.unwrap();
+        assert_eq!(back.status, Status::Open);
+        assert_eq!(
+            back.spec, t.spec,
+            "the wait changed nothing of what was filed"
+        );
+        only_the_position_gets(&mut l, &t.id).await;
+        a_replay_gives_the_same_task(&mut l, &t.id).await;
+    }
+
+    async fn an_unpin_leaves_an_effect_that_is_not_settled_and_the_task_stays_held_back(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = pinned_with_an_effect(&mut l, &now).await;
+        let unpinned = l.unpin(&t.id, RETIRED).await.unwrap();
+        assert_eq!(unpinned.spec.position, None);
+        assert_eq!(unpinned.effects, ["act-1"], "the effect is still there");
+        // no pin now, and nobody gets it: nobody knows what became of the action
+        held_back_from(&mut l, &t.id, None).await;
+        a_replay_gives_the_same_task(&mut l, &t.id).await;
+        l.effect_settled(&t.id, "act-1", Outcome::NotApplied, ("human:a:x", None))
+            .await
+            .unwrap();
+        let taken = next_from(&mut l, "s2", None).await.unwrap();
+        assert_eq!(taken.task.id, t.id);
+    }
+
+    async fn the_event_of_an_unpin_names_no_principal(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, pinned("Announce", QA)).await;
+        // held under a live lease when the pin leaves: the holder did not take it off
+        claim_from(&mut l, &t.id, "s1", seat(QA)).await.unwrap();
+        l.unpin(&t.id, RETIRED).await.unwrap();
+        let events = l.events_after("dom-a", 0).await.unwrap();
+        let of = |op: &str| -> Vec<&Logged> { events.iter().filter(|e| e.op == op).collect() };
+        let unpinned = of("unpinned");
+        assert_eq!(unpinned.len(), 1, "{events:?}");
+        assert_eq!(unpinned[0].task, t.id);
+        assert_eq!(unpinned[0].principal, None);
+        assert_eq!(unpinned[0].attempt, None);
+        // the claim made from the position names its holder, as any claim does
+        let claimed = of("claimed");
+        assert_eq!(claimed.len(), 1, "{events:?}");
+        assert_eq!(claimed[0].principal.as_deref(), Some("s1"));
+    }
+
+    /// A pinned task that is done, one that is invalidated, a task never pinned and one
+    /// unpinned already.
+    async fn four_tasks_with_no_pin_to_take_off(l: &mut Ledger) -> [Task; 4] {
+        let done = admitted(l, pinned("Done", QA)).await;
+        claim_from(l, &done.id, "s1", seat(QA)).await.unwrap();
+        l.complete_as(&done.id, "s1", "mem-a-h").await.unwrap();
+        let invalid = admitted(l, pinned("Invalidated", QA)).await;
+        l.invalidate(&invalid.id, "obsolete", None).await.unwrap();
+        let never = admitted(l, spec("Never pinned")).await;
+        let once = admitted(l, pinned("Unpinned once", QA)).await;
+        l.unpin(&once.id, RETIRED).await.unwrap();
+        [done, invalid, never, once]
+    }
+
+    async fn only_an_open_pinned_task_is_unpinned(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let tasks = four_tasks_with_no_pin_to_take_off(&mut l).await;
+        let events = l.event_count().await.unwrap();
+        for t in &tasks {
+            let refused = l.unpin(&t.id, RETIRED).await;
+            assert!(is_wrong_state(&refused), "{}: {:?}", t.id, refused.err());
+        }
+        assert_eq!(l.event_count().await.unwrap(), events, "and no event");
+        let done = l.get(&tasks[0].id).await.unwrap();
+        assert_eq!(
+            done.spec.position.as_deref(),
+            Some(QA),
+            "a done task keeps it"
+        );
+        assert_eq!(unpinned_events(b).await.len(), 1);
+    }
+
+    /// A task filed from `parent` under `origin`, which names how.
+    fn filed_from_parent(origin: String, title: &str) -> TaskSpec {
+        TaskSpec {
+            origin: Some(origin),
+            ..spec(title)
+        }
+    }
+
+    async fn a_continuation_of_a_pinned_task_takes_its_pin(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let separate = TaskSpec {
+            pin_reason: Some(PinReason::Separation),
+            ..pinned("Review", QA)
+        };
+        let parent = admitted(&mut l, separate).await;
+        let cont = filed_from_parent(continues(&parent.id), "Resume");
+        let cont = l.create(cont).await.unwrap().task;
+        assert_eq!(cont.spec.position.as_deref(), Some(QA));
+        assert_eq!(cont.spec.pin_reason, Some(PinReason::Separation));
+        let own = TaskSpec {
+            origin: Some(continues(&parent.id)),
+            ..pinned("Names its own", DEV)
+        };
+        let own = l.create(own).await.unwrap().task;
+        assert_eq!(own.spec.position.as_deref(), Some(DEV));
+        assert_eq!(own.spec.pin_reason, Some(PinReason::Continuity));
+        no_other_task_takes_a_pin(&mut l, &parent).await;
+    }
+
+    /// A subagent task and a retry of a pinned task, a continuation of an unpinned task,
+    /// a continuation of a task the ledger does not hold, and a continuation of a pinned
+    /// task that is filed in another domain: each is unpinned.
+    async fn no_other_task_takes_a_pin(l: &mut Ledger, pinned_parent: &Task) {
+        let plain = admitted(l, spec("Unpinned parent")).await;
+        for origin in [
+            format!("task:{}", pinned_parent.id),
+            format!("retries:{}", pinned_parent.id),
+            continues(&plain.id),
+            continues("task-a-none"),
+        ] {
+            let filed = filed_from_parent(origin.clone(), "From a parent");
+            let t = l.create(filed).await.unwrap().task;
+            assert_eq!(
+                (t.spec.position, t.spec.pin_reason),
+                (None, None),
+                "{origin}"
+            );
+        }
+        // the position is one of the parent's domain: another domain holds none of that name
+        let abroad = TaskSpec {
+            domain: "dom-b".into(),
+            ..filed_from_parent(continues(&pinned_parent.id), "Resume in another domain")
+        };
+        let abroad = l.create(abroad).await.unwrap().task;
+        assert_eq!(
+            (abroad.spec.position, abroad.spec.pin_reason),
+            (None, None),
+            "a continuation in another domain"
+        );
+    }
+
+    async fn seated(l: &Ledger, position: &str) -> Vec<String> {
+        l.seated("dom-a", position).await.unwrap()
+    }
+
+    async fn a_position_is_seated_while_a_claim_made_from_it_is_under_a_live_lease(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let covers = ["review".to_string()];
+        let qa = Some(Seat {
+            position: QA,
+            covers: &covers,
+        });
+        let t = admitted(&mut l, pinned("Review", QA)).await;
+        let covered = admitted(&mut l, defined("Covered", "review@mem-x")).await;
+        assert!(seated(&l, QA).await.is_empty(), "before any claim");
+        claim_from(&mut l, &t.id, "s1", qa).await.unwrap();
+        // a claimant in no position holds a task the charter covers: it is not seated
+        claim_from(&mut l, &covered.id, "s2", None).await.unwrap();
+        only_the_claimant_in_the_position_is_seated(&l).await;
+        *now.lock().unwrap() = T0 + mins(30);
+        assert_eq!(seated(&l, QA).await, ["s1"], "to the end of the lease");
+        *now.lock().unwrap() = T0 + mins(31);
+        assert!(seated(&l, QA).await.is_empty(), "the lease ran out");
+        a_seat_is_left_at_a_release_and_at_a_completion(&mut l, &t, qa).await;
+    }
+
+    async fn only_the_claimant_in_the_position_is_seated(l: &Ledger) {
+        assert_eq!(seated(l, QA).await, ["s1"]);
+        assert!(seated(l, DEV).await.is_empty(), "another position");
+        assert!(l.seated("dom-b", QA).await.unwrap().is_empty());
+    }
+
+    /// Two sessions in the position are both seated, each once; a release and a
+    /// completion each take one away.
+    async fn a_seat_is_left_at_a_release_and_at_a_completion(
+        l: &mut Ledger,
+        t: &Task,
+        qa: Option<Seat<'_>>,
+    ) {
+        let more = admitted(l, pinned("More", QA)).await;
+        let third = admitted(l, pinned("Third", QA)).await;
+        claim_from(l, &t.id, "s4", qa).await.unwrap();
+        claim_from(l, &more.id, "s3", qa).await.unwrap();
+        claim_from(l, &third.id, "s3", qa).await.unwrap();
+        assert_eq!(seated(l, QA).await, ["s3", "s4"], "sorted, each once");
+        l.release_as(&t.id, "s4", None).await.unwrap();
+        assert_eq!(seated(l, QA).await, ["s3"], "after a release");
+        l.complete_as(&more.id, "s3", "mem-a-h").await.unwrap();
+        l.complete_as(&third.id, "s3", "mem-a-h").await.unwrap();
+        assert!(seated(l, QA).await.is_empty(), "after a completion");
+    }
+
+    /// The tasks pinned to `pos-a-qa` in `dom-a`, one in each state that is not closed,
+    /// in the order the queue ranks them: open, claimed, blocked, proposed.
+    async fn one_pinned_task_in_each_open_state(l: &mut Ledger) -> Vec<String> {
+        let at = |priority: i64, title: &str| TaskSpec {
+            priority,
+            ..pinned(title, QA)
+        };
+        let proposed = l.create(at(1, "Proposed")).await.unwrap().task;
+        let dep = admitted(l, spec("Not done")).await;
+        let waits = TaskSpec {
+            depends_on: vec![dep.id],
+            ..at(2, "Blocked")
+        };
+        let blocked = admitted(l, waits).await;
+        assert_eq!(blocked.status, Status::Blocked);
+        let claimed = admitted(l, at(3, "Claimed")).await;
+        claim_from(l, &claimed.id, "s1", seat(QA)).await.unwrap();
+        let open = admitted(l, at(4, "Open")).await;
+        vec![open.id, claimed.id, blocked.id, proposed.id]
+    }
+
+    /// What `pinned_to` must leave out: a done and an invalidated task of the position,
+    /// and an unpinned task. Returns a task of another position and one of another domain.
+    async fn tasks_that_are_not_the_position_s_open_ones(l: &mut Ledger) -> (Task, Task) {
+        let done = admitted(l, pinned("Done", QA)).await;
+        claim_from(l, &done.id, "s1", seat(QA)).await.unwrap();
+        l.complete_as(&done.id, "s1", "mem-a-h").await.unwrap();
+        let invalid = admitted(l, pinned("Invalidated", QA)).await;
+        l.invalidate(&invalid.id, "obsolete", None).await.unwrap();
+        admitted(l, spec("Unpinned")).await;
+        let elsewhere = admitted(l, pinned("Another position", DEV)).await;
+        let abroad = TaskSpec {
+            domain: "dom-b".into(),
+            ..pinned("Another domain", QA)
+        };
+        (elsewhere, admitted(l, abroad).await)
+    }
+
+    async fn pinned_ids(l: &Ledger, domain: &str, position: &str) -> Vec<String> {
+        let tasks = l.pinned_to(domain, position).await.unwrap();
+        tasks.into_iter().map(|t| t.id).collect()
+    }
+
+    async fn the_tasks_pinned_to_a_position_are_its_open_ones_in_queue_order(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        assert!(pinned_ids(&l, "dom-a", QA).await.is_empty());
+        let expected = one_pinned_task_in_each_open_state(&mut l).await;
+        let (elsewhere, abroad) = tasks_that_are_not_the_position_s_open_ones(&mut l).await;
+        assert_eq!(pinned_ids(&l, "dom-a", QA).await, expected);
+        assert_eq!(pinned_ids(&l, "dom-a", DEV).await, [elsewhere.id]);
+        assert_eq!(pinned_ids(&l, "dom-b", QA).await, [abroad.id]);
+    }
+
+    /// A row as a ledger from before pins wrote it, with `extra` as given.
+    fn row_from_before(extra: Option<&str>) -> RawTask {
+        RawTask {
+            id: "task-a-1".into(),
+            domain: "dom-a".into(),
+            title: "Old".into(),
+            body: "Do it.\n".into(),
+            requirements: "[]".into(),
+            depends_on: "[]".into(),
+            origin: None,
+            upstream_event: None,
+            created_by: "human:test:me".into(),
+            label_rank: 0,
+            priority: 0,
+            created: "2026-10-01T10:00:00Z".into(),
+            status: "open".into(),
+            holder: None,
+            lease_until: None,
+            attempts: 0,
+            handoff: None,
+            reason: None,
+            superseded_by: None,
+            posted_to: None,
+            extra: extra.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn a_task_and_a_claim_from_before_pins_read_as_unpinned() {
+        let created = r#"{"kind":"created","id":"task-a-1","spec":{"domain":"dom-a","title":"Old","body":"Do it.\n","requirements":[],"depends_on":[],"origin":null,"upstream_event":null,"created_by":"human:test:me","classification":"public","priority":0,"definition":"review@mem-x"}}"#;
+        let Event::Created { spec, .. } = Event::parse("task-a-1", created).unwrap() else {
+            panic!("not a creation");
+        };
+        assert_eq!((spec.position, spec.pin_reason), (None, None));
+        assert_eq!(spec.definition.as_deref(), Some("review@mem-x"));
+        for extra in [
+            None,
+            Some(""),
+            Some("{}"),
+            Some(r#"{"definition":"review@mem-x"}"#),
+        ] {
+            let task = row_from_before(extra).into_task().unwrap();
+            assert_eq!(
+                (task.spec.position, task.spec.pin_reason),
+                (None, None),
+                "{extra:?}"
+            );
+        }
+        let claimed =
+            r#"{"kind":"claimed","holder":"s1","until":"2026-10-01T10:30:00Z","generation":1}"#;
+        let Event::Claimed { position, .. } = Event::parse("task-a-1", claimed).unwrap() else {
+            panic!("not a claim");
+        };
+        assert_eq!(position, None);
+    }
+
+    #[test]
+    fn a_pin_reason_is_one_of_three_words() {
+        for reason in [
+            PinReason::Continuity,
+            PinReason::Relationship,
+            PinReason::Separation,
+        ] {
+            assert_eq!(reason.as_str().parse::<PinReason>().unwrap(), reason);
+            let json = serde_json::to_string(&reason).unwrap();
+            assert_eq!(json, format!("{:?}", reason.as_str()));
+        }
+        assert!(is_bad_pin(&"habit".parse::<PinReason>()));
     }
 }

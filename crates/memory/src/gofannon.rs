@@ -132,7 +132,7 @@ pub async fn work(m: &Arc<Memory>, plan: &Plan) -> Result<usize, Box<dyn std::er
             "amem: claimed {}: {} for gofannon {}",
             task.id, task.title, plan.agent
         );
-        m.set_held_task(&task.id);
+        m.hold_task(&task.id).await?;
         let heartbeat = keep_lease(client.clone(), task.id.clone(), plan.lease_seconds);
         let ran = run(m, plan, &task).await;
         heartbeat.abort();

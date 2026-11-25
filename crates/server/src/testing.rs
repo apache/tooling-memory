@@ -88,3 +88,18 @@ pub(crate) fn refused_actions(dir: &Path, principal: &str) -> Vec<(String, Strin
     }
     actions.into_iter().collect()
 }
+
+/// The entries that the read events of `m`'s session name in the log of `domain`, in the
+/// log's order.
+pub(crate) fn read_in_log(m: &Memory, domain: &str) -> Vec<String> {
+    let events = crate::log::read(m.root(), domain, 0).unwrap();
+    let own = events
+        .into_iter()
+        .filter(|e| e.session.as_deref() == Some(m.session_id.as_str()));
+    own.filter_map(|e| match e.change {
+        crate::log::Change::Read { ids, .. } => Some(ids),
+        _ => None,
+    })
+    .flatten()
+    .collect()
+}

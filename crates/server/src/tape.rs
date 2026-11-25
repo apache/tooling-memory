@@ -18,6 +18,9 @@
 //! the tape calls that carry it, as it erases decision contexts. A re-run keeps no tape
 //! and no decision contexts of its own.
 
+use crate::arms::Settings;
+use crate::evaluation::RunOf;
+use crate::replay_state::ReplayManifest;
 use crate::{lock, Error, Memory};
 use dm_core::Label;
 use dm_store::Area;
@@ -49,6 +52,25 @@ pub struct TapeStart {
     /// Whether the working tree had changes not in that commit.
     #[serde(default)]
     pub dirty: bool,
+    /// The settings the session ran under: a re-run starts under the same. The memory
+    /// server writes its own session's, whatever a caller puts here. A header with no
+    /// such key is of a session under the settings of production.
+    #[serde(default, skip_serializing_if = "is_production")]
+    pub settings: Settings,
+    /// The replay manifest the session began with: what it could see at its start. The
+    /// memory server writes its own session's, whatever a caller puts here. None on a
+    /// tape kept before manifests were, or when the state could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest: Option<ReplayManifest>,
+    /// The run of an evaluation the session is: the digest of the plan it started
+    /// under, the task, the seed and the arm. The memory server writes its own
+    /// session's, whatever a caller puts here. None for a session that is no run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<RunOf>,
+}
+
+fn is_production(settings: &Settings) -> bool {
+    *settings == Settings::default()
 }
 
 /// A tape's header.
@@ -335,9 +357,13 @@ impl Playback {
 }
 
 impl Memory {
-    /// The domain this session's records go to: the domain of the task it holds, else
-    /// the only granted one; none when there is neither.
+    /// The domain this session's records go to: for a run of an evaluation, the domain
+    /// of its plan; else the domain of the task it holds, else the only granted one;
+    /// none when there is none of these.
     pub(crate) async fn recording_domain(&self) -> Option<String> {
+        if let Some(domain) = self.evaluation_domain() {
+            return Some(domain);
+        }
         match self.held_task() {
             Some(id) => self
                 .ledger
@@ -362,7 +388,9 @@ impl Memory {
         self.playback.get()
     }
 
-    /// Say how this session was started, at the head of its tape.
+    /// Say how this session was started, at the head of its tape. The settings, the
+    /// replay manifest and the run of an evaluation in the header are this session's
+    /// own, whatever `start` holds in those three fields.
     ///
     /// # Errors
     ///
@@ -378,12 +406,26 @@ impl Memory {
             session: self.session_id.clone(),
             domain: domain.clone(),
             started_at: now(),
-            start,
+            start: self.own_state(start).await,
             pinned: false,
         })
         .await?;
         lock(&self.recording).domain = Some(domain);
         Ok(())
+    }
+
+    /// `start` with this session's settings, its replay manifest as it is now, and the
+    /// run of an evaluation that it is. A
+    /// header is written without a manifest when the state cannot be read: the prompt
+    /// is what a re-run cannot do without, and the replay state then says that the
+    /// starting state was not recorded.
+    async fn own_state(&self, start: TapeStart) -> TapeStart {
+        TapeStart {
+            settings: self.settings(),
+            manifest: self.replay_manifest().await.ok(),
+            evaluation: self.evaluation(),
+            ..start
+        }
     }
 
     async fn put_header(&self, h: &TapeHeader) -> Result<(), Error> {
@@ -421,7 +463,7 @@ impl Memory {
                     session: self.session_id.clone(),
                     domain: d.clone(),
                     started_at: now(),
-                    start: TapeStart::default(),
+                    start: self.own_state(TapeStart::default()).await,
                     pinned: false,
                 })
                 .await?;
@@ -459,7 +501,7 @@ impl Memory {
         Ok(())
     }
 
-    fn owner_only(&self, what: &str) -> Result<(), Error> {
+    pub(crate) fn owner_only(&self, what: &str) -> Result<(), Error> {
         if self.author == self.grants.owner {
             Ok(())
         } else {
@@ -884,6 +926,71 @@ mod tests {
             m.sweep_tapes(later).await.unwrap(),
             vec![other.session_id().to_string()]
         );
+    }
+
+    #[test]
+    fn a_tape_header_kept_before_manifests_were_still_parses() {
+        let old = r#"{"session":"sess-a","domain":"dom-me","started_at":"2026-11-01T10:00:00Z","harness":"claude","prompt":"Finish the import.","commit":"abc","dirty":true,"pinned":false}"#;
+        let h: TapeHeader = serde_json::from_str(old).unwrap();
+        assert_eq!(h.start.harness, "claude");
+        assert_eq!(h.start.settings, Settings::default(), "production");
+        assert!(h.start.manifest.is_none());
+        // a session under the settings of production writes no settings key
+        assert_eq!(serde_json::to_string(&h).unwrap(), old);
+        // and the two new keys are read back
+        let arm = crate::arms::Arm::T0Only.settings();
+        let with = TapeHeader {
+            start: TapeStart {
+                settings: arm.clone(),
+                manifest: Some(ReplayManifest::default()),
+                ..h.start.clone()
+            },
+            ..h
+        };
+        let text = serde_json::to_string(&with).unwrap();
+        let back: TapeHeader = serde_json::from_str(&text).unwrap();
+        assert_eq!(back, with);
+        assert_eq!(back.start.settings, arm);
+    }
+
+    #[tokio::test]
+    async fn a_tape_header_holds_the_session_s_own_settings_and_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let arm = crate::arms::Arm::T0Only.settings();
+        let forged = ReplayManifest {
+            ranker: "another ranker".into(),
+            ..ReplayManifest::default()
+        };
+        let m = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        m.set_settings(arm.clone()).unwrap();
+        m.tape_start(TapeStart {
+            harness: "claude".into(),
+            settings: crate::arms::Arm::Full.settings(),
+            manifest: Some(forged),
+            ..TapeStart::default()
+        })
+        .await
+        .unwrap();
+        let owner = Memory::open(dir.path()).unwrap();
+        let start = owner.tape(m.session_id()).await.unwrap().header.start;
+        assert_eq!(start.harness, "claude", "what the caller said stays");
+        assert_eq!(start.settings, arm, "the session's settings");
+        assert_eq!(
+            start.manifest,
+            Some(m.replay_manifest().await.unwrap()),
+            "the session's manifest"
+        );
+        // a session that began without saying how
+        let quiet = Memory::open(dir.path()).unwrap().with_author("agent:b");
+        quiet.set_settings(arm.clone()).unwrap();
+        quiet
+            .tape_call("t0", &json!({}), &json!({}), false)
+            .await
+            .unwrap();
+        let start = owner.tape(quiet.session_id()).await.unwrap().header.start;
+        assert_eq!(start.settings, arm);
+        assert_eq!(start.manifest, Some(quiet.replay_manifest().await.unwrap()));
     }
 
     #[tokio::test]
