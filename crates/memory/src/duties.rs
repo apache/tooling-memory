@@ -305,6 +305,8 @@ pub async fn auditor_duties(
 
 /// Each of the newest curations: a finding with no model when it cites nothing that a
 /// judge reads, else the model's answer on the text of the case, and a finding on `no`.
+/// A spent budget stops the questions and not the checks with no model: the loop goes
+/// on to the next curation, whatever the order of the curations is.
 async fn judge_curations(
     judge: &Judge<'_>,
     m: &Memory,
@@ -322,7 +324,7 @@ async fn judge_curations(
             continue;
         }
         let Some((ok, why)) = judge.ask(&audit::curation_question(&case)).await? else {
-            break;
+            continue;
         };
         cycle.curations_judged += 1;
         if !ok {

@@ -480,7 +480,8 @@ fn bodies_of(tasks: &[serde_json::Value], origin: &str) -> Vec<String> {
 
 /// Three curations by an agent on a curator's task, a handoff with an instruction, and
 /// a correction: what the duties of a cycle look for. Returns the entry that cites
-/// nothing.
+/// nothing. It is written first, so a cycle, which takes the newest first, comes to
+/// the two that need a model before it.
 fn plant_duties(f: &Fixture) -> String {
     let source = f.written("fact", "The port", "The index listens on port 7.\n", None);
     let mut old = Vec::new();
@@ -507,9 +508,10 @@ fn plant_duties(f: &Fixture) -> String {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         v["id"].as_str().unwrap().to_string()
     };
+    let bare = rewrite(&old[2], "The index has a port.\n", &[]);
     rewrite(&old[0], "The index listens on port 7.\n", &[&source]);
     rewrite(&old[1], "UNSUPPORTED-CLAIM: the port is 9.\n", &[&source]);
-    rewrite(&old[2], "The index has a port.\n", &[])
+    bare
 }
 
 /// What a first cycle counts of the duties, on the record of [`plant_duties`].
@@ -596,7 +598,8 @@ fn a_spent_budget_stops_the_questions_of_the_duties_and_not_the_checks_with_no_m
     );
     assert_eq!(cycle["calls"], 1, "{cycle}");
     assert_eq!(cycle["handoffs_sampled"], 0, "{cycle}");
-    // the curation that cites nothing needs no model; the two others are not judged
+    // the curation that cites nothing needs no model, and it is judged after the budget
+    // is spent; the two others are not judged
     assert_eq!(cycle["curations_judged"], 1, "{cycle}");
     let tasks = filed_tasks(&f);
     let curations = bodies_of(&tasks, "auditor:curation");
