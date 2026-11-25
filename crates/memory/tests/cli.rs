@@ -1291,6 +1291,265 @@ fn the_curator_s_telemetry_raises_a_probing_alarm_from_the_decision_log() {
     assert!(why.contains("in the clock hour 2026-11-15T14"), "{why}");
 }
 
+/// Add tables to the grants file of a root. Each command opens the root anew.
+fn grant(root: &Path, tables: &str) {
+    let path = root.join("grants.toml");
+    let text = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(&path, format!("{text}\n{tables}")).unwrap();
+}
+
+/// One row of `amem limits --json`, by its limit and its unit.
+fn limit_row(root: &Path, limit: &str, unit: &str) -> serde_json::Value {
+    let rows = json(&ok(root, &["limits", "--json"], None));
+    let found = rows
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["limit"] == limit && r["unit"] == unit);
+    found
+        .unwrap_or_else(|| panic!("no row {limit} in {unit}: {rows}"))
+        .clone()
+}
+
+/// `amem metrics` prints the 21 rows of the paper and the 10 targets, as JSON and as
+/// text. On a root that completed no task, the first row says that it is not measured.
+#[test]
+fn metrics_prints_the_21_rows_of_the_paper_and_then_the_targets() {
+    let d = step_init();
+    let table = json(&ok(&d.root, &["metrics", "--json"], None));
+    assert_eq!(table["domain"], "dom-me", "{table}");
+    assert_eq!(table["window_days"], 7, "{table}");
+    let rows = table["rows"].as_array().unwrap();
+    assert_eq!(rows.len(), 21, "{table}");
+    assert_eq!(rows[0]["name"], "Cost per completed task");
+    assert_eq!(rows[0]["measured"], false, "{table}");
+    assert_eq!(table["targets"].as_array().unwrap().len(), 10, "{table}");
+    let days = json(&ok(&d.root, &["metrics", "--days", "3", "--json"], None));
+    assert_eq!(days["window_days"], 3, "{days}");
+    let text = ok(&d.root, &["metrics"], None);
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(lines[0].starts_with("metrics of dom-me, the last 7 days, price vector "));
+    assert_eq!(lines.len(), 1 + 21 + 1 + 10, "{text}");
+    assert!(
+        lines[1].starts_with("  Cost per completed task: not measured: "),
+        "{text}"
+    );
+    assert_eq!(lines[22], "targets", "{text}");
+    assert!(lines[23].starts_with("  Search latency, median: target "));
+}
+
+/// The owner raises the share of upkeep at the command line, and `amem limits` then
+/// names the approval. The raise holds for the hours that the command names. The share
+/// of throughput is raised for a principal.
+#[test]
+fn limits_raise_records_an_approval_that_limits_then_names() {
+    use time::format_description::well_known::Rfc3339;
+    let d = step_init();
+    let unset = fails(&d.root, &["limits", "raise", "upkeep", "--to", "60"]);
+    assert!(unset.contains("the grants set no limit upkeep"), "{unset}");
+    grant(
+        &d.root,
+        "[limits.dom-me]\nupkeep_percent = 50\nclaims_per_hour = 2\n",
+    );
+    let before = limit_row(&d.root, "upkeep", "percent of completed tasks");
+    assert_eq!(before["cap"], 50.0, "{before}");
+    assert!(before["raised_by"].is_null(), "{before}");
+    let raise = ["limits", "raise", "upkeep", "--to", "60", "--hours", "2"];
+    let raised = json(&ok(&d.root, &raise, None));
+    assert_eq!(raised["target"], "limit:upkeep", "{raised}");
+    assert_eq!(raised["action"], "raise:60", "{raised}");
+    let time =
+        |key: &str| time::OffsetDateTime::parse(raised[key].as_str().unwrap(), &Rfc3339).unwrap();
+    let life = (time("expires") - time("at")).whole_minutes();
+    assert!((119..=120).contains(&life), "two hours: {raised}");
+    let after = limit_row(&d.root, "upkeep", "percent of completed tasks");
+    assert_eq!(
+        (&after["cap"], &after["configured"]),
+        (&60.0.into(), &50.0.into())
+    );
+    assert_eq!(after["raised_by"], raised["id"], "{after}");
+    let id = raised["id"].as_str().unwrap();
+    let text = ok(&d.root, &["limits"], None);
+    let said = format!("; raised from 50 by the approval {id}");
+    assert!(text.contains(&said), "{text}");
+    let nobody = fails(&d.root, &["limits", "raise", "throughput", "--to", "9"]);
+    assert!(nobody.contains("name the principal"), "{nobody}");
+    let share = [
+        "limits",
+        "raise",
+        "throughput",
+        "--to",
+        "9",
+        "--for",
+        "agent:x",
+    ];
+    assert_eq!(json(&ok(&d.root, &share, None))["scope"], "agent:x");
+    let word = fails(&d.root, &["limits", "raise", "spend", "--to", "9"]);
+    let no = "spend is no limit that an approval raises";
+    assert!(word.contains(no), "{word}");
+}
+
+/// Put one model call of `m-1` on the meter of the egress now: a million tokens in, in
+/// `session`, at `openai`.
+fn metered(root: &Path, session: &str) {
+    let at = std::time::SystemTime::now();
+    let usage = dm_egress::Usage {
+        model: Some("m-1".into()),
+        input_tokens: 1_000_000,
+        ..dm_egress::Usage::default()
+    };
+    let meter = dm_egress::Telemetry::open(&root.join("state/telemetry.db")).unwrap();
+    meter.record(at, session, "openai", 200, &usage).unwrap();
+}
+
+/// The price vector `t1`: a million tokens in of `m-1` cost two dollars.
+fn priced(root: &Path) {
+    let prices = "version = \"t1\"\n[models.m-1]\ninput = 2.0\n";
+    std::fs::write(root.join("prices.toml"), prices).unwrap();
+}
+
+/// A row of spend for one day has the count that the binary read off the meter of the
+/// egress: the tokens of the last 24 hours, and their price in US cents. A row of
+/// spend for one session has no count.
+#[test]
+fn limits_counts_the_spend_of_the_last_day_from_the_meter_of_the_egress() {
+    let d = step_init();
+    grant(
+        &d.root,
+        "[spend.openai]\nday_tokens = 4000000\nday_usd_cents = 800\nsession_tokens = 10\n",
+    );
+    let rows = || json(&ok(&d.root, &["limits", "--json"], None));
+    let of = |rows: &serde_json::Value, unit: &str, scope: &str| {
+        let all = rows.as_array().unwrap().iter();
+        let found = all
+            .clone()
+            .find(|r| r["unit"] == unit && r["scope"] == scope);
+        found
+            .unwrap_or_else(|| panic!("no row of {scope} in {unit}: {rows}"))
+            .clone()
+    };
+    let nothing = rows();
+    assert_eq!(of(&nothing, "tokens", "openai, one day")["now"], 0.0);
+    metered(&d.root, "s-1");
+    metered(&d.root, "s-2");
+    priced(&d.root);
+    let spent = rows();
+    let tokens = of(&spent, "tokens", "openai, one day");
+    assert_eq!(
+        tokens["now"], 2_000_000.0,
+        "two calls in the last day: {tokens}"
+    );
+    assert_eq!(tokens["fraction"], 0.5, "{tokens}");
+    let cents = of(&spent, "US cents", "openai, one day");
+    assert_eq!(
+        (&cents["now"], &cents["fraction"]),
+        (&400.0.into(), &0.5.into())
+    );
+    let session = of(&spent, "tokens", "openai, one session");
+    assert!(session["now"].is_null(), "{session}");
+    let text = ok(&d.root, &["limits"], None);
+    assert!(
+        text.contains("400 of 800 US cents, openai, one day"),
+        "{text}"
+    );
+}
+
+/// A task that the owner claims at the command line and hands to the landing queue
+/// `main`: the task, and the handoff that describes the change.
+fn queued_for_landing(root: &Path) -> (String, String) {
+    let filed = ok(root, &["task", "create", "Change the importer"], None);
+    let task = id_of(&filed);
+    if json(&filed)["status"] == "proposed" {
+        ok(root, &["task", "admit", &task], None);
+    }
+    let claimed = json(&ok(root, &["task", "claim-next"], None));
+    assert_eq!(claimed["id"], task.as_str(), "{claimed}");
+    let generation = claimed["generation"].to_string();
+    let handoff = id_of(&ok(
+        root,
+        &[
+            "write",
+            "--kind",
+            "handoff",
+            "--body",
+            "Changed src/importer.rs.\n",
+        ],
+        None,
+    ));
+    let queue = [
+        "task",
+        "queue-landing",
+        &task,
+        "--queue",
+        "main",
+        "--handoff",
+        &handoff,
+    ];
+    let unnamed = fails(root, &queue);
+    assert!(
+        unnamed.contains("name the generation of the claim"),
+        "{unnamed}"
+    );
+    let with = [&queue[..], &["--generation", &generation]].concat();
+    let parked = json(&ok(root, &with, None));
+    assert_eq!(parked["status"], "blocked", "{parked}");
+    assert_eq!(parked["waiting_on"], "landing:main", "{parked}");
+    (task, handoff)
+}
+
+/// The owner queues a change, reads the queue, lands the change and reads the times of
+/// the task, all at the command line. The metric table then has the time from the claim
+/// to the landing. With the session of the handoff on the meter of the egress and its
+/// model in the price vector, the first row is the cost that the binary computed.
+#[test]
+fn a_change_is_queued_and_landed_at_the_command_line_and_the_table_counts_it() {
+    let d = step_init();
+    grant(&d.root, "[landing.main]\ndomain = \"dom-me\"\n");
+    let (task, handoff) = queued_for_landing(&d.root);
+    let waiting = json(&ok(&d.root, &["landing", "show", "main"], None));
+    assert_eq!(waiting["waiting"][0]["task"], task.as_str(), "{waiting}");
+    assert_eq!(waiting["waiting"][0]["person"], true, "{waiting}");
+    let landed = json(&ok(&d.root, &["landing", "land", "main"], None));
+    assert_eq!(landed["id"], task.as_str(), "{landed}");
+    assert_eq!(landed["status"], "done", "{landed}");
+    assert_eq!(landed["handoff"], handoff.as_str(), "{landed}");
+    let empty = fails(&d.root, &["landing", "land", "main"]);
+    assert!(
+        empty.contains("nothing waits in the landing queue main"),
+        "{empty}"
+    );
+    let times = json(&ok(&d.root, &["task", "times", &task], None));
+    assert_eq!(times["queue"], "main", "{times}");
+    assert!(times["claim_to_landed_secs"].is_i64(), "{times}");
+    let table = json(&ok(&d.root, &["metrics", "--json"], None));
+    let row = &table["rows"][14];
+    assert_eq!(row["name"], "Claim-to-landed time", "{table}");
+    assert_eq!(row["measured"], true, "{row}");
+    assert_eq!(
+        table["rows"][0]["measured"], false,
+        "nothing is on the meter"
+    );
+    costs_two_dollars(&d.root, &handoff);
+}
+
+/// With the session that wrote `handoff` on the meter of the egress and its model in the
+/// price vector, the first row of the table is the cost that the binary computed.
+fn costs_two_dollars(root: &Path, handoff: &str) {
+    let writes = std::fs::read_to_string(root.join("state/writes.jsonl")).unwrap();
+    let wrote = writes.lines().map(json).find(|w| w["id"] == handoff);
+    let session = wrote.unwrap()["session"].as_str().unwrap().to_string();
+    metered(root, &session);
+    priced(root);
+    let table = json(&ok(root, &["metrics", "--json"], None));
+    let cost = &table["rows"][0];
+    assert_eq!(cost["measured"], true, "{cost}");
+    assert_eq!(cost["from"], "caller", "{cost}");
+    assert_eq!(cost["value"]["tasks"], 1, "{cost}");
+    assert_eq!(cost["value"]["usd"], 2.0, "{cost}");
+    assert_eq!(cost["value"]["prices"], "t1", "{cost}");
+    assert!(ok(root, &["cost"], None).ends_with("\nprices: t1\n"));
+}
+
 fn holds(root: &Path, needle: &[u8]) -> Option<PathBuf> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {

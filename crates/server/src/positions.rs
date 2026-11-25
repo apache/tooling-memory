@@ -987,7 +987,7 @@ impl Memory {
 
     /// Whether this session works `task`: it holds the task under the claim it made,
     /// or under the claim its launcher made for it.
-    fn works(&self, task: &Task) -> bool {
+    pub(crate) fn works(&self, task: &Task) -> bool {
         let claimed = lock(&self.claims).get(&task.id) == Some(&task.generation);
         let held = self.held_task().as_deref() == Some(task.id.as_str());
         task.status == Status::Claimed && (claimed || held)
@@ -2979,8 +2979,12 @@ mod tests {
         in_force(&owner, &release()).await;
         let commitment = admitted(&owner, pinned("Cut 1.2")).await;
         let outside = session(dir.path(), "claude");
+        // an agent names only a task that it works: the answer names nothing of the task
         let why = denied(outside.create_task(resumes(&commitment.id)).await);
-        assert!(why.contains("is pinned to position pos-release"), "{why}");
+        assert!(
+            why.contains("the session that works that task does") && !why.contains("pos-"),
+            "{why}"
+        );
         let filed = owner.ledger.lock().await.filed_from(&commitment.id).await;
         assert!(filed.unwrap().is_empty(), "nothing was filed");
         // the session that works the task files one: a commitment once it is admitted
@@ -3135,9 +3139,10 @@ mod tests {
         );
         let filed = owner.ledger.lock().await.filed_from(&later.id).await;
         assert!(filed.unwrap().is_empty(), "nothing was filed");
-        // a task that the ledger does not hold is continued as before, with no pin
-        let loose = low.create_task(resumes("task-me-none")).await.unwrap().task;
-        assert_eq!(loose.spec.position, None);
+        // a task that the ledger does not hold gets the same answer: the answer does
+        // not say whether a hidden task is there
+        let loose = denied(low.create_task(resumes("task-me-none")).await);
+        assert_eq!(loose, why);
     }
 
     #[tokio::test]

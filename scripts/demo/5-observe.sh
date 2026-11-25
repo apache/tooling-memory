@@ -1,10 +1,12 @@
 #!/bin/sh
 # Act 5: watching it. Traces to a collector: model calls, reads, policy decisions and
-# task transitions; the paper's read metrics; vendor-drift probes; and transcripts kept
-# as sources, reached only by citation. Each part runs when this build has it. The last
-# step is the freeze: a drift window, and what it stops. It needs no model.
+# task transitions; the paper's read metrics; the paper's metric table and its targets;
+# the limits, the share of upkeep and the landing queue; vendor-drift probes; and
+# transcripts kept as sources, reached only by citation. Each part runs when this build
+# has it. The last step is the freeze: a drift window, and what it stops. It needs no
+# model.
 . "$(dirname "$0")/lib.sh"
-act 5 "Watching it" "What the system shows about itself: traces of every model call, read, decision and task transition; the paper's read metrics; probes for a vendor changing a model under its name; transcripts kept as sources; and replay of a session's decisions on another model." "the system itself: a loopback OpenTelemetry sink counting spans; the drift probes, run against $WORKER_MODEL and then $AUDITOR_MODEL; the egress, whose recorded decision contexts are replayed; and $WORKER_MODEL, replaying a session another model ran."
+act 5 "Watching it" "What the system shows about itself: traces of every model call, read, decision and task transition; the paper's read metrics; the paper's metric table and its targets; the limits, with a fleet that files its own work held at the ceiling on upkeep, and a change landed through a queue; probes for a vendor changing a model under its name; transcripts kept as sources; and replay of a session's decisions on another model." "the system itself: a loopback OpenTelemetry sink counting spans; agent:a, played by the demo script, which does a task, queues its change, and files work of its own; you, the owner, who lands the change and raises the share of upkeep; the drift probes, run against $WORKER_MODEL and then $AUDITOR_MODEL; the egress, whose recorded decision contexts are replayed; and $WORKER_MODEL, replaying a session another model ran."
 has() { a "$1" --help >/dev/null 2>&1; }
 # the open drift windows, one `destination model` per line
 open_windows() { a drift window list | j "'\n'.join(w['destination'] + ' ' + w['model'] for w in d if not w['until'])"; }
@@ -36,6 +38,83 @@ echo "  (a loopback sink for the demo; the same variable points amem at Jaeger o
 if a savings --help 2>/dev/null | grep -q . && a savings | grep -q "Metrics"; then
   say "The read metrics" "Fetch-through, retrieval depth per task, prefetch precision and wasted reads, computed from the read and write logs."
   a savings | sed -n '/Metrics/,/^$/p' | sed 's/^/  /'
+fi
+
+if has metrics; then
+  say "The paper's metric table" "The 21 rows of the paper's metric table for the domain, over the last 7 days. Each row has a value from a log, or it says why no log here answers it. The published targets follow, with what is measured against each. No model is called."
+  a metrics --domain dom-demo | sed 's/^/  /'
+fi
+
+if has limits; then
+  say "A fleet that files its own work" "Upkeep is the work that the fleet makes for itself: curation, and a task that an agent files and then completes. A ceiling in the grants holds the share of upkeep among the completed tasks, at admission. It stands beside the other limits, each in its own unit, and you raise one for a time with an approval. A change lands through a queue, and the time from the claim to the landing is what the fabric reports."
+  # the handoff that an agent writes: author, title, body
+  wrote() { agent "$1" write "{\"domain\": \"dom-demo\", \"entry_type\": \"handoff\", \"title\": \"$2\", \"body\": \"$3\"}" | j "d['id']"; }
+  # an expression over the value `v` of the row of the share of upkeep
+  upkeep() { a metrics --domain dom-demo --json | j "(lambda v: $1)(next(r for r in d['rows'] if r['name'] == 'Share of throughput spent on upkeep')['value'])"; }
+  share() { upkeep "f\"{v['upkeep']} of the {v['done']} completed tasks are upkeep ({v['share']:.0%}), {v['self_filed']} of them filed and completed by one agent\""; }
+  rows() { a metrics --domain dom-demo | grep -E "^  ($1):" | sed 's/^/  /'; }
+  # This block changes grants.toml and puts it back. A run that stopped in the block
+  # left the copy: start from it, and put the grants back however this run ends.
+  [ ! -f "$root/grants.toml.before-limits" ] || mv "$root/grants.toml.before-limits" "$root/grants.toml"
+  cp "$root/grants.toml" "$root/grants.toml.before-limits"
+  trap '[ ! -f "$root/grants.toml.before-limits" ] || mv "$root/grants.toml.before-limits" "$root/grants.toml"' EXIT
+  printf '\n[landing.main]\ndomain = "dom-demo"\nper_day = 20\n' >> "$root/grants.toml"
+  echo "  grants.toml: [landing.main] domain = \"dom-demo\", per_day = 20: the queue that changes land through"
+  c=$(a task create "Correct the release checklist" --domain dom-demo --body "A change that a person asked for." | j "d['id']")
+  a task admit "$c" >/dev/null 2>&1 || true
+  g=$(agent agent:a claim "{\"id\": \"$c\"}" | j "d['task']['generation']")
+  h=$(wrote agent:a "The release checklist, corrected" "Corrected step 4 of the release checklist.")
+  agent agent:a queue_landing "{\"task\": \"$c\", \"queue\": \"main\", \"handoff\": \"$h\", \"generation\": $g}" | j "f\"  agent:a did {d['task']['id']} and queued its change: {d['task']['status']}, waiting on {d['task']['waiting_on']}\""
+  a landing show main | j "'\n'.join(f\"  in the queue: {w['task']} by {w['by']}\" for w in d['waiting']) + f\"\n  changes of agents landed in the last 24 hours: {d['fleet_landed_last_day']} of {d['per_day']}\""
+  a landing land main | j "f\"  you land it: {d['id']} is {d['status']}\""
+  echo "  amem task times $c:"
+  a task times "$c" | j "f\"    claimed {d['claimed'][:19]}Z, queued {d['queued'][:19]}Z, landed {d['completed'][:19]}Z: {d['claim_to_landed_secs']} seconds from the claim to the landing, through the queue {d['queue']}\""
+
+  echo "  before: $(share)"
+  rows "Induced work"
+  # the ceiling: five points above the share now, so that a few tasks of the fleet's own reach it
+  cap=$(upkeep "min(100, v['upkeep'] * 100 // v['done'] + 5)")
+  printf '\n[limits.dom-demo]\nupkeep_percent = %s\n' "$cap" >> "$root/grants.toml"
+  echo "  grants.toml: [limits.dom-demo] upkeep_percent = $cap"
+  # A session's filing with no held task is born proposed, so agent:a also asks to
+  # admit it: the ceiling is held there. It files, admits, claims and completes until
+  # the share is at the ceiling.
+  admit() { agent agent:a admit_task "{\"id\": \"$1\"}" 2>&1; }
+  held=; n=0
+  while [ -z "$held" ] && [ "$n" -lt 20 ]; do
+    n=$((n + 1))
+    t=$(agent agent:a create_task "{\"domain\": \"dom-demo\", \"title\": \"Tidy the notes, part $n\", \"body\": \"Work that agent:a found for itself.\"}" | j "d['task']['id']")
+    if why=$(admit "$t"); then
+      g=$(agent agent:a claim "{\"id\": \"$t\"}" | j "d['task']['generation']")
+      h=$(wrote agent:a "The notes, tidied, part $n" "Tidied the notes.")
+      agent agent:a complete "{\"id\": \"$t\", \"generation\": $g, \"handoff\": \"$h\"}" | j "f\"  agent:a files {d['task']['id']} on its own account, admits it, claims it and completes it: {d['task']['status']}\""
+      echo "    $(share)"
+    else
+      held=$t
+      echo "  agent:a files $t on its own account and asks to admit it:"
+      printf '%s\n' "$why" | fold -s -w 72 | sed 's/^/    /'
+      echo "  $t is $(a task get "$t" | j "d['status']")"
+    fi
+  done
+  if [ -n "$held" ]; then
+    echo "  amem limits: the five limits, each in its own unit"
+    a limits --domain dom-demo | sed 's/^/  /'
+    to=$(upkeep "min(100, v['upkeep'] * 100 // v['done'] + 1)")
+    a limits raise upkeep --to "$to" --domain dom-demo --hours 1 | j "f\"  you raise the share to $to percent for one hour: the approval {d['id']} of {d['action']} on {d['target']}, until {d['expires'][:19]}Z\""
+    if admitted=$(admit "$held"); then
+      echo "$admitted" | j "f\"  agent:a asks again: {d['task']['id']} is {d['task']['status']}\""
+    else
+      echo "  agent:a asks again: $admitted"
+    fi
+    a limits --domain dom-demo | grep '^  upkeep' | sed 's/^/  /'
+  else
+    echo "  (the share did not reach the ceiling in $n filings)"
+  fi
+  rows "Claim-to-landed time|Induced work|Share of throughput spent on upkeep"
+  # the task that was admitted last is closed, so that no later act works it
+  [ -z "$held" ] || a task invalidate "$held" --reason "a demo" >/dev/null 2>&1 || true
+  mv "$root/grants.toml.before-limits" "$root/grants.toml"
+  trap - EXIT
 fi
 
 if has drift && gateway; then

@@ -42,6 +42,10 @@ pub struct Read {
     /// How a recall was served: `brief`, or `pack:sections` and `pack:summaries`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// How long the server took to answer, in milliseconds: kept for a search. Absent
+    /// in lines written before this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
 }
 
 /// The log file under a root.
@@ -243,6 +247,21 @@ impl ReadLog {
         via: Option<&str>,
         ids: &[String],
     ) {
+        self.record(tool, query, (hits, tokens), cached, via, ids, None);
+    }
+
+    /// Append one read, and trace it. `size` is the hits and the tokens served.
+    #[allow(clippy::too_many_arguments)] // one per thing a read is
+    fn record(
+        &self,
+        tool: &str,
+        query: Option<&str>,
+        size: (usize, usize),
+        cached: bool,
+        via: Option<&str>,
+        ids: &[String],
+        ms: Option<u64>,
+    ) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -262,11 +281,12 @@ impl ReadLog {
                 .clone(),
             tool: tool.to_string(),
             query: query.map(str::to_string),
-            hits,
-            tokens,
+            hits: size.0,
+            tokens: size.1,
             cached,
             ids: ids.to_vec(),
             via: via.map(str::to_string),
+            ms,
         };
         trace(&read);
         let _g = self
@@ -285,6 +305,13 @@ impl ReadLog {
                 let _ = writeln!(f, "{line}");
             }
         }
+    }
+
+    /// A search answered with these hits, in `ms` milliseconds.
+    pub fn searched(&self, query: &str, hits: &[Hit], ms: u64) {
+        let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        let size = (hits.len(), hits_tokens(hits));
+        self.record("search", Some(query), size, false, None, &ids, Some(ms));
     }
 
     /// A list or search answered with these hits.
@@ -344,6 +371,9 @@ fn trace(read: &Read) {
     }
     if let Some(v) = &read.via {
         attrs.push(("memory.via", v.as_str().into()));
+    }
+    if let Some(ms) = read.ms {
+        attrs.push(("memory.ms", ms.into()));
     }
     dm_otel::event("memory.read", &attrs);
 }
@@ -414,6 +444,31 @@ mod tests {
         assert_eq!(reads[0].tokens, 6 + 2);
         assert_eq!(reads[1].query.as_deref(), Some("import"));
         assert_eq!(reads[1].session, "sess-1");
+    }
+
+    #[test]
+    fn a_line_without_the_time_of_the_answer_reads_back_and_a_search_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"at":"2026-10-10T00:00:00Z","session":"s-old","tool":"search","query":"import","hits":2,"tokens":40,"ids":["mem-a","mem-b"]}"#;
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        std::fs::write(path(dir.path()), format!("{old}\n")).unwrap();
+        let log = ReadLog::new(dir.path(), "sess-new");
+        log.searched("import", &[], 7);
+        log.text("t0", "a text");
+        let reads = all(dir.path()).unwrap();
+        assert_eq!(reads.len(), 3, "the old line parses: {reads:?}");
+        assert_eq!((reads[0].session.as_str(), reads[0].ms), ("s-old", None));
+        assert_eq!(reads[0].ids, ["mem-a", "mem-b"]);
+        assert_eq!((reads[1].tool.as_str(), reads[1].ms), ("search", Some(7)));
+        assert_eq!(reads[2].ms, None, "only a search is timed");
+        let text = std::fs::read_to_string(path(dir.path())).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains(r#""ms":7"#), "{}", lines[1]);
+        assert!(
+            !lines[2].contains("\"ms\""),
+            "an untimed read has no ms: {}",
+            lines[2]
+        );
     }
 
     #[test]

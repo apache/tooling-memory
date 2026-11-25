@@ -169,6 +169,19 @@ pub struct SpendInput {
     pub session_tokens: u64,
     /// Tokens the root has spent there in the last day.
     pub day_tokens: u64,
+    /// US cents this session has spent there, on metered calls, as the price vector
+    /// prices them.
+    #[serde(default)]
+    pub session_cents: u64,
+    /// US cents the root has spent there in the last day.
+    #[serde(default)]
+    pub day_cents: u64,
+    /// The metered models with tokens that the price vector does not price.
+    #[serde(default)]
+    pub unpriced: Vec<String>,
+    /// The version of the price vector that priced the cents.
+    #[serde(default)]
+    pub prices: String,
 }
 
 /// A tool's outbound request, as the host is about to send it.
@@ -2072,6 +2085,7 @@ mod tests {
             crate::SpendLimit {
                 session_tokens: Some(1000),
                 day_tokens: Some(5000),
+                ..crate::SpendLimit::default()
             },
         );
         let p = Policy::builtin(&g).unwrap();
@@ -2093,6 +2107,7 @@ mod tests {
                     destination: dest.into(),
                     session_tokens: session,
                     day_tokens: day,
+                    ..SpendInput::default()
                 }),
                 fetch: None,
                 approval: None,
@@ -2108,6 +2123,104 @@ mod tests {
             ask("anthropic", 1_000_000, 1_000_000).allow,
             "no limit set there"
         );
+    }
+
+    fn ask_spend(limit: crate::SpendLimit, spend: SpendInput) -> Decision {
+        let mut g = grants();
+        g.spend.insert("llmao".into(), limit);
+        Policy::builtin(&g)
+            .unwrap()
+            .decide(&Input {
+                action: Action::Spend,
+                principal: Principal {
+                    id: "agent:x".into(),
+                    class: Class::Agent,
+                },
+                domain: String::new(),
+                filing: None,
+                task: None,
+                parent: None,
+                write: None,
+                promote: None,
+                held_task: None,
+                spend: Some(SpendInput {
+                    destination: "llmao".into(),
+                    prices: "v7".into(),
+                    ..spend
+                }),
+                fetch: None,
+                approval: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_model_call_over_a_limit_in_money_does_not_leave() {
+        let money = || crate::SpendLimit {
+            session_usd_cents: Some(100),
+            day_usd_cents: Some(500),
+            ..crate::SpendLimit::default()
+        };
+        let cents = |session_cents: u64, day_cents: u64| SpendInput {
+            session_cents,
+            day_cents,
+            ..SpendInput::default()
+        };
+        assert!(ask_spend(money(), cents(99, 499)).allow, "one cent under");
+        let d = ask_spend(money(), cents(100, 100));
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(
+            d.reason,
+            "spend limit: this session has spent 100 US cents at llmao, its limit is 100 US cents (price vector v7)"
+        );
+        let d = ask_spend(money(), cents(10, 500));
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(
+            d.reason,
+            "spend limit: the root has spent 500 US cents at llmao in the last day, its limit is 500 US cents (price vector v7)"
+        );
+    }
+
+    #[test]
+    fn a_limit_in_money_refuses_a_model_that_has_no_price() {
+        let unpriced = || SpendInput {
+            unpriced: vec!["qwen".into()],
+            ..SpendInput::default()
+        };
+        let d = ask_spend(
+            crate::SpendLimit {
+                day_usd_cents: Some(500),
+                ..crate::SpendLimit::default()
+            },
+            unpriced(),
+        );
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(
+            d.reason,
+            "spend limit: qwen has no price in price vector v7, so a limit in money cannot be checked"
+        );
+        let tokens_only = crate::SpendLimit {
+            session_tokens: Some(1000),
+            ..crate::SpendLimit::default()
+        };
+        assert!(
+            ask_spend(tokens_only.clone(), unpriced()).allow,
+            "limits in tokens need no price"
+        );
+        // the limits in tokens come first, with their own text
+        let both = crate::SpendLimit {
+            session_usd_cents: Some(1),
+            ..tokens_only
+        };
+        let d = ask_spend(
+            both,
+            SpendInput {
+                session_tokens: 1000,
+                session_cents: 5,
+                ..SpendInput::default()
+            },
+        );
+        assert!(d.reason.contains("1000 tokens"), "{d:?}");
     }
 
     fn fetch_grants() -> Grants {

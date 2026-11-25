@@ -25,6 +25,7 @@
 //! deny-by-default the paper asks for.
 
 pub mod decide;
+pub mod prices;
 pub mod record;
 pub mod scan;
 
@@ -58,8 +59,8 @@ pub enum Error {
     Policy(String),
 }
 
-/// What one destination's model calls may spend, in tokens in and out: per session,
-/// and across the root in the last day. Checked by the egress before a call leaves.
+/// What one destination's model calls may spend, in tokens in and out and in money: per
+/// session, and across the root in the last day. Checked by the egress before a call leaves.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendLimit {
     /// Tokens one session may spend here.
@@ -68,6 +69,13 @@ pub struct SpendLimit {
     /// Tokens the root may spend here in the last day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub day_tokens: Option<u64>,
+    /// US cents one session may spend here, as the price vector prices its metered
+    /// tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_usd_cents: Option<u64>,
+    /// US cents the root may spend here in the last day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_usd_cents: Option<u64>,
 }
 
 /// The gates on writes whose blast radius is not routine; `[gates]` in the file.
@@ -271,9 +279,90 @@ pub struct Grants {
     /// Spend limits per resource class, by destination: `[spend.llmao]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub spend: BTreeMap<String, SpendLimit>,
+    /// Landing queues by name: `[landing.main]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub landing: BTreeMap<String, LandingQueue>,
+    /// The shares of a domain, by domain: `[limits.dom-a]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, DomainLimits>,
     /// Where the task ledger lives when not in the SQLite file under the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<LedgerSettings>,
+}
+
+/// A queue through which finished changes land, one at a time, when a person says so:
+///
+/// ```toml
+/// [landing.main]
+/// domain = "dom-a"
+/// per_day = 4
+/// count_after_hours = 24
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingQueue {
+    /// The domain whose tasks the queue lands.
+    pub domain: String,
+    /// The share of the fleet: how many changes of agents the queue lands in 24 hours.
+    /// Absent is no share. The changes of people are not counted against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_day: Option<u32>,
+    /// The hours after which a landing counts as progress; 24 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_after_hours: Option<u32>,
+}
+
+impl LandingQueue {
+    /// The hours after which a landing counts when the file names none.
+    pub const COUNT_AFTER_HOURS: u32 = 24;
+
+    /// The fixed delay after which a landing counts as progress.
+    #[must_use]
+    pub fn count_after(&self) -> time::Duration {
+        let hours = self.count_after_hours.unwrap_or(Self::COUNT_AFTER_HOURS);
+        time::Duration::hours(i64::from(hours))
+    }
+}
+
+/// The shares of one domain. A person raises one for a time with an approval; the file
+/// holds the value that stands without one:
+///
+/// ```toml
+/// [limits.dom-a]
+/// claims_per_hour = 6
+/// upkeep_percent = 30
+/// window_days = 7
+///
+/// [limits.dom-a.outbound]
+/// github = 20
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainLimits {
+    /// Share of throughput: the claims that one agent may make in this domain in 60
+    /// minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims_per_hour: Option<u32>,
+    /// Share of upkeep: the highest percentage of the completed tasks of the window
+    /// that may be upkeep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upkeep_percent: Option<u8>,
+    /// The window of the upkeep share, in days; 7 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_days: Option<u32>,
+    /// Outbound rate: the handoffs posted back in 24 hours, by the family of the
+    /// task's origin (`github`, `issues`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outbound: BTreeMap<String, u32>,
+}
+
+impl DomainLimits {
+    /// The days of the window of the upkeep share when the file names none.
+    pub const WINDOW_DAYS: u32 = 7;
+
+    /// The window of the upkeep share, in days.
+    #[must_use]
+    pub fn window(&self) -> u32 {
+        self.window_days.unwrap_or(Self::WINDOW_DAYS)
+    }
 }
 
 /// The ledger's backend, when it is a server rather than the file under the root:
@@ -343,6 +432,8 @@ impl Grants {
             ledger: None,
             gates: Gates::default(),
             spend: BTreeMap::new(),
+            landing: BTreeMap::new(),
+            limits: BTreeMap::new(),
         }
     }
 
@@ -914,5 +1005,80 @@ ceiling = "public"
             Grants::load(Path::new("/nonexistent/grants.toml")),
             Err(Error::Io { .. })
         ));
+    }
+
+    #[test]
+    fn a_file_without_a_landing_queue_reads_and_renders_as_before() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("landing"), "{text}");
+        assert!(Grants::parse(FILE).unwrap().landing.is_empty());
+    }
+
+    #[test]
+    fn a_landing_queue_round_trips_and_its_delay_defaults_to_a_day() {
+        let mut g = Grants::starter("human:local:me", "dom-me");
+        let text = format!(
+            "{}\n[landing.main]\ndomain = \"dom-me\"\nper_day = 2\n",
+            g.render().unwrap()
+        );
+        let back = Grants::parse(&text).unwrap();
+        let q = LandingQueue {
+            domain: "dom-me".into(),
+            per_day: Some(2),
+            count_after_hours: None,
+        };
+        assert_eq!(q.count_after(), time::Duration::hours(24));
+        g.landing.insert("main".into(), q);
+        assert_eq!(back, g);
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        let short = LandingQueue {
+            count_after_hours: Some(6),
+            ..g.landing["main"].clone()
+        };
+        assert_eq!(short.count_after(), time::Duration::hours(6));
+    }
+
+    #[test]
+    fn a_file_without_limits_reads_and_renders_as_before() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("limits"), "{text}");
+        assert!(Grants::parse(FILE).unwrap().limits.is_empty());
+    }
+
+    #[test]
+    fn the_shares_of_a_domain_round_trip_and_the_window_defaults_to_a_week() {
+        let mut g = Grants::starter("human:local:me", "dom-me");
+        let text = format!(
+            "{}\n[limits.dom-me]\nclaims_per_hour = 6\nupkeep_percent = 30\n\n[limits.dom-me.outbound]\ngithub = 20\n",
+            g.render().unwrap()
+        );
+        let back = Grants::parse(&text).unwrap();
+        let limits = DomainLimits {
+            claims_per_hour: Some(6),
+            upkeep_percent: Some(30),
+            window_days: None,
+            outbound: BTreeMap::from([("github".to_string(), 20)]),
+        };
+        assert_eq!(limits.window(), 7);
+        g.limits.insert("dom-me".into(), limits);
+        assert_eq!(back, g);
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        let short = DomainLimits {
+            window_days: Some(2),
+            ..DomainLimits::default()
+        };
+        assert_eq!(short.window(), 2);
+        let none = format!(
+            "{}\n[limits.dom-me]\n",
+            Grants::starter("human:local:me", "dom-me")
+                .render()
+                .unwrap()
+        );
+        assert_eq!(
+            Grants::parse(&none).unwrap().limits["dom-me"],
+            DomainLimits::default()
+        );
     }
 }

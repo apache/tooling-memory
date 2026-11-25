@@ -23,7 +23,7 @@
 //! reader has seen, and a reader that asks for the events after a number misses none.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
+    check_holder, claimable, parse_time, Claimer, Error, Event, Held, Moment, PromotionRecord,
     PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
     LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
@@ -471,6 +471,37 @@ impl Db {
             )
             .await?;
         rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
+    }
+
+    /// The moments of the tasks of one domain, oldest first. The join leaves out the
+    /// records that are no task's. A domain that has recorded nothing has none.
+    pub(crate) async fn moments(&self, domain: &str) -> Result<Vec<Moment>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT e.task_id, e.kind, e.at, e.payload
+                     FROM {s}.events e JOIN {s}.tasks t ON t.id = e.task_id
+                     WHERE t.domain = $1 AND e.kind IN ({}) ORDER BY e.seq",
+                    crate::moment_kinds_sql()
+                ),
+                &[&domain],
+            )
+            .await?;
+        let mut out = Vec::new();
+        for r in &rows {
+            let (at, payload): (String, String) = (r.try_get(2)?, r.try_get(3)?);
+            out.push(crate::moment_from_row(
+                r.try_get(0)?,
+                r.try_get(1)?,
+                &at,
+                &payload,
+            )?);
+        }
+        Ok(out)
     }
 
     /// Record a promotion unless that promoter promoted that version of the entry to that

@@ -7,11 +7,11 @@ Anything that a model decides can change more:
 
 - the auditor's verdicts
 - what the harness sessions do
-- the replay in 5.5
+- the replay in 5.7
 - the answers in act 6
 - the re-enactments in act 8.
 
-Some steps are newer than that run: 5.6, act 6, and the manifest lines of act 8. The
+Some steps are newer than that run: 5.8, act 6, and the manifest lines of act 8. The
 steps of these that need no model ran on 23 November 2026, and their figures are from
 that day. The steps of these that need the gateway did not run yet. For those steps,
 these notes say what the step prints, and they hold no figures.
@@ -55,9 +55,9 @@ offline.
   - the task in act 7
   - the re-runs in act 8, one of them on gemma4-26b.
 - **qwen3.8-27b on its own**. The system calls it directly: to answer a question in 1.5,
-  as the model that 5.3 probes, and as the model that 5.5 replays against.
+  as the model that 5.5 probes, and as the model that 5.7 replays against.
 - **gemma4-26b**, the auditor. It reads summaries in act 2 and held writes in act 3. In
-  5.3, it takes the role of a different model, swapped in behind the name qwen3.8-27b.
+  5.5, it takes the role of a different model, swapped in behind the name qwen3.8-27b.
   In act 8, it is the other model that a session is re-enacted on.
 - **The launcher**, in act 6. It gives each session its settings, and the session cannot
   change them.
@@ -111,7 +111,7 @@ offline.
 - **Scorecard**: the result of one evaluation, kept as an entry in the platform domain
   (6.5).
 - **Drift window**: a time span for one model at one destination, from detected drift
-  until you close it. Nothing that an agent wrote in the span is promoted (5.6).
+  until you close it. Nothing that an agent wrote in the span is promoted (5.8).
 - **Tap**: a component that connects to an outside system. It runs as a WebAssembly
   component, and it can reach only what its grant names. The fetch tool in
   3.13 is a tap. The GitHub tap in act 9 is another.
@@ -387,7 +387,8 @@ you. "promote" means the approvals to verified.
 
 ## Act 5 · Watching it
 
-On stage: the system watching itself.
+On stage: the system watching itself. In 5.4, `agent:a` (scripted) does a task and files
+work of its own, and you land a change and raise a limit.
 
 **5.1 Traces.** The system logs every read, decision, task change and model call as a
 span. A small local sink counts the spans. In production, the sink is any OpenTelemetry
@@ -398,26 +399,67 @@ Fetch-through, a search hit that a caller opens later, is 0 of 71 in this run. M
 those hits come from the demo's own scripted searches, which open nothing. Of the entries
 that sessions opened, 1 in 33 was never cited in that session's handoff.
 
-**5.3 Vendor drift.** The demo probes qwen3.8-27b twice, with no alarms. Then it checks
+**5.3 The metric table.** `amem metrics` prints the 21 rows of the metric table of our
+design paper, for the last 7 days. Each row has a value from a log, or it says why no log
+answers it. The figures of 5.3 and 5.4 are from a run on 24 November 2026, on a newly
+seeded root, with no gateway key. In that run, 10 rows had a value. Three of those rows
+also named a part that is not measured. 11 rows had no value. For 7 of them, the root
+had no such event yet. For 3 of them, no log here can give the answer. The last one is
+the cost of a completed task: no session was on the meter of the egress. The 10 published
+targets follow the rows. The search latency is the only target that is measured: 6 ms
+for the median and for the 99th percentile, from the one search of 5.1. The other 8
+targets say why nothing is measured against them.
+
+**5.4 A fleet that files its own work.** Upkeep is the work that the fleet makes for
+itself: curation, and a task that an agent files and then completes. First, a change
+lands through a queue. You file a task. `agent:a` claims it, writes a handoff, and hands
+the change to the landing queue `main`. The task is `blocked` and waits on
+`landing:main`. You land the change with `amem landing land main`, and the task is
+`done`. `amem task times` shows the claim, the queueing and the landing: 0 seconds from
+the claim to the landing in this run, because the script does it at once.
+
+Then the grants get a ceiling on the share of upkeep: five points above the share at
+that moment, 5 percent in this run. `agent:a` files a task on its own account. The
+filing of a session that holds no task is born `proposed` in this domain, so `agent:a`
+also asks to admit it. The server holds the ceiling at that admission. The first task is
+admitted, and `agent:a` claims it and completes it. Now 1 of the 2 completed tasks is
+upkeep, and `agent:a` filed and completed that one itself. The second task is refused at
+admission. The refusal gives the ceiling, and it says that a person admits the task or
+raises the share. It gives no count, because the share counts tasks that a session
+possibly cannot read. The task stays `proposed`.
+
+`amem limits` then shows the five limits, each in its own unit: spend, the share of
+throughput, the outbound rate, the enforced rules and the share of upkeep, and also the
+landing queue. In this run, only the landing queue and the share of upkeep are set. You
+raise the share of upkeep to 51 percent for one hour with `amem limits raise`. That is
+an approval on the ledger, and the row of the limit names it. `agent:a` asks again, and
+the task is admitted. The last three lines are rows of the metric table: one change
+landed through `main`, one task that an agent filed is open, and the share of upkeep is
+0.5. The script then closes that task and puts the grants back.
+
+With a gateway key, 5.5 to 5.8 follow. Without one, 5.5 and 5.7 do not run. The
+transcripts are then step 5.5, and the freeze is step 5.6.
+
+**5.5 Vendor drift.** The demo probes qwen3.8-27b twice, with no alarms. Then it checks
 gemma4-26b against qwen's baseline, as if a vendor swapped the model behind the name.
 Four of six detectors fire, though latency is only reported.
 
-**5.4 Transcripts.** The record keeps transcripts for 30 days. Search never finds them.
+**5.6 Transcripts.** The record keeps transcripts for 30 days. Search never finds them.
 You can reach a transcript only through an entry that cites a turn. When a session ends
 without leaving a handoff of its own, the launcher files a note of its last exchanges
 that cites their turns. Act 4's delegating session is the one here that did. Thus it is
 the one that the step shows. The turn shown is the first turn, the prompt.
 
-**5.5 Replay.** The system sends the first four model calls of that session to
+**5.7 Replay.** The system sends the first four model calls of that session to
 qwen3.8-27b again, exactly as the egress recorded them. It checks whether qwen makes the
 same choice at each call. In this run, qwen agreed at two of the four: both delegated,
 and both wrote. Where Claude Code checked the task tree, qwen wrote. Where Claude Code
 ended with a reply, qwen released the task itself. Replay measures whether another model
 would agree, not which model is right. The agreement changes from run to run.
 
-**5.6 The freeze.** The claim: when a vendor changes a model, nothing that an agent
+**5.8 The freeze.** The claim: when a vendor changes a model, nothing that an agent
 wrote since then moves up a trust tier on an agent's word or on yours. The repoint check
-of 5.3 now files its confirmed drift, and that opens a drift window for the checked
+of 5.5 now files its confirmed drift, and that opens a drift window for the checked
 model. The step lists the open window. Without the gateway, no check runs, and the step
 opens a window by hand and says so. Then `agent:a` writes an entry, and `agent:curator`
 tries to promote it to curated. The memory server refuses, and the refusal names the
@@ -610,7 +652,7 @@ both runs used in the same order, against all the calls that either run made. It
 the same answer, shorter.
 
 **8.4 Side by side.** This step shows every run of the session against the original.
-This is the comparison that a platform eval would keep. Replay (5.5) sends single model
+This is the comparison that a platform eval would keep. Replay (5.7) sends single model
 calls again. Re-enactment runs the whole session.
 
 ## Act 9 · From outside

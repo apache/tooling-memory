@@ -3,7 +3,7 @@
 # model, and each memory call with what it returned. Re-enactment runs the session
 # again, on the same model or another, with the memory calls answered from the tape
 # until the run asks for something the original did not; then it reports how far the
-# run kept to the original. Replay (5.5) resends recorded model calls; this runs the
+# run kept to the original. Replay (5.7) resends recorded model calls; this runs the
 # whole session. The tape's head also holds the replay manifest: the state the session
 # began with. A run that left the tape read the record as it is now, so the report marks
 # it incomplete when that state moved.

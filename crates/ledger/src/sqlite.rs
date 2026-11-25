@@ -4,7 +4,7 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
+    check_holder, claimable, parse_time, Claimer, Error, Event, Held, Moment, PromotionRecord,
     PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
     LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
@@ -250,6 +250,27 @@ impl Db {
             .prepare("SELECT payload FROM events WHERE task_id = ?1 AND kind = ?2 ORDER BY seq")?;
         let rows = stmt.query_map(params![id, kind], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The moments of the tasks of one domain, oldest first. The join leaves out the
+    /// records that are no task's and the tasks of other domains.
+    pub(crate) fn moments(&self, domain: &str) -> Result<Vec<Moment>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT e.task_id, e.kind, e.at, e.payload
+             FROM events e JOIN tasks t ON t.id = e.task_id
+             WHERE t.domain = ?1 AND e.kind IN ({}) ORDER BY e.seq",
+            crate::moment_kinds_sql()
+        ))?;
+        let rows = stmt.query_map(params![domain], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (task, kind, at, payload): (String, String, String, String) = row?;
+            out.push(crate::moment_from_row(task, kind, &at, &payload)?);
+        }
+        Ok(out)
     }
 
     /// Record a promotion unless that promoter promoted that version of the entry to that

@@ -49,14 +49,17 @@ pub mod fabric;
 pub mod gates;
 pub mod held_out;
 mod holds;
+pub mod limits;
 pub mod lineage;
 pub mod log;
 pub mod mcp;
+pub mod measure;
 pub mod platform;
 pub mod positions;
 pub mod prefetch;
 pub mod projection;
 pub mod reach;
+pub mod read_metrics;
 pub mod reads;
 pub mod recall;
 pub mod replay_state;
@@ -891,19 +894,25 @@ impl Memory {
         Ok(())
     }
 
-    /// Whether a model call may leave for `destination`, given what this session and
-    /// the root have spent there as the egress metered it. A refusal is a logged
+    /// The price vector: `prices.toml` under the root, with its version. No file is the
+    /// empty table, version `none`.
+    ///
+    /// # Errors
+    ///
+    /// A file that is there and does not parse.
+    pub fn prices(&self) -> Result<dm_policy::prices::Prices, Error> {
+        let text = std::fs::read_to_string(self.root.join("prices.toml")).unwrap_or_default();
+        Ok(dm_policy::prices::Prices::parse(&text)?)
+    }
+
+    /// Whether a model call may leave for its destination, given what this session and
+    /// the root have spent there, in tokens and in money, as the egress metered it. A refusal is a logged
     /// decision; an allow is not, since every model call asks.
     ///
     /// # Errors
     ///
     /// When the policy fails to evaluate.
-    pub fn check_spend(
-        &self,
-        destination: &str,
-        session_tokens: u64,
-        day_tokens: u64,
-    ) -> Result<Decision, Error> {
+    pub fn check_spend(&self, spend: dm_policy::decide::SpendInput) -> Result<Decision, Error> {
         let input = Input {
             action: Action::Spend,
             principal: self.principal(),
@@ -914,11 +923,7 @@ impl Memory {
             write: None,
             promote: None,
             held_task: self.held_task(),
-            spend: Some(dm_policy::decide::SpendInput {
-                destination: destination.to_string(),
-                session_tokens,
-                day_tokens,
-            }),
+            spend: Some(spend),
             fetch: None,
             approval: None,
         };
@@ -1261,10 +1266,12 @@ impl Memory {
         domain: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Hit>, Error> {
+        let asked = std::time::Instant::now();
         let f = self.filter_for(domain)?;
         let hits = self.index.lock().await.search(query, &f, limit)?;
         self.observe(&hits)?;
-        self.reads.hits("search", Some(query), &hits);
+        let ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
+        self.reads.searched(query, &hits, ms);
         Ok(hits)
     }
 
@@ -1296,6 +1303,17 @@ impl Memory {
     /// [`Error::NotFound`] when absent or above the session's handling, [`Error::Gone`]
     /// for a withheld entry and an author outside the security role, or a store error.
     pub async fn archived(&self, id: &str) -> Result<Entry, Error> {
+        self.archived_as(id, false).await
+    }
+
+    /// As [`Memory::archived`], for a measurement that reads the entry to count it and
+    /// serves it to no reader. The read event says that the read is a survey, so the
+    /// rule for a dead entry does not count it as a use.
+    pub(crate) async fn archived_for_a_count(&self, id: &str) -> Result<Entry, Error> {
+        self.archived_as(id, true).await
+    }
+
+    async fn archived_as(&self, id: &str, survey: bool) -> Result<Entry, Error> {
         let mut f = self.session_filter()?;
         f.include_inactive = true;
         let meta = self.index.lock().await.meta(id, &f)?;
@@ -1311,7 +1329,13 @@ impl Memory {
             return Err(withhold::gone(id));
         }
         let outside = reach::outside_content(&entry);
-        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification, outside)? {
+        let label = entry.front.classification;
+        let seen = if survey {
+            self.observe_checked(&meta.hit.domain, id, label, outside)?
+        } else {
+            self.observe_entry(&meta.hit.domain, id, label, outside)?
+        };
+        if !seen {
             return Err(Error::NotFound(id.to_string()));
         }
         Ok(entry)
@@ -2754,12 +2778,20 @@ impl Memory {
     /// one, since [`Memory::sign_off`] reads the requester, the action and the version
     /// from it.
     ///
+    /// An origin `task:<id>`, `continues:<id>` or `retries:<id>` names the task that
+    /// this one is filed from. That task is then the root that decides what kind of work
+    /// this one is, and a completion of a continuation closes it. The service sets such
+    /// an origin on a fan-out, a continuation and a retry. Only a person files a task
+    /// with one, and the task named is one that the session may read.
+    ///
     /// # Errors
     ///
     /// An ungranted domain, or a ledger or policy error; [`Error::Denied`] for a
     /// `promote:` origin, which only [`Memory::promote`] files, for a `signoff:` origin,
-    /// which only the service files, or when the origin and upstream event name a task
-    /// already filed that this session may not read.
+    /// which only the service files, for an origin that names a task when the session
+    /// is no person, or when the origin and upstream event name a task already filed
+    /// that this session may not read; the ledger's not-found for an origin that names
+    /// a task that the session may not read.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
         // a task from this origin is an approval task: approve reads its event as the
         // version proposed and its filer as the proposer, so one filed here would be a
@@ -2778,6 +2810,7 @@ impl Memory {
             )));
         }
         let mut l = self.ledger.lock().await;
+        self.names_a_task_it_reads(&l, origin).await?;
         let held = match self.held_task() {
             Some(id) => l.get(&id).await.ok(),
             None => None,
@@ -2788,6 +2821,32 @@ impl Memory {
             Filing::Session
         };
         self.file_in(&mut l, spec, filing, held.as_ref()).await
+    }
+
+    /// Refuse an origin that names a task, unless a person files it and names a task
+    /// that the session may read, or the session works the task that it names. An
+    /// agent that could name any task would choose the root of its own filing, and the
+    /// answer would say whether a hidden task is there. A session that works a task
+    /// files into the chain of that task: the root is the root of its work. So does a
+    /// session that fills the position of a pinned task. Each other agent gets one
+    /// answer, for a task that is there, one that is hidden and one that is not there.
+    async fn names_a_task_it_reads(&self, l: &Ledger, origin: &str) -> Result<(), Error> {
+        let Some(named) = measure::filed_from(origin) else {
+            return Ok(());
+        };
+        if measure::is_person(&self.author, &self.grants.owner) {
+            return self.check_task(&l.get(named).await?);
+        }
+        if let Ok(task) = l.get(named).await {
+            let seated = task.spec.position.is_some() && self.commits(&task)?;
+            if self.sees(&task, self.handling()?) && (self.works(&task) || seated) {
+                return Ok(());
+            }
+        }
+        Err(Error::Denied(
+            "an origin task:<id>, continues:<id> or retries:<id> names the task that a task is filed from: the service sets it, a person does, or the session that works that task does"
+                .into(),
+        ))
     }
 
     /// File a task the system files on the owner's behalf, as the curator's survey,
@@ -2930,6 +2989,11 @@ impl Memory {
                 return Err(Error::Denied(format!("{id} is not admitted: {gap}")));
             }
         }
+        if !self.is_in_person() {
+            if let Some(held) = self.upkeep_hold(&l, &task).await? {
+                return Err(self.refusal("limit", &task.spec.domain, held));
+            }
+        }
         let admitted = l.admit(id).await?;
         self.rank_edges(&mut l, &admitted).await?;
         self.observe_task(&admitted);
@@ -2999,13 +3063,18 @@ impl Memory {
             fetch: None,
             approval: None,
         })?;
-        if d.admit {
-            let admitted = l.admit(&task.id).await?;
-            self.rank_edges(l, &admitted).await?;
-            Ok(admitted)
-        } else {
-            Ok(task)
+        if !d.admit {
+            return Ok(task);
         }
+        // the policy admits it; the share of upkeep can still hold it back, and then
+        // the decision log says so. A person in person admits it later
+        if let Some(held) = self.upkeep_hold(l, &task).await? {
+            let _logged = self.refusal("limit", &task.spec.domain, held);
+            return Ok(task);
+        }
+        let admitted = l.admit(&task.id).await?;
+        self.rank_edges(l, &admitted).await?;
+        Ok(admitted)
     }
 
     /// The task a fan-out files for one subagent: its parent's work, under the parent's
@@ -3441,6 +3510,7 @@ impl Memory {
             attempt: kept.as_deref(),
         };
         let mut l = self.ledger.lock().await;
+        self.within_throughput(&l, &domain).await?;
         let claim = Self::in_own_words(l.claim_next_by(&domain, who, lease).await, attempt)?;
         drop(l);
         if let Some(c) = &claim {
@@ -3483,6 +3553,7 @@ impl Memory {
         let mut l = self.ledger.lock().await;
         let task = l.get(id).await?;
         self.check_task(&task)?;
+        self.within_throughput(&l, &task.spec.domain).await?;
         let can = self.capabilities()?;
         let who = dm_ledger::Claimer {
             holder: &self.author,
@@ -4777,7 +4848,11 @@ mod tests {
         assert!(is_stale(&agent.list(None, None, 10).await));
         assert!(is_stale(&agent.write(req("A late note.\n")).await));
         assert!(is_stale(&agent.claim(&t.id, Duration::minutes(5)).await));
-        assert!(is_stale(&agent.check_spend("gateway", 0, 0)));
+        let spend = dm_policy::decide::SpendInput {
+            destination: "gateway".into(),
+            ..dm_policy::decide::SpendInput::default()
+        };
+        assert!(is_stale(&agent.check_spend(spend)));
         assert!(
             is_stale(&view.search("backoff", None, 10).await),
             "a view of it too"

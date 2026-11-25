@@ -10,7 +10,7 @@
 //! prefetch precision and wasted reads, from the read and write logs.
 
 pub mod judge;
-pub mod metrics;
+pub use dm_server::read_metrics as metrics;
 
 use dm_core::approx_tokens;
 use dm_egress::Telemetry;
@@ -297,49 +297,6 @@ fn funnel(root: &Path, report: &mut Report) -> Fallible<()> {
     Ok(())
 }
 
-/// The handoffs among the entries the write log names, with the text a citation is
-/// looked for in, and the handoffs of the tasks completed in the granted domains. The
-/// metrics, and the handoffs' texts by id.
-async fn metrics_of(
-    memory: &Memory,
-    root: &Path,
-) -> Fallible<(metrics::Metrics, BTreeMap<String, String>)> {
-    let all = reads::all(root)?;
-    let writes = reads::all_writes(root)?;
-    let mut handoffs = BTreeMap::new();
-    for w in &writes {
-        if handoffs.contains_key(&w.id) {
-            continue;
-        }
-        let entry = match memory.get(&w.id).await {
-            Ok(e) => e,
-            Err(_) => match memory.archived(&w.id).await {
-                Ok(e) => e,
-                Err(_) => continue,
-            },
-        };
-        if entry.front.entry_type == dm_core::EntryType::Handoff {
-            let text = format!("{}\n{}", entry.body, entry.front.cites.join("\n"));
-            handoffs.insert(w.id.clone(), text);
-        }
-    }
-    let mut completed = std::collections::BTreeSet::new();
-    for d in memory.domains() {
-        let done = memory
-            .tasks(Some(&d), dm_ledger::Status::Done)
-            .await
-            .unwrap_or_default();
-        completed.extend(done.into_iter().filter_map(|t| t.handoff));
-    }
-    let m = metrics::compute(&metrics::Inputs {
-        reads: &all,
-        writes: &writes,
-        handoffs: &handoffs,
-        completed: &completed,
-    });
-    Ok((m, handoffs))
-}
-
 /// Measure.
 ///
 /// # Errors
@@ -372,7 +329,7 @@ pub async fn measure(
     }
     retrieval(&memory, &mut report, query, &titles).await?;
     funnel(root, &mut report)?;
-    let (m, handoffs) = metrics_of(&memory, root).await?;
+    let (m, handoffs) = memory.read_metrics().await?;
     if let Some(j) = judge {
         report.judged = Some(judge::judge(&memory, &m, &handoffs, j.deputy, j.sample).await);
     }
