@@ -81,3 +81,5 @@ if [ -n "$h" ]; then
 else
   echo "  (the session did not complete the task; its output is on the task as a handoff)"
 fi
+# steps 1.8 to 1.10: the surface of Appendix A, which needs no harness and no model
+. "$here/scripts/demo/1-surface.sh"

@@ -862,6 +862,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn lineage_reaches_an_entry_that_cites_another_by_version_or_by_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = root_with_security(dir.path());
+        let x = owner.write(req("# Port\n\nIt listens on 8080.\n")).await;
+        let x = x.unwrap().id;
+        let text = owner.store.get_text("dom-me", &x).await.unwrap().unwrap();
+        let by_version = format!("{x}@{}", dm_core::digest(&text));
+        let cites = vec![
+            by_version.clone(),
+            "https://example.org/ports".to_string(),
+            format!("{x}#port"),
+        ];
+        // a session that did not read `x`: the citation alone is the edge
+        let writer = Memory::open(dir.path()).unwrap().with_author("agent:w");
+        let y = writer
+            .write(WriteRequest {
+                cites: cites.clone(),
+                ..req("# Proxy\n\nIt forwards to the port.\n")
+            })
+            .await
+            .unwrap()
+            .id;
+        // the entry keeps its citations as they were written
+        let kept = owner.store.get("dom-me", &y).await.unwrap().unwrap();
+        assert_eq!(kept.front.cites, cites);
+        // the `write` event names the entry by its bare id, one time
+        let events = crate::log::read(dir.path(), "dom-me", 0).unwrap();
+        let named: Vec<&Vec<String>> = events
+            .iter()
+            .filter_map(|e| match &e.change {
+                Change::Write { id, cites, .. } if *id == y => Some(cites),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(named, [&vec![x.clone()]]);
+        let l = owner.lineage(&x, Direction::Forward, None).await.unwrap();
+        assert_eq!(edges(&l), [(y.as_str(), 1, false, true)]);
+        let l = owner.lineage(&y, Direction::Back, None).await.unwrap();
+        assert_eq!(edges(&l), [(x.as_str(), 1, false, true)]);
+    }
+
+    #[tokio::test]
     async fn lineage_leaves_out_an_event_above_what_the_session_may_handle() {
         let dir = tempfile::tempdir().unwrap();
         let owner = root_with_security(dir.path());

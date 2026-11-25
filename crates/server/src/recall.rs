@@ -12,7 +12,8 @@
 //! per-session cache that `get` serves from once the index has admitted the id, so what
 //! was pushed and later asked for shows up in the read log.
 
-use crate::{lock, Error, Memory};
+pub use crate::brief::{plan_brief, AnswerKind, Ask, BriefPlan};
+use crate::{lock, Error, Memory, Narrow};
 use dm_core::{approx_tokens, Entry, EntryType, Label, ReadFilter, TrustTier};
 use dm_index::Hit;
 use serde::{Deserialize, Serialize};
@@ -269,6 +270,10 @@ pub struct Recall {
     /// the session has one; reading it there is free, since the pack was served here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub projected: Option<String>,
+    /// The size that the caller's context and answer kind gave this recall, when the
+    /// caller named one of them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<BriefPlan>,
 }
 
 /// A small model the service may spend on a session's behalf. The launcher provides
@@ -359,7 +364,37 @@ pub(crate) struct Answer {
     pub missing: Vec<String>,
 }
 
-const INSTRUCTIONS: &str = "You are the recall deputy of a shared memory record used by agents \
+impl Answer {
+    /// The entries that the brief rests on and that `pack` holds: the list the deputy
+    /// gave, or the ids in the square brackets of the brief when that list names none.
+    fn cited_from(&self, pack: &Pack) -> Vec<String> {
+        let in_pack: HashSet<String> = pack.ids().into_iter().collect();
+        let listed: Vec<String> = self
+            .citations
+            .iter()
+            .filter(|c| in_pack.contains(*c))
+            .cloned()
+            .collect();
+        if !listed.is_empty() {
+            return listed;
+        }
+        cited_in(&self.brief)
+            .into_iter()
+            .filter(|c| in_pack.contains(c))
+            .collect()
+    }
+}
+
+/// One question to a deputy: who answers, how the brief is sized, and until when.
+struct Asked<'a> {
+    deputy: &'a dyn Deputy,
+    question: &'a str,
+    plan: Option<&'a BriefPlan>,
+    deadline: Instant,
+}
+
+pub(crate) const INSTRUCTIONS: &str =
+    "You are the recall deputy of a shared memory record used by agents \
 and people. Answer the question from the entries below and from nothing else. Write a brief in \
 Markdown, a paragraph or a short list, and cite the entry an assertion rests on by its id in \
 square brackets after the sentence, like [mem-a-1234]. Where the entries do not answer part of \
@@ -368,10 +403,12 @@ under \"missing\"; leave it empty when nothing is missing or another search woul
 Answer with JSON only, no prose around it: {\"brief\": Markdown, \"citations\": [ids you cited], \
 \"missing\": [queries]}.";
 
-/// The deputy's prompt over a pack.
+/// The deputy's prompt over a pack. A plan adds one sentence after the instructions: the
+/// form of the brief and its length.
 #[must_use]
-pub fn prompt_for(question: &str, pack: &Pack) -> String {
-    let mut s = format!("{INSTRUCTIONS}\n\n## Question\n\n{question}\n\n## Entries\n");
+pub fn prompt_for(question: &str, pack: &Pack, plan: Option<&BriefPlan>) -> String {
+    let sized = plan.map_or_else(String::new, |p| format!(" {}", p.sentence()));
+    let mut s = format!("{INSTRUCTIONS}{sized}\n\n## Question\n\n{question}\n\n## Entries\n");
     for p in &pack.pieces {
         s.push_str(&format!(
             "\n### {} ({}, {}, {}) {}\n\n{}\n",
@@ -422,14 +459,6 @@ fn cited_in(brief: &str) -> Vec<String> {
         }
     }
     out
-}
-
-fn mem_ids(sources: &[String]) -> Vec<String> {
-    sources
-        .iter()
-        .filter(|s| dm_core::id::is_entry_id(s))
-        .cloned()
-        .collect()
 }
 
 /// Round-robin over the per-query hit lists, each id once, best first within a query.
@@ -534,12 +563,31 @@ impl Memory {
         depth: Depth,
         budget: Budget,
     ) -> Result<Pack, Error> {
+        self.pack_narrowed(queries, domain, depth, budget, &Narrow::default())
+            .await
+    }
+
+    /// [`Memory::pack`], with each query narrowed by the caller as
+    /// [`Memory::search_with`] narrows a search. The entries that the bodies cite are
+    /// not narrowed: a link is followed for what it says, whatever its kind or author.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or an index or store error.
+    pub async fn pack_narrowed(
+        &self,
+        queries: &[String],
+        domain: Option<&str>,
+        depth: Depth,
+        budget: Budget,
+        narrow: &Narrow,
+    ) -> Result<Pack, Error> {
         let f = self.filter_for(domain)?;
         let hits = {
             let ix = self.index.lock().await;
             let mut lists = Vec::with_capacity(queries.len());
             for q in queries {
-                lists.push(ix.search(q, &f, budget.hits.max(1))?);
+                lists.push(ix.search_narrowed(q, &f, narrow, budget.hits.max(1))?);
             }
             interleave(lists, budget.hits.max(1))
         };
@@ -582,7 +630,7 @@ impl Memory {
                 continue;
             }
             spent += cost;
-            p.links = mem_ids(&entry.front.cites);
+            p.links = crate::address::entries_of(&entry.front.cites);
             p.body = Some(entry.body.clone());
             lock(&self.cache).insert(&p.id, dm_core::digest(&entry.render()));
         }
@@ -631,14 +679,32 @@ impl Memory {
         domain: Option<&str>,
         limit: usize,
     ) -> Result<Pack, Error> {
+        self.search_sections_with(query, domain, &Narrow::default(), limit)
+            .await
+    }
+
+    /// [`Memory::search_sections`], narrowed by the caller: the pack has a body only of
+    /// an entry that passes the session's filter and the narrowing.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or an index or store error.
+    pub async fn search_sections_with(
+        &self,
+        query: &str,
+        domain: Option<&str>,
+        narrow: &Narrow,
+        limit: usize,
+    ) -> Result<Pack, Error> {
         // a search costs what it hit and nothing more; linking is recall's
         let budget = Budget {
             hits: limit,
             links: 0,
             ..Budget::default()
         };
+        let queries = [query.to_string()];
         let pack = self
-            .pack(&[query.to_string()], domain, Depth::Sections, budget)
+            .pack_narrowed(&queries, domain, Depth::Sections, budget, narrow)
             .await?;
         self.reads
             .served("search", Some(query), pack.pieces.len(), pack.tokens, false);
@@ -665,19 +731,52 @@ impl Memory {
         depth: Option<Depth>,
         budget: Budget,
     ) -> Result<Recall, Error> {
+        self.recall_for(question, domain, depth, budget, Ask::default())
+            .await
+    }
+
+    /// [`Memory::recall`], sized from what the caller says about itself: the kind of
+    /// answer and the tokens that its context holds ([`plan_brief`]). The plan binds the
+    /// part that goes into the context of the caller. With a deputy, the deputy reads
+    /// the pack under the full budget, and its prompt holds the form and the length of
+    /// the brief. With no deputy, the bodies of the pack stay under the plan. The read
+    /// log keeps the plan as the `choice` of the line. An `ask` with no value gives the
+    /// recall that [`Memory::recall`] gives.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::recall`].
+    pub async fn recall_for(
+        &self,
+        question: &str,
+        domain: Option<&str>,
+        depth: Option<Depth>,
+        budget: Budget,
+        ask: Ask,
+    ) -> Result<Recall, Error> {
         if !self.settings().retrieves() {
             return self.recall_of_nothing(question, domain, depth);
         }
+        let plan = plan_brief(ask, budget);
         let Some(deputy) = self.deputy() else {
-            return self.recall_owed(question, domain, depth, budget).await;
+            return self
+                .recall_owed(question, domain, depth, budget, plan)
+                .await;
         };
+        let plan = plan.as_ref();
         let deadline = Instant::now() + budget.wall;
         let read_under = self.filter_for(domain)?;
         let mut pack = self
             .pack(&[question.to_string()], domain, Depth::Sections, budget)
             .await?;
         let mut hops = 1;
-        let mut answer = self.ask(deputy.as_ref(), question, &pack, deadline).await?;
+        let asked = Asked {
+            deputy: deputy.as_ref(),
+            question,
+            plan,
+            deadline,
+        };
+        let mut answer = self.ask(&asked, &pack).await?;
         while !answer.missing.is_empty() && hops < MAX_HOPS {
             let more = self
                 .pack(
@@ -694,7 +793,7 @@ impl Memory {
             pack.extend(more);
             // a second hop that fails, out of clock or refused by the egress, costs
             // the caller nothing it already had: the first brief stands
-            match self.ask(deputy.as_ref(), question, &pack, deadline).await {
+            match self.ask(&asked, &pack).await {
                 Ok(a) => answer = a,
                 Err(_) => break,
             }
@@ -708,28 +807,15 @@ impl Memory {
                     .into(),
             ));
         }
-        let in_pack: HashSet<String> = pack.ids().into_iter().collect();
-        let mut citations: Vec<String> = answer
-            .citations
-            .iter()
-            .filter(|c| in_pack.contains(*c))
-            .cloned()
-            .collect();
-        if citations.is_empty() {
-            citations = cited_in(&answer.brief)
-                .into_iter()
-                .filter(|c| in_pack.contains(c))
-                .collect();
-        }
+        let citations = answer.cited_from(&pack);
         let pack = pack.summaries();
-        self.reads.served_via(
-            "recall",
-            Some(question),
+        let size = (
             pack.pieces.len(),
             approx_tokens(&answer.brief) + pack.tokens,
-            false,
-            Some("brief"),
         );
+        let choice = plan.map(BriefPlan::choice);
+        self.reads
+            .recalled(question, size, "brief", choice.as_deref());
         let mut r = Recall {
             question: question.to_string(),
             synthesis: Synthesis::Server {
@@ -740,6 +826,7 @@ impl Memory {
             pack,
             hops,
             projected: None,
+            plan: plan.copied(),
         };
         self.project_recall(&mut r).await;
         Ok(r)
@@ -764,29 +851,35 @@ impl Memory {
             pack: Pack::empty(&[question.to_string()], depth),
             hops: 0,
             projected: None,
+            plan: None,
         })
     }
 
     /// The caller-executed tier: the pack at the depth asked for, or the session's
-    /// default, with synthesis owed.
+    /// default, with synthesis owed. The pack goes into the context of the caller, so a
+    /// plan bounds its bodies.
     async fn recall_owed(
         &self,
         question: &str,
         domain: Option<&str>,
         depth: Option<Depth>,
         budget: Budget,
+        plan: Option<BriefPlan>,
     ) -> Result<Recall, Error> {
         let depth = depth.unwrap_or_else(|| self.default_depth());
+        let budget = Budget {
+            tokens: plan.map_or(budget.tokens, |p| p.pack_tokens),
+            ..budget
+        };
         let pack = self
             .pack(&[question.to_string()], domain, depth, budget)
             .await?;
-        self.reads.served_via(
-            "recall",
-            Some(question),
-            pack.pieces.len(),
-            pack.tokens,
-            false,
-            Some(&format!("pack:{depth}")),
+        let choice = plan.map(|p| p.choice());
+        self.reads.recalled(
+            question,
+            (pack.pieces.len(), pack.tokens),
+            &format!("pack:{depth}"),
+            choice.as_deref(),
         );
         let mut r = Recall {
             question: question.to_string(),
@@ -796,21 +889,16 @@ impl Memory {
             pack,
             hops: 1,
             projected: None,
+            plan,
         };
         self.project_recall(&mut r).await;
         Ok(r)
     }
 
-    async fn ask(
-        &self,
-        deputy: &dyn Deputy,
-        question: &str,
-        pack: &Pack,
-        deadline: Instant,
-    ) -> Result<Answer, Error> {
-        let prompt = prompt_for(question, pack);
-        let left = deadline.saturating_duration_since(Instant::now());
-        let text = tokio::time::timeout(left, deputy.complete(&prompt))
+    async fn ask(&self, asked: &Asked<'_>, pack: &Pack) -> Result<Answer, Error> {
+        let prompt = prompt_for(asked.question, pack, asked.plan);
+        let left = asked.deadline.saturating_duration_since(Instant::now());
+        let text = tokio::time::timeout(left, asked.deputy.complete(&prompt))
             .await
             .map_err(|_| Error::Deputy("no answer within the recall's wall clock".into()))?
             .map_err(Error::Deputy)?;
@@ -818,7 +906,9 @@ impl Memory {
     }
 }
 
-/// The JSON a binding returns for a recall. One shape for the CLI and the MCP tool.
+/// The JSON a binding returns for a recall. One shape for the CLI and the MCP tool. When
+/// the caller owes the synthesis and the recall has a plan, the `next` text ends with the
+/// form and the length that the caller writes to.
 #[must_use]
 pub fn to_json(r: &Recall) -> Value {
     let next = match r.synthesis {
@@ -827,13 +917,21 @@ pub fn to_json(r: &Recall) -> Value {
     };
     let mut v = serde_json::to_value(r).unwrap_or(Value::Null);
     if let Some(o) = v.as_object_mut() {
-        let next = match &r.projected {
+        let mut next = match &r.projected {
             Some(file) => format!(
                 "{next} This recall is also a file, `{file}` under the memory's projection \
                  directory (`/memory` in a confined run), readable without a further get."
             ),
             None => next.to_string(),
         };
+        if let (Synthesis::Owed, Some(plan)) = (&r.synthesis, &r.plan) {
+            next.push_str(&format!(
+                " The caller needs {}. Write {}, under {} tokens.",
+                plan.answer_kind.noun(),
+                plan.answer_kind.form(),
+                plan.brief_tokens
+            ));
+        }
         o.insert("next".into(), Value::from(next));
     }
     v
@@ -856,6 +954,7 @@ mod tests {
             summary: String::new(),
             score: 0.0,
             review_due: false,
+            snippet: None,
             reach: dm_core::Reach::Fleet,
         }
     }
@@ -936,7 +1035,12 @@ mod tests {
             &m,
             "Retry policy",
             "Operation R retries with exponential backoff, per the table.\n",
-            vec![cited.clone(), "https://example.invalid/rfc".into()],
+            // by section and by version: each names the entry, and the link is one
+            vec![
+                format!("{cited}#delays"),
+                "https://example.invalid/rfc".into(),
+                format!("{cited}@{}", "0".repeat(64)),
+            ],
         )
         .await;
         let big_body = "Retry retry retry. ".repeat(300);

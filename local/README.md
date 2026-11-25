@@ -390,7 +390,8 @@ only when all of these are true:
 A handoff, a policy entry and a position are not demoted. Only a person restores an entry.
 
 A survey is not a use of an entry. Search, list and T0 give summaries, and their `read`
-events have `"survey": true`. The check that tests entries together reads bodies, and
+events have `"survey": true`. A search also gives a snippet with each summary, and it
+stays a survey. The check that tests entries together reads bodies, and
 an export carries each entry of its scope. Their `read` events have the same field. Only a `read` event without this field keeps an
 entry out of the dead entries: `get` and `recall` write such events. Thus a curation
 cycle does not make each entry live again.
@@ -757,7 +758,7 @@ Verified is the review gate. Nobody sets it directly. It has two steps:
 1. One principal proposes it, with `promote` and `to: verified`. This files a task that
    requires a person.
 2. A person who did not propose it approves it, with `amem approve <task>`. An agent never
-   approves, and a session that the memory server serves approves nothing. The ledger
+   approves, and a session that the memory server serves to a harness approves nothing. The ledger
    keeps the approval as an event, with the action `verify` and the version, and
    `amem approvals <id>` lists it. The approval is of the version the proposal named: if the entry changed
    since, `approve` refuses it, and a proposer, any proposer, proposes the entry as it
@@ -977,7 +978,8 @@ An agent cannot approve. Three rules hold this:
 - A session that the memory server serves approves nothing, with `amem approve` or with
   its own call, whatever name the session has. A harness reaches that session, so the
   request can come from an agent.
-- The memory server has no memory tool that approves.
+- The memory tool `approve` approves only in a session of a person, which a harness
+  does not reach (`amem serve --person`).
 
 These rules hold only for a harness that is confined. Nobody authenticates at the command
 line. A harness without a sandbox has a shell on the host: a harness under
@@ -1041,18 +1043,39 @@ An erasure of the entry rewrites the sign-off tasks of the entry. They keep the 
 entry and lose the reason that the requester gave. The erasure closes the open ones. It
 withholds a copy, as it withholds each active entry that cites the erased entry.
 
-### The two memory tools
+### The memory tools
 
 - `erase` takes `id` and `reason` (`requested`, `mistaken`, `sensitive` or `legal`). It
   gives the receipt, or the refusal that names the sign-off task.
 - `declassify` takes `id`, `target_label` and `justification`. It gives `proposed` with
   the sign-off task, or `declassified` with the id of the copy, its label, the citation
   and the approval.
+- `approvals` takes `id` and `domain`, each optional. It gives what `amem approvals`
+  gives, under the key `approvals`.
+- `approve` takes `task` and an optional `expires` (RFC 3339). It gives what
+  `amem approve` gives.
 
 Each memory tool calls the function that the command line calls. An agent calls the
-memory tool, a person approves the task at the command line, and the agent makes the same
-call again. In a re-enactment, each of the two is a call that changes the record: after
+memory tool, a person approves the task, and the agent makes the same call again. In a
+re-enactment, `erase`, `declassify` and `approve` are calls that change the record: after
 the run diverges, the call is captured and not applied.
+
+`approve` is refused in each session that a harness reaches, whatever its author:
+"a session of the memory server approves nothing". An agent can reach each memory tool of
+such a session. A person approves at the command line, or in a session of a person:
+
+```sh
+amem serve --person
+```
+
+That command serves the memory tools on standard input and output as the owner, and no
+harness is behind it. The command line refuses `--person` together with `--author`,
+`--position` or `--arm`. In that session, `approve` records the approval, and the policy
+still decides who the approver is. The other actions that only a person in person does
+are also open there: the verdict at the level `person`, the raise of a limit, and a
+landing. Nobody authenticates in a session of a person. It is as strong as the command
+line and no stronger: an agent with a shell on the host can start one. Thus the gate holds
+only when the harness is confined.
 
 ## Policy as memory: `amem policy list` and `lint`
 
@@ -1897,6 +1920,120 @@ does not land while the landings of the fleet in the last 24 hours are at the sh
 later change lands in its place. That refusal is a line in the decision log with the
 action `limit`. `amem limits raise landing:<queue>` raises the share.
 
+## The retrieval surface: addresses, filters and the size of a recall
+
+The paper's Appendix A names the operations of the memory server. This section describes
+the parts of `get`, `search`, `recall` and `export` that it adds to the read path.
+
+### An address: `get` by section and by version
+
+`get` and `amem get` take an address. An address has one of three forms:
+
+| Address | What it serves |
+|---|---|
+| `<id>` | The current version of the entry, in full. A redirect is followed |
+| `<id>#<anchor>` | One section of the current version |
+| `<id>@<version>` | One version of the entry. No redirect is followed |
+
+The id is each name that the record takes for an entry: at most 128 characters of
+letters, digits, `.`, `_` and `-`, and no `.` at the start. An id that this code makes
+starts with `mem-`. An entry that a person wrote by hand can have a different name.
+
+An anchor is the text of a Markdown heading in lower case, with `-` in place of each
+group of other characters: `## First step` has the anchor `first-step`. A section goes
+from its heading to the next heading of the same level or a higher level. A fetch of a
+section applies the same checks as a fetch of the entry. The read log counts the tokens
+of the section only. If the entry has no such anchor, the refusal lists the
+anchors that it has.
+
+A version is the digest of the text of the entry: 64 hexadecimal characters. Each answer
+of `get` has `version`, and a later `get` takes `<id>@<version>`. Thus a citation of a
+version reads the same text after the entry changed. The answer then has
+`current: false`. The read filter of the session must admit the entry as it is now, and
+must admit the version by its own frontmatter. The label of the session goes up to the
+higher of the two labels. A version of an erased entry is not served. No version of a
+demoted entry is served: the answer is `gone`, as for the id alone, and the archive
+keeps the entry for audit. A version that the
+session may not read gets the refusal of a version that the entry does not have:
+`<id> has no version <version>`. Thus the refusal does not confirm a guess of the text
+of that version.
+
+```sh
+amem get mem-me-xxxxxxxx#decision
+amem get mem-me-xxxxxxxx --json        # the answer of the memory tool, with `version`
+amem get mem-me-xxxxxxxx@<version>     # the text of that version
+```
+
+Without `--json`, `amem get` prints the entry with its frontmatter, or the section alone
+for an anchor.
+
+### Filters and snippets: `search`
+
+`search` takes `filters`, and `amem search` takes one flag for each filter:
+
+| Filter | Flag | What it keeps |
+|---|---|---|
+| `type` | `--type` | entries of one type |
+| `min_tier` | `--min-tier` | entries at that trust tier or above |
+| `author` | `--author` | entries of one principal, such as `agent:a` |
+| `since` | `--since` | entries created at that RFC 3339 time or after it |
+
+A filter only makes the answer smaller. It is part of the same query as the read filter
+of the session, so it gives no entry that the session cannot read. A value that is not
+known is refused.
+
+Each hit has a `snippet`: about 16 words of the body around the words of the query, from
+the index. When only the title or the summary has the words, the snippet is the start of
+the body. An entry with an empty body has no snippet. `amem search` prints the same keys
+for each hit as the memory tool.
+
+### The size of a recall
+
+The caller of `recall` can say two things about itself:
+
+- `answer_kind` (`--answer-kind`): `fact`, `list` or `overview`
+- `context_tokens` (`--context-tokens`): the tokens that its context holds now.
+
+The memory server then plans the size of the answer, and the answer has the plan under
+`plan`: the answer kind, the tokens of the brief and the tokens of the pack. A fact gets
+the shortest brief and the smallest pack, and an overview gets the longest and the
+largest. Above 50,000 tokens of context the sizes are half, and above 150,000 they are a
+quarter. With a deputy, the plan goes into the prompt of the deputy. With no model, the
+plan bounds the pack, because the pack goes into the context of the caller. The read log
+keeps the choice in `choice`. A recall with neither value is as before, and has no plan.
+
+### An export that the memory server keeps
+
+The memory tool `export` takes `max_label` and an optional `domain`. It takes no path.
+The memory server writes the bundle under `state/exports/<session>/<domain>-<label>`.
+The answer has `kept_at`, the number of entries, the highest label in the bundle and the
+digest of the manifest. It has no id, title or summary of an entry. The number and the
+digest are facts about the entries in the bundle. Thus the label of the session goes up
+to the highest label in the bundle, as after a search that returned those entries. An
+export to a destination obeys the same rule. A `max_label` above the handling of the
+session is refused. A second export of the same domain at the same label in one session
+replaces the first.
+
+The bundle holds only the entries that the session may read. Its read filter stays in
+force: the tiers, the reach of raw entries and the snapshot. Thus a session that reads
+only curated entries gets no raw entry in its bundle.
+
+An erasure removes the kept bundles of the domain of the erased entry. It also removes
+the kept bundles of each domain that holds an entry that the erasure withholds. The
+served bundles of those domains go too. The early erasure of a transcript does the
+same for the domain of the transcript: a bundle can hold an excerpt of the transcript.
+
+Two items are open:
+
+- Nothing removes the kept bundles of a session that ended. `state/exports` grows with
+  each session that exports, until an erasure in the domain.
+- No lock holds an export against an erasure in a different process. An export that
+  read an entry before the erasure can write its body after the erasure removed the
+  kept bundles. The receipt of the erasure lists the export under `sends`.
+
+`amem export` without a destination does the same and prints the directory. With a
+destination, it writes the bundle there, as before.
+
 ## When an entry has moved: redirects
 
 A list or a search can show an entry that a curation replaces a short time later. The
@@ -1948,10 +2085,13 @@ and write logs:
 instead. The read log also records who read, the owner or an agent. The curator's relay
 alarm uses this.
 
-Prefetch also occurs at fetch time. This is the paper's rule 4. Over MCP, `get` carries
-`read_with`: the summaries of at most two entries that the read log shows searched up with
-the entry at least three times. The memory server looks them up under the session's
-filter and logs them as a read.
+Prefetch also occurs at fetch time. This is the paper's rule 4. The answer of `get`
+carries `related`: the summaries of at most two related entries. A related entry is one
+that the read log shows returned with the entry by at least three searches. Each one has
+a weight `p`: of the searches that returned the entry in their first five hits, the share
+that returned the related entry there too. An entry with a weight under 0.25 is left out.
+The memory server looks the related entries up under the session's filter and logs them
+as one read, with the name `read_with`. A fetch by version carries no related entries.
 
 A Codex run on the gateway's Qwen prefetched eight summaries and opened three bodies. Only
 co-retrieval had found one of those three. The run scored fetch-through 2/3, depth 4.0,

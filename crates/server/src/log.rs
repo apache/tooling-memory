@@ -115,7 +115,8 @@ pub enum Change {
         ids: Vec<String>,
         /// Whether the read is a survey, and so no use of the entries. A survey served
         /// no body: the hits of a search or of a list, a brief, the rules of a policy
-        /// check, or the summaries in the prompt of a task. A check of the auditor that
+        /// check, or the summaries in the prompt of a task. A hit of a search has a
+        /// snippet of the body, and the search stays a survey. A check of the auditor that
         /// reads bodies to test them together is a survey too, and so is the read of an
         /// export, which carries each entry of its scope. A read that served a body to a
         /// reader leaves the field out.
@@ -577,16 +578,6 @@ fn last_ledger_seq(root: &Path, domain: &str) -> Result<u64, Error> {
         .unwrap_or(0))
 }
 
-/// Whether a citation names an entry, in the shape of a name the record holds. A link
-/// or a path does not, and stays out of the log.
-fn names_entry(cite: &str) -> bool {
-    dm_core::id::is_entry_id(cite)
-        && cite.len() <= 128
-        && cite
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
 impl Memory {
     /// Write a version of an entry through its domain's log: the change is appended
     /// first, then the record takes it. Every record write of an entry comes here. A
@@ -674,13 +665,9 @@ impl Memory {
             Ok(Change::Write {
                 id: entry.front.id.clone(),
                 digest: dm_core::digest(&text),
-                cites: entry
-                    .front
-                    .cites
-                    .iter()
-                    .filter(|c| names_entry(c))
-                    .cloned()
-                    .collect(),
+                // by the bare id: a citation of a section or of a version names its
+                // entry, and a link or a path names none and stays out of the log
+                cites: crate::address::entries_of(&entry.front.cites),
                 supersedes: entry.front.supersedes.clone(),
             })
         };
@@ -2268,7 +2255,11 @@ mod tests {
         for e in &events {
             assert_eq!(e.session.as_deref(), Some(owner.session_id()));
         }
-        assert_eq!(owner.label(), Label::Public, "an export shows it nothing");
+        assert_eq!(
+            owner.label(),
+            Label::Restricted,
+            "the label rises to the highest label that the bundle carries"
+        );
     }
 
     fn task(title: &str, label: Label) -> dm_ledger::TaskSpec {

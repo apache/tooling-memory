@@ -187,6 +187,7 @@ mod tests {
             summary: summary.into(),
             score: 0.0,
             review_due: false,
+            snippet: None,
             reach: dm_core::Reach::Fleet,
         }
     }

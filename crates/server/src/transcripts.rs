@@ -860,7 +860,10 @@ impl Memory {
     /// Erase a transcript before its clock: its turns, the harness's lines and every
     /// excerpt of it leave the record; a stub, the header with no turns, and a receipt
     /// remain; and the entries that cite it are withheld from retrieval, as an erased
-    /// entry's citers are. The owner's act, and only once.
+    /// entry's citers are. The bundles under the root that can hold an excerpt or a
+    /// withheld body are removed, as the erasure of an entry removes them: the served
+    /// bundles and the kept bundles of the transcript's domain and of each domain that
+    /// holds a withheld entry. The owner's act, and only once.
     ///
     /// # Errors
     ///
@@ -902,6 +905,8 @@ impl Memory {
         let near = crate::withhold::onto_receipt(&mut receipt, downstream);
         self.put_transcript_receipt(&receipt).await?;
         self.withhold(&near).await?;
+        // a bundle under the root holds the excerpts and the bodies as they were
+        self.drop_copies(&t.domain, &receipt.withheld).await?;
         receipt.unresolved = vec![
             "the harness's own copy in its private home under the root's state".into(),
             "exports issued before the erasure".into(),
@@ -1947,5 +1952,32 @@ mod tests {
             "{:?}",
             receipt.withheld
         );
+    }
+
+    #[tokio::test]
+    async fn an_early_erasure_removes_the_bundles_that_hold_an_excerpt_or_a_withheld_body() {
+        let (dir, m, session, a, _, _) = swept().await;
+        let kept = m.export_kept(None, Label::Internal).await.unwrap();
+        let kept = dir.path().join(kept.kept_at);
+        let exports = dir.path().join(crate::bundle::EXPORTS_DIR);
+        assert!(
+            !holding(&exports, "zanzibar").is_empty(),
+            "the kept bundle holds the excerpts of the cited turn"
+        );
+        assert!(kept.join(format!("{a}.md")).is_file());
+        let served = crate::bundle::bundle_dir(dir.path(), "dom-me", Label::Public);
+        std::fs::create_dir_all(&served).unwrap();
+        let receipt = m.erase_transcript(&session, Reason::Sensitive).await;
+        assert!(receipt.unwrap().withheld.contains(&a));
+        assert!(
+            holding(&exports, "zanzibar").is_empty(),
+            "no excerpt of the erased transcript stays in a kept bundle"
+        );
+        assert!(
+            holding(&exports, "Handoff A.").is_empty(),
+            "nor a withheld body"
+        );
+        assert!(!kept.exists());
+        assert!(!served.exists(), "and the served bundle of the domain");
     }
 }

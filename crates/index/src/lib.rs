@@ -64,6 +64,37 @@ pub struct Hit {
     pub review_due: bool,
     /// Who reads the entry while it is raw.
     pub reach: Reach,
+    /// A few words of the body around the match, on one line: at most
+    /// [`SNIPPET_TOKENS`] tokens, with an ellipsis at each end that was cut. The start of
+    /// the body when only the title or the summary matched. `None` for a read that has
+    /// no query, and for an entry with an empty body.
+    pub snippet: Option<String>,
+}
+
+/// How a caller narrows a search within what its [`ReadFilter`] admits. Each field that
+/// is set leaves out more entries; no field admits an entry that the filter leaves out.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Narrow {
+    /// Only entries of this kind.
+    pub entry_type: Option<EntryType>,
+    /// Only entries at this tier or above.
+    pub min_tier: Option<TrustTier>,
+    /// Only entries of this author: the principal, with or without what an author line
+    /// puts after it (`agent:a` is the author of `agent:a (model: x)`, not of `agent:ab`).
+    pub author: Option<String>,
+    /// Only entries created at this instant or after it.
+    pub since: Option<OffsetDateTime>,
+}
+
+impl Narrow {
+    /// True when no field is set: the search is that of the filter alone.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entry_type.is_none()
+            && self.min_tier.is_none()
+            && self.author.is_none()
+            && self.since.is_none()
+    }
 }
 
 /// An entry's indexed metadata, without its body.
@@ -158,6 +189,18 @@ const HIT_COLUMNS: &str = "e.id, e.domain, e.entry_type, e.tier_rank, e.label_ra
 /// How many columns [`HIT_COLUMNS`] names.
 const HIT_WIDTH: usize = 9;
 
+/// The most tokens of a body that a snippet holds.
+pub const SNIPPET_TOKENS: usize = 16;
+
+/// What a snippet has in place of the text that was cut from an end.
+pub const SNIPPET_CUT: &str = "\u{2026}";
+
+/// The snippet as a hit carries it: on one line, and `None` when it has no text.
+fn one_line(snippet: Option<String>) -> Option<String> {
+    let line = snippet?.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!line.is_empty()).then_some(line)
+}
+
 /// The reach as the `reach` column holds it: NULL for the fleet's, so a row written
 /// without the column, by a binary from before or in a file from before, is the fleet's.
 fn reach_to_text(reach: Reach) -> Option<&'static str> {
@@ -251,6 +294,7 @@ fn hit_from_row(row: &Row<'_>, score: f64) -> Result<Hit, Error> {
         summary: row.get(6)?,
         score,
         review_due,
+        snippet: None,
     })
 }
 
@@ -312,6 +356,40 @@ fn compile_filter(f: &ReadFilter, first: usize) -> (String, Vec<rusqlite::types:
         values.extend(f.domains.iter().map(|d| d.clone().into()));
     }
     compile_raw_reach(f, first + values.len(), &mut sql, &mut values);
+    (sql, values)
+}
+
+/// The WHERE fragment and parameters of what a caller asked to leave out. Positional
+/// parameters start at `first`. Each condition is joined with AND to the filter's, so it
+/// can only leave out a row. Every value is a bound parameter, and the author is compared
+/// as text, so `%` and `_` in it are those characters.
+fn compile_narrow(n: &Narrow, first: usize) -> (String, Vec<rusqlite::types::Value>) {
+    let mut sql = String::new();
+    let mut values: Vec<rusqlite::types::Value> = Vec::new();
+    if let Some(kind) = n.entry_type {
+        sql.push_str(&format!(" AND e.entry_type = ?{}", first + values.len()));
+        values.push(kind.to_string().into());
+    }
+    if let Some(tier) = n.min_tier {
+        sql.push_str(&format!(" AND e.tier_rank >= ?{}", first + values.len()));
+        values.push((tier as i64).into());
+    }
+    if let Some(author) = &n.author {
+        let a = first + values.len();
+        sql.push_str(&format!(
+            " AND (e.author = ?{a} OR substr(e.author, 1, length(?{a}) + 1) = ?{a} || ' ')"
+        ));
+        values.push(author.clone().into());
+    }
+    if let Some(since) = n.since {
+        let (unix, nanos) = sort_key(since);
+        let u = first + values.len();
+        sql.push_str(&format!(
+            " AND (e.created_unix > ?{u} OR (e.created_unix = ?{u} AND e.created_nanos >= ?{}))",
+            u + 1
+        ));
+        values.extend([unix.into(), nanos.into()]);
+    }
     (sql, values)
 }
 
@@ -663,7 +741,8 @@ impl Index {
     }
 
     /// Ranked full-text search over title, summary, and body, within the filter.
-    /// Summaries only; the caller opens an entry with `get` if a summary warrants it.
+    /// Summaries, each with a snippet of the body; the caller opens an entry with `get`
+    /// if a summary warrants it.
     ///
     /// # Errors
     ///
@@ -674,10 +753,27 @@ impl Index {
         filter: &ReadFilter,
         limit: usize,
     ) -> Result<Vec<Hit>, Error> {
+        self.search_narrowed(query, filter, &Narrow::default(), limit)
+    }
+
+    /// [`Index::search`], with the entries that `narrow` names left out before the
+    /// ranking and the limit: the hits are the best `limit` of what passes both. The
+    /// fallback to any word is narrowed as the first pass is.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or a row the index did not write.
+    pub fn search_narrowed(
+        &self,
+        query: &str,
+        filter: &ReadFilter,
+        narrow: &Narrow,
+        limit: usize,
+    ) -> Result<Vec<Hit>, Error> {
         let Some(q) = fts_query(query, false) else {
             return Ok(Vec::new());
         };
-        let hits = self.search_fts(&q, filter, limit)?;
+        let hits = self.search_fts(&q, filter, narrow, limit)?;
         if !hits.is_empty() || query.split_whitespace().count() < 2 {
             return Ok(hits);
         }
@@ -685,17 +781,28 @@ impl Index {
         // than a known item. Any word, still ranked by BM25, so the best partial match
         // leads. Explainable either way.
         match fts_query(query, true) {
-            Some(q) => self.search_fts(&q, filter, limit),
+            Some(q) => self.search_fts(&q, filter, narrow, limit),
             None => Ok(hits),
         }
     }
 
-    fn search_fts(&self, q: &str, filter: &ReadFilter, limit: usize) -> Result<Vec<Hit>, Error> {
+    /// One pass of a search. The snippet is of the body column of the row that the
+    /// WHERE admitted, so no snippet is of an entry that the filter leaves out.
+    fn search_fts(
+        &self,
+        q: &str,
+        filter: &ReadFilter,
+        narrow: &Narrow,
+        limit: usize,
+    ) -> Result<Vec<Hit>, Error> {
         let (where_sql, mut values) = compile_filter(filter, 2);
+        let (narrow_sql, narrowed) = compile_narrow(narrow, 2 + values.len());
+        values.extend(narrowed);
         let sql = format!(
-            "SELECT {HIT_COLUMNS}, bm25(entries_fts, 0.0, 10.0, 5.0, 1.0) AS score
+            "SELECT {HIT_COLUMNS}, bm25(entries_fts, 0.0, 10.0, 5.0, 1.0) AS score,
+                    snippet(entries_fts, 3, '', '', '{SNIPPET_CUT}', {SNIPPET_TOKENS})
              FROM entries_fts f JOIN entries e ON e.id = f.id
-             WHERE entries_fts MATCH ?1{where_sql}
+             WHERE entries_fts MATCH ?1{where_sql}{narrow_sql}
              ORDER BY score, {NEWEST_FIRST}
              LIMIT {}",
             limit.max(1)
@@ -704,7 +811,11 @@ impl Index {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
             let score: f64 = row.get(HIT_WIDTH)?;
-            Ok(hit_from_row(row, score))
+            let snippet: Option<String> = row.get(HIT_WIDTH + 1)?;
+            Ok(hit_from_row(row, score).map(|hit| Hit {
+                snippet: one_line(snippet),
+                ..hit
+            }))
         })?;
         rows.map(|r| r?).collect()
     }
@@ -1982,5 +2093,365 @@ mod tests {
         drop(ix);
         let bytes = index_bytes(dir.path());
         assert!(!bytes.windows(marker.len()).any(|w| w == marker));
+    }
+
+    /// The words of a snippet, without the mark of a cut.
+    fn words(snippet: &str) -> Vec<&str> {
+        snippet
+            .split_whitespace()
+            .map(|w| w.trim_matches(|c| SNIPPET_CUT.contains(c)))
+            .filter(|w| !w.is_empty())
+            .collect()
+    }
+
+    #[test]
+    fn a_search_hit_has_a_snippet_of_the_body_around_the_match_and_no_other_read_has_one() {
+        let mut ix = Index::in_memory().unwrap();
+        let before =
+            "one two three four five six seven eight nine ten eleven twelve thirteen fourteen \
+                      fifteen sixteen seventeen eighteen nineteen twenty";
+        let after = "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda mu";
+        let body = format!("{before}\n\nthe quorum\nrule {after}\n");
+        let mut long = entry("dom-a", "mem-a-long", "Votes", &body);
+        long.front.summary = Some("How a vote is counted.".into());
+        long.front.review_by = Some(date!(2026 - 12 - 01));
+        ix.upsert(&long).unwrap();
+        ix.upsert(&entry("dom-a", "mem-a-title", "Quorum", "Seven of nine.\n"))
+            .unwrap();
+        ix.upsert(&entry("dom-a", "mem-a-empty", "Quorum again", ""))
+            .unwrap();
+
+        let hits = ix.search("quorum", &any(), 10).unwrap();
+        let snippet = |id: &str| {
+            let hit = hits.iter().find(|h| h.id == id).unwrap();
+            hit.snippet.clone()
+        };
+        let got = snippet("mem-a-long").unwrap();
+        let held = words(&got);
+        assert!(held.contains(&"quorum"), "{got:?}");
+        assert!(held.len() <= SNIPPET_TOKENS, "{got:?}");
+        assert!(held.iter().all(|w| body.contains(w)), "{got:?}");
+        assert!(
+            got.starts_with(SNIPPET_CUT) && got.ends_with(SNIPPET_CUT),
+            "each end that was cut says so: {got:?}"
+        );
+        assert!(!got.contains('\n'), "{got:?}");
+        assert!(got.contains("the quorum rule"), "on one line: {got:?}");
+        // a match in the title alone: the start of the body
+        assert_eq!(snippet("mem-a-title").as_deref(), Some("Seven of nine."));
+        assert_eq!(snippet("mem-a-empty"), None);
+
+        let f = any();
+        let listed = ix.list(&f, None, 10).unwrap();
+        let due = ix.due_for_review(&f, date!(2027 - 01 - 01), 10).unwrap();
+        assert_eq!((listed.len(), due.len()), (3, 1));
+        assert!(listed.iter().chain(&due).all(|h| h.snippet.is_none()));
+        let meta = ix.meta("mem-a-long", &f).unwrap().unwrap();
+        assert_eq!(meta.hit.snippet, None);
+    }
+
+    /// The instant that the entries of [`shapes_to_narrow`] are created around.
+    const AROUND: OffsetDateTime = datetime!(2026-10-02 10:00:00.5 UTC);
+
+    /// An entry of `dom-a` that a search for `ledger` finds, of this kind, tier and
+    /// author, created this long after [`AROUND`].
+    fn shaped(id: &str, kind: EntryType, tier: TrustTier, author: &str, after: i64) -> Entry {
+        let mut e = entry("dom-a", id, "Note", &format!("The ledger of {id}.\n"));
+        e.front.entry_type = kind;
+        e.front.trust_tier = tier;
+        e.front.author = author.into();
+        e.front.created = AROUND + time::Duration::nanoseconds(after);
+        e
+    }
+
+    /// Entries that differ in each thing a search can be narrowed by. One is restricted.
+    fn shapes_to_narrow() -> Vec<Entry> {
+        use EntryType::{Decision, Fact};
+        use TrustTier::{Curated, Raw, Verified};
+        let mut secret = shaped("mem-a-secret", Decision, Verified, "agent:a", 2_000_000_000);
+        secret.front.classification = Label::Restricted;
+        vec![
+            shaped("mem-a-raw", Fact, Raw, "agent:a", 0),
+            shaped(
+                "mem-a-decision",
+                Decision,
+                Curated,
+                "agent:a (model: x)",
+                -1,
+            ),
+            shaped("mem-a-verified", Fact, Verified, "agent:ab", 1_000_000_000),
+            shaped("mem-a-percent", Fact, Raw, "agent:100%", -3_600_000_000_000),
+            secret,
+        ]
+    }
+
+    fn holding_shapes() -> Index {
+        let mut ix = Index::in_memory().unwrap();
+        for e in shapes_to_narrow() {
+            ix.upsert(&e).unwrap();
+        }
+        ix
+    }
+
+    fn by_author(author: &str) -> Narrow {
+        Narrow {
+            author: Some(author.into()),
+            ..Narrow::default()
+        }
+    }
+
+    /// The ids that a search for `ledger` gives under `f` and `n`, in order of id.
+    fn narrowed(ix: &Index, f: &ReadFilter, n: &Narrow) -> Vec<String> {
+        let hits = ix.search_narrowed("ledger", f, n, 100).unwrap();
+        let mut got: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+        got.sort_unstable();
+        got
+    }
+
+    /// What `n` asks of an entry, said in Rust.
+    fn asked_for(n: &Narrow, e: &Entry) -> bool {
+        let f = &e.front;
+        let of_author = |a: &String| {
+            f.author == *a
+                || f.author
+                    .strip_prefix(a.as_str())
+                    .is_some_and(|rest| rest.starts_with(' '))
+        };
+        n.entry_type.is_none_or(|t| f.entry_type == t)
+            && n.min_tier.is_none_or(|t| f.trust_tier >= t)
+            && n.author.as_ref().is_none_or(of_author)
+            && n.since.is_none_or(|at| f.created >= at)
+    }
+
+    fn each_narrow() -> Vec<Narrow> {
+        let mut all = vec![
+            Narrow::default(),
+            Narrow {
+                entry_type: Some(EntryType::Decision),
+                ..Narrow::default()
+            },
+            Narrow {
+                since: Some(AROUND),
+                ..Narrow::default()
+            },
+            Narrow {
+                entry_type: Some(EntryType::Fact),
+                min_tier: Some(TrustTier::Curated),
+                author: Some("agent:ab".into()),
+                since: Some(AROUND - time::Duration::hours(2)),
+            },
+        ];
+        for tier in [TrustTier::Raw, TrustTier::Curated, TrustTier::Verified] {
+            all.push(Narrow {
+                min_tier: Some(tier),
+                ..Narrow::default()
+            });
+        }
+        for author in ["agent:a", "agent:ab", "agent:100%", "agent:nobody"] {
+            all.push(by_author(author));
+        }
+        all
+    }
+
+    #[test]
+    fn each_field_of_a_narrowing_leaves_out_entries_and_admits_none_that_the_filter_refuses() {
+        let ix = holding_shapes();
+        let entries = shapes_to_narrow();
+        assert!(Narrow::default().is_empty());
+        let mut curated = any();
+        curated.min_tier = TrustTier::Curated;
+        let mut only_raw = any();
+        only_raw.max_tier = TrustTier::Raw;
+        let mut snapshot = any();
+        snapshot.not_after = Some(AROUND);
+        let internal = ReadFilter::for_domains(["dom-a"], Label::Internal);
+        for f in [any(), internal, curated, only_raw, snapshot, any().closed()] {
+            let wide = narrowed(&ix, &f, &Narrow::default());
+            assert_eq!(
+                ix.search("ledger", &f, 100).unwrap().len(),
+                wide.len(),
+                "a search with nothing to narrow by is the search: {f:?}"
+            );
+            for n in each_narrow() {
+                assert_eq!(n.is_empty(), n == Narrow::default());
+                let want: Vec<String> = entries
+                    .iter()
+                    .filter(|e| wide.contains(&e.front.id) && asked_for(&n, e))
+                    .map(|e| e.front.id.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
+                assert_eq!(narrowed(&ix, &f, &n), want, "{n:?} under {f:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrowing_by_kind_tier_author_or_time_gives_the_entries_that_it_names() {
+        let ix = holding_shapes();
+        let f = ReadFilter::for_domains(["dom-a"], Label::Internal);
+        let decisions = Narrow {
+            entry_type: Some(EntryType::Decision),
+            ..Narrow::default()
+        };
+        assert_eq!(narrowed(&ix, &f, &decisions), ["mem-a-decision"]);
+        assert_eq!(
+            narrowed(&ix, &any(), &decisions),
+            ["mem-a-decision", "mem-a-secret"]
+        );
+        // the principal, with or without what follows it; not a longer principal
+        assert_eq!(
+            narrowed(&ix, &f, &by_author("agent:a")),
+            ["mem-a-decision", "mem-a-raw"]
+        );
+        assert_eq!(
+            narrowed(&ix, &f, &by_author("agent:ab")),
+            ["mem-a-verified"]
+        );
+        // one nanosecond before the instant is out, the instant is in, at any offset
+        for at in [AROUND, AROUND.to_offset(time::macros::offset!(+5:30))] {
+            let since = Narrow {
+                since: Some(at),
+                ..Narrow::default()
+            };
+            assert_eq!(narrowed(&ix, &f, &since), ["mem-a-raw", "mem-a-verified"]);
+        }
+        let next = Narrow {
+            since: Some(AROUND + time::Duration::nanoseconds(1)),
+            ..Narrow::default()
+        };
+        assert_eq!(narrowed(&ix, &f, &next), ["mem-a-verified"]);
+    }
+
+    #[test]
+    fn a_narrowing_to_a_tier_gives_nothing_below_it_and_nothing_below_the_tier_of_the_filter() {
+        let ix = holding_shapes();
+        let at_least = |tier| Narrow {
+            min_tier: Some(tier),
+            ..Narrow::default()
+        };
+        let f = ReadFilter::for_domains(["dom-a"], Label::Internal);
+        assert_eq!(
+            narrowed(&ix, &f, &at_least(TrustTier::Curated)),
+            ["mem-a-decision", "mem-a-verified"]
+        );
+        assert_eq!(narrowed(&ix, &f, &at_least(TrustTier::Raw)).len(), 4);
+        // a reader held to curated entries that asks for raw ones gets none
+        let mut curated = f.clone();
+        curated.min_tier = TrustTier::Curated;
+        assert_eq!(
+            narrowed(&ix, &curated, &at_least(TrustTier::Raw)),
+            ["mem-a-decision", "mem-a-verified"]
+        );
+    }
+
+    #[test]
+    fn an_author_to_narrow_by_is_text_and_no_pattern() {
+        let ix = holding_shapes();
+        for pattern in [
+            "%",
+            "agent:%",
+            "agent:_",
+            "agent:a%",
+            "agent:___%",
+            "agent:*",
+        ] {
+            assert_eq!(
+                narrowed(&ix, &any(), &by_author(pattern)),
+                Vec::<String>::new(),
+                "{pattern}"
+            );
+        }
+        assert_eq!(
+            narrowed(&ix, &any(), &by_author("agent:100%")),
+            ["mem-a-percent"]
+        );
+    }
+
+    #[test]
+    fn the_limit_counts_the_hits_that_pass_the_narrowing() {
+        let mut ix = Index::in_memory().unwrap();
+        let mut best = shaped("mem-a-best", EntryType::Fact, TrustTier::Raw, "agent:a", 0);
+        best.front.title = Some("Ledger".into());
+        let decision = shaped(
+            "mem-a-decision",
+            EntryType::Decision,
+            TrustTier::Raw,
+            "agent:a",
+            0,
+        );
+        ix.upsert(&best).unwrap();
+        ix.upsert(&decision).unwrap();
+        let first = ix.search("ledger", &any(), 1).unwrap();
+        assert_eq!(ids(&first), ["mem-a-best"]);
+        let decisions = Narrow {
+            entry_type: Some(EntryType::Decision),
+            ..Narrow::default()
+        };
+        let first = ix.search_narrowed("ledger", &any(), &decisions, 1).unwrap();
+        assert_eq!(ids(&first), ["mem-a-decision"]);
+    }
+
+    #[test]
+    fn the_fallback_to_any_word_is_narrowed_as_the_first_pass_is() {
+        let ix = holding_shapes();
+        let f = ReadFilter::for_domains(["dom-a"], Label::Internal);
+        let query = "ledger zzzz";
+        // no entry has both words, so each hit is one of the fallback
+        let wide = ix.search(query, &f, 100).unwrap();
+        assert_eq!(wide.len(), 4);
+        let decisions = Narrow {
+            entry_type: Some(EntryType::Decision),
+            ..Narrow::default()
+        };
+        let hits = ix.search_narrowed(query, &f, &decisions, 100).unwrap();
+        assert_eq!(ids(&hits), ["mem-a-decision"]);
+        let nobody = ix
+            .search_narrowed(query, &f, &by_author("agent:nobody"), 100)
+            .unwrap();
+        assert!(nobody.is_empty());
+    }
+
+    #[test]
+    fn a_search_gives_no_hit_and_no_snippet_of_an_entry_that_the_filter_leaves_out() {
+        let mut ix = Index::in_memory().unwrap();
+        let mut entries = every_shape();
+        for (i, e) in entries.iter_mut().enumerate() {
+            e.body = format!("The budget of {}.\n", e.front.id);
+            if i % 2 == 1 {
+                e.front.classification = Label::Restricted;
+            }
+            ix.upsert(e).unwrap();
+        }
+        let chains: [&[&str]; 3] = [&[], &["task-x"], &["task-w", "task-x"]];
+        let narrows = [
+            Narrow::default(),
+            by_author("human:test:me"),
+            Narrow {
+                min_tier: Some(TrustTier::Raw),
+                since: Some(datetime!(2026-01-01 0:00 UTC)),
+                ..Narrow::default()
+            },
+        ];
+        for raw_reach in [RawReach::Chain, RawReach::Fleet, RawReach::All] {
+            for chain in chains {
+                for handling in [Label::Public, Label::Restricted] {
+                    let mut f = reads(raw_reach, chain);
+                    f.handling = handling;
+                    let admitted = admitted(&ix, &f, &entries);
+                    for n in &narrows {
+                        let hits = ix.search_narrowed("budget", &f, n, 100).unwrap();
+                        let mut found = ids(&hits);
+                        found.sort_unstable();
+                        // each of these narrowings names every entry here
+                        assert_eq!(found, admitted, "{n:?} under {f:?}");
+                        for h in &hits {
+                            let own = format!("The budget of {}.", h.id);
+                            assert_eq!(h.snippet.as_deref(), Some(own.as_str()));
+                        }
+                    }
+                }
+            }
+        }
     }
 }

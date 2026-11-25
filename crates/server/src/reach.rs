@@ -325,6 +325,7 @@ mod tests {
     use super::*;
     use crate::log::{read, Event};
     use crate::sources::{Answer, Answered, Tools};
+    use crate::testing::agents_read;
     use crate::{lock, WriteRequest, Written};
     use dm_core::{EntryType, Label};
     use dm_ledger::{Status, Task, TaskSpec};
@@ -994,19 +995,6 @@ mod tests {
             ..spec(title)
         };
         o.ledger.lock().await.create(spec).await.unwrap().task
-    }
-
-    /// Give the agents of a root one more key in their read filter.
-    fn agents_read(root: &Path, pair: &str) {
-        let text = dm_policy::decide::BUILTIN.replace(
-            "read_filter := base_filter\n",
-            &format!(
-                "read_filter := object.union(base_filter, {{{pair}}}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n"
-            ),
-        );
-        assert_ne!(text, dm_policy::decide::BUILTIN);
-        std::fs::create_dir_all(root.join("policy")).unwrap();
-        std::fs::write(root.join("policy/local.rego"), text).unwrap();
     }
 
     #[tokio::test]

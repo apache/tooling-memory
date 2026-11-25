@@ -18,6 +18,7 @@ use dm_core::erasure::{self, Reason, Receipt};
 use dm_core::{
     Confidence, Entry, EntryType, Frontmatter, Label, Reach, ReadFilter, Status, TrustTier,
 };
+pub use dm_index::Narrow;
 use dm_index::{Hit, Index};
 use dm_ledger::{Claim, Created, Ledger, Task, TaskSpec};
 use dm_policy::decide::{
@@ -36,24 +37,30 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
+pub mod address;
 pub mod approvals;
 pub mod arms;
 pub mod audit;
 pub mod autonomy;
+pub mod brief;
 pub mod bundle;
 pub mod contexts;
 pub mod drift_windows;
 pub mod duties;
 pub mod evaluation;
 pub mod fabric;
+pub mod fetch;
 pub mod gates;
 pub mod held_out;
 mod holds;
+mod kept;
 pub mod limits;
 pub mod lineage;
 pub mod log;
 pub mod mcp;
 pub mod measure;
+#[cfg(test)]
+mod narrow;
 pub mod platform;
 pub mod positions;
 pub mod prefetch;
@@ -396,6 +403,14 @@ pub struct Memory {
     /// The domains this session has read: a send of the session goes into the log of
     /// each. Shared with the session's views.
     read_domains: Arc<Mutex<std::collections::BTreeSet<String>>>,
+}
+
+/// The refusal of a demoted entry, for a fetch of its id and for a fetch of one of its
+/// versions.
+pub(crate) fn demoted_gone(id: &str) -> Error {
+    Error::Gone(format!(
+        "{id} was demoted by curation; the archive keeps it for audit"
+    ))
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -1173,7 +1188,8 @@ impl Memory {
     /// entries at the highest classification among them. A read is in the log whether
     /// the read log is kept or not: the read log is telemetry, and this is lineage. The
     /// event says that the read is a survey: it served no body, so the rule for a dead
-    /// entry does not count it as a use.
+    /// entry does not count it as a use. A hit of a search has a snippet of the body,
+    /// and the search stays a survey: each curation cycle searches.
     ///
     /// # Errors
     ///
@@ -1266,9 +1282,32 @@ impl Memory {
         domain: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Hit>, Error> {
+        self.search_with(query, domain, &Narrow::default(), limit)
+            .await
+    }
+
+    /// [`Memory::search`], narrowed by the caller: by kind, lowest tier, author, and
+    /// time of creation. The narrowing is within the session's filter. It leaves
+    /// entries out, and it brings in none that the filter refuses: a session held to
+    /// curated entries that asks for raw ones gets none. Each hit has a snippet of the
+    /// body from the index, and the read log counts the snippets.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or an index error.
+    pub async fn search_with(
+        &self,
+        query: &str,
+        domain: Option<&str>,
+        narrow: &Narrow,
+        limit: usize,
+    ) -> Result<Vec<Hit>, Error> {
         let asked = std::time::Instant::now();
         let f = self.filter_for(domain)?;
-        let hits = self.index.lock().await.search(query, &f, limit)?;
+        let ix = self.index.lock().await;
+        let hits = ix.search_narrowed(query, &f, narrow, limit);
+        drop(ix);
+        let hits = hits?;
         self.observe(&hits)?;
         let ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.reads.searched(query, &hits, ms);
@@ -1420,15 +1459,25 @@ impl Memory {
 
     /// [`Memory::get`] under `f`.
     async fn get_under(&self, id: &str, f: &ReadFilter) -> Result<Entry, Error> {
+        let (entry, _) = self.admitted(id, f).await?;
+        self.log_opened(&entry, &entry.body);
+        Ok(entry)
+    }
+
+    /// The first part of [`Memory::get`] under `f`: the index admits the entry, the
+    /// record gives its current version, and the session observes it. Returns the entry
+    /// with the digest of its stored text, which is its version. The read log gets no
+    /// line here: the caller writes it for what it serves ([`Memory::log_opened`]).
+    async fn admitted(&self, id: &str, f: &ReadFilter) -> Result<(Entry, String), Error> {
         let meta = self.index.lock().await.meta(id, f)?;
         let Some(meta) = meta else {
             self.forget_pushed(id);
             return Err(self.not_served(id, None, f).await);
         };
         self.note_get();
-        let entry = self
+        let (entry, text) = self
             .store
-            .get(&meta.hit.domain, id)
+            .get_with_text(&meta.hit.domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         // the index can lag the record: a list or search a moment ago may have offered
@@ -1442,9 +1491,15 @@ impl Memory {
             self.forget_pushed(id);
             return Err(Error::NotFound(id.to_string()));
         }
-        let pushed = self.was_pushed(&entry);
-        self.reads.opened(id, &entry.body, pushed);
-        Ok(entry)
+        Ok((entry, dm_core::digest(&text)))
+    }
+
+    /// The read-log line of a get: `served` is the text that the caller serves of
+    /// `entry`, its whole body or one section, and the line counts the tokens of that
+    /// text. The line says whether a pack had pushed this version of the entry.
+    fn log_opened(&self, entry: &Entry, served: &str) {
+        let pushed = self.was_pushed(entry);
+        self.reads.opened(&entry.front.id, served, pushed);
     }
 
     /// Why an entry is not served, for an entry this session could read under `f`:
@@ -1465,9 +1520,7 @@ impl Memory {
                 },
                 _ => Error::Gone(format!("{id} was replaced; search for its current version")),
             },
-            Some(Status::Demoted) => Error::Gone(format!(
-                "{id} was demoted by curation; the archive keeps it for audit"
-            )),
+            Some(Status::Demoted) => demoted_gone(id),
             Some(Status::Erased) => {
                 Error::Gone(format!("{id} was erased; a stub and a receipt remain"))
             }
@@ -1495,11 +1548,21 @@ impl Memory {
     ///
     /// As [`Memory::get`], or [`Error::Gone`] past the redirect limit or on a cycle.
     pub async fn get_following(&self, id: &str) -> Result<(Entry, Vec<String>), Error> {
+        let (entry, _, from) = self.admitted_following(id).await?;
+        self.log_opened(&entry, &entry.body);
+        Ok((entry, from))
+    }
+
+    /// [`Memory::admitted`] under the filter of the session, following the redirect of
+    /// a replaced entry as [`Memory::get_following`] says. Returns the entry, its
+    /// version and the ids it was redirected from. The read log gets no line here.
+    async fn admitted_following(&self, id: &str) -> Result<(Entry, String, Vec<String>), Error> {
         let mut from = Vec::new();
         let mut at = id.to_string();
         loop {
-            match self.get(&at).await {
-                Ok(e) => return Ok((e, from)),
+            let f = self.session_filter()?;
+            match self.admitted(&at, &f).await {
+                Ok((e, version)) => return Ok((e, version, from)),
                 Err(Error::Moved { to, .. })
                     if from.len() < MAX_REDIRECTS && to != id && !from.contains(&to) =>
                 {
@@ -3870,10 +3933,17 @@ impl Memory {
     /// Say in the log of `domain` that a bundle left: first a read of the entries it
     /// carries, at the highest classification among them and marked as a survey, since
     /// an export of a scope is no use of one entry, then the send, which names the
-    /// bound of the export and the digest of the manifest. The session's label does not
-    /// rise: an export hands the entries out and shows none of them to the session. The
-    /// send is at the highest classification the bundle holds when that is above the
-    /// session's label.
+    /// bound of the export and the digest of the manifest. The session's label rises to
+    /// the highest classification among the entries: the answer of an export says how
+    /// many entries are at or below the bound and gives a digest that changes with each
+    /// of them, and that is a fact about those entries, as the hits of a search are.
+    /// The send is at the label of the session after that.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] when the bundle holds an entry above the handling of the
+    /// session, which the read filter does not let happen; or the log could not take an
+    /// event.
     async fn log_export(
         &self,
         domain: &str,
@@ -3881,12 +3951,17 @@ impl Memory {
     ) -> Result<(), Error> {
         let ids: Vec<String> = manifest.entries.iter().map(|e| e.id.clone()).collect();
         if let Some(carried) = manifest.entries.iter().map(|e| e.classification).max() {
+            if !lock(&self.session).observe(carried) {
+                return Err(Error::Denied(format!(
+                    "the bundle holds an entry at {carried}, above the handling of the session"
+                )));
+            }
             self.log_survey(domain, ids, carried)?;
         }
         let to = format!("export:{}", manifest.max_label);
         let digest = dm_core::digest(&manifest.to_yaml());
-        let label = self.label().max(manifest.highest_label);
-        self.log_send_at(Some(domain), &to, digest, label).await
+        self.log_send_at(Some(domain), &to, digest, self.label())
+            .await
     }
 
     /// Erase an entry: the body leaves every version in the record and the index, the
@@ -4002,7 +4077,8 @@ impl Memory {
     }
 
     /// The steps of an erasure after the record's: the entries downstream, the index,
-    /// the served bundles, every render, and the ledger's whys and approval tasks; then
+    /// the served bundles and the bundles that sessions keep under the root, every
+    /// render, and the ledger's whys and approval tasks; then
     /// the receipt, closed. The index takes the stub through the feed, from the `erased`
     /// event of the entry in the log.
     async fn finish_erasure(
@@ -4035,7 +4111,7 @@ impl Memory {
         }
         self.index.lock().await.vacuum()?;
         self.forget_pushed(id);
-        self.drop_bundles(domain)?;
+        self.drop_copies(domain, &receipt.withheld).await?;
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
         let missed = self.erase_from_projections(domain, id);
@@ -4192,6 +4268,32 @@ fn cites(text: &str, id: &str) -> bool {
 }
 
 impl Memory {
+    /// Remove the bundles under the root that can hold what an erasure took out of
+    /// service: those of `domain`, where the erased entry is, and those of each domain
+    /// that holds one of `withheld`, the entries on the receipt that the erasure
+    /// withholds. They are the bundles that the root serves and the bundles that its
+    /// sessions keep. A bundle holds bodies as they were, and a withheld body can be
+    /// imported from it.
+    async fn drop_copies(&self, domain: &str, withheld: &[String]) -> Result<(), Error> {
+        let mut domains = vec![domain.to_string()];
+        for other in self.domains() {
+            if domains.contains(&other) {
+                continue;
+            }
+            for id in withheld {
+                if self.store.get_text(&other, id).await?.is_some() {
+                    domains.push(other);
+                    break;
+                }
+            }
+        }
+        for d in &domains {
+            self.drop_bundles(d)?;
+            self.drop_kept(d)?;
+        }
+        Ok(())
+    }
+
     /// Remove the bundles served from this root for a domain, at every label, and the
     /// working copies an export in progress leaves beside them.
     fn drop_bundles(&self, domain: &str) -> Result<(), Error> {

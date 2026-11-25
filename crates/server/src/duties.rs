@@ -9,7 +9,8 @@
 //!
 //! An entry is dead when nothing used it inside a window of time: no read of its body
 //! is in the log, and no active entry names it. A survey is not a use: a search, a list
-//! and a brief serve summaries, the auditor reads bodies to test them together, and an
+//! and a brief serve summaries, a search adds a snippet of the body to each summary,
+//! the auditor reads bodies to test them together, and an
 //! export carries each entry of its scope. Each curation cycle runs such surveys. An agent demotes only a dead entry, and only
 //! on a task of a curator or of the auditor. A person demotes for either reason, and
 //! only a person restores.
@@ -326,14 +327,16 @@ fn ownership(entry: &Entry) -> Option<String> {
 }
 
 /// The entries that `entry` links to: the entry that it replaces, and then each
-/// citation that is an entry id. The flag says whether the link is a citation.
+/// citation that names an entry. A citation of a section or of a version names its
+/// entry by the bare id ([`crate::address::entry_of`]). The flag says whether the link
+/// is a citation.
 fn links(entry: &Entry) -> impl Iterator<Item = (&str, bool)> {
     let cited = entry
         .front
         .cites
         .iter()
         .filter(|c| c.starts_with("mem-"))
-        .map(|c| (c.as_str(), true));
+        .map(|c| (crate::address::entry_of(c).unwrap_or(c), true));
     entry
         .front
         .supersedes
@@ -1227,6 +1230,8 @@ mod tests {
         assert!(listed.iter().any(|h| h.id == dead), "{listed:?}");
         let found = surveyor.search(dead, None, 10).await.unwrap();
         assert!(found.iter().any(|h| h.id == dead), "{found:?}");
+        // a snippet of the body does not make the search a use
+        assert!(found.iter().all(|h| h.snippet.is_some()), "{found:?}");
         let auditor = agent(dir.path(), OWNER);
         auditor.test_together(None, 8).await.unwrap();
         // the log holds each of these reads, as a survey
@@ -1715,6 +1720,53 @@ mod tests {
             [("mem-me-to-first", Some("mem-me-third"))]
         );
         assert_eq!(found.len(), 6, "{found:?}");
+    }
+
+    #[tokio::test]
+    async fn a_citation_of_a_section_or_of_a_version_is_checked_as_a_citation_of_its_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let version = "0".repeat(64);
+        let citing = |id: &str, to: &[String]| {
+            let cites: String = to.iter().map(|c| format!("- {c}\n")).collect();
+            old(id, "decision", &format!("cites:\n{cites}"))
+        };
+        planted(
+            &o,
+            &[
+                old("mem-me-live", "decision", ""),
+                old("mem-me-demoted", "decision", "status: demoted\n"),
+                old("mem-me-first", "decision", ""),
+                old("mem-me-second", "decision", "supersedes: mem-me-first\n"),
+                citing(
+                    "mem-me-to-live",
+                    &["mem-me-live#about".into(), format!("mem-me-live@{version}")],
+                ),
+                citing("mem-me-to-demoted", &["mem-me-demoted#about".into()]),
+                citing("mem-me-to-first", &[format!("mem-me-first@{version}")]),
+            ],
+        )
+        .await;
+        let found = checked(&o).await;
+        assert_eq!(
+            of(&found, Check::CrossLink),
+            [("mem-me-to-demoted", None)],
+            "{found:?}"
+        );
+        let why = &found
+            .iter()
+            .find(|f| f.check == Check::CrossLink)
+            .unwrap()
+            .why;
+        assert!(
+            why.contains("names mem-me-demoted, which is demoted"),
+            "{why}"
+        );
+        assert_eq!(
+            of(&found, Check::Superseded),
+            [("mem-me-to-first", Some("mem-me-second"))]
+        );
+        assert_eq!(found.len(), 2, "{found:?}");
     }
 
     #[tokio::test]

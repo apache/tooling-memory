@@ -11,10 +11,12 @@ Anything that a model decides can change more:
 - the answers in act 6
 - the re-enactments in act 8.
 
-Some steps are newer than that run: 5.8, act 6, and the manifest lines of act 8. The
-steps of these that need no model ran on 23 November 2026, and their figures are from
-that day. The steps of these that need the gateway did not run yet. For those steps,
-these notes say what the step prints, and they hold no figures.
+Some steps are newer than that run: 1.8 to 1.10, 5.8, act 6, and the manifest lines of
+act 8. The steps of these that need no model ran on 23 November 2026, and their figures
+are from that day. Steps 1.8 to 1.10 need no model and no harness. They ran alone on
+25 November 2026, from `scripts/demo/1-surface.sh`, on a new record of 135 entries, and
+their figures are from that run. The steps of these that need the gateway did not run
+yet. For those steps, these notes say what the step prints, and they hold no figures.
 
 ```sh
 make demo-ready HARNESS=claude RESET=1
@@ -165,6 +167,35 @@ model read.
 
 **1.7 The handoff.** This is what the next session starts from. Every claim points at an
 entry.
+
+**1.8 By address.** The claim: a reader names the part that it needs, and a citation
+continues to name the text that it cited. You write a decision with two sections and a
+fact about the same thing. Three searches return the two entries together. A search with
+`--type decision` returns the decision alone, and the hit has a snippet from the index.
+`amem get <id>#decision` gives one section: the read log counts 18 tokens for it, and
+the body of the entry has 102. The same answer names the fact as a related entry with
+the weight `p` 0.75. Four searches returned the decision, and three of them returned the
+fact too. A third entry cites `<id>@<version>`. Then `agent:curator`
+promotes the decision, and the entry has a new version. `amem get <id>@<version>` still
+gives the text that the citation named, with `current: false` and the tier `raw`.
+
+**1.9 A recall sized for its caller.** The same question as in 1.2, two times. The first
+recall gives 8 pieces and 3,250 tokens. The second says that the caller needs a fact and
+that its context holds 120,000 tokens. The plan is a brief of 75 tokens from a pack of
+750 tokens of bodies, and the pack has 8 pieces and 1,209 tokens. No model is behind the
+memory server here, so the plan bounds the pack.
+
+**1.10 Approve and export as memory tools.** `agent:a` asks to erase the fact. The
+refusal names the sign-off task. `agent:a` calls `approve` on that task itself, and the
+memory server refuses: a session that a harness reaches approves nothing. You call
+`approve` in a session of your own, `amem serve --person`. `approvals` lists the
+approval, and the same call of `agent:a` now erases. Say that nobody authenticates in
+your session: it is as strong as the command line, and the gate holds only when the
+harness is confined. You then erase the other two entries of these steps, so the
+curator of act 2 finds nothing of them. Last, `agent:a` calls `export` at `internal`.
+The answer has the number of entries (138: the 135 entries and three stubs of erased
+entries), the highest label, the digest of the manifest and the place under
+`state/exports`. It has no id of an entry and no path that the agent can open.
 
 ## Act 2 · Curation and trust tiers
 

@@ -5,10 +5,11 @@
 //! ledger operations, and a `memory://t0/<domain>` resource per granted domain. What it
 //! never gets is a path on disk, a credential, or an entry its grants do not admit.
 
+use crate::brief::{AnswerKind, Ask};
 use crate::duties::{CheckOptions, DemoteReason, DEAD_WINDOW_DAYS};
 use crate::lineage::Direction;
 use crate::recall::{self, Budget, Depth};
-use crate::{tape, Error, Memory, WriteRequest};
+use crate::{fetch, tape, Error, Memory, Narrow, WriteRequest};
 use dm_core::TrustTier;
 use dm_index::Hit;
 use rmcp::handler::server::router::tool::ToolRouter;
@@ -122,7 +123,11 @@ fn rfc3339(t: time::OffsetDateTime) -> String {
     t.format(&Rfc3339).unwrap_or_default()
 }
 
-fn hit_json(h: &Hit) -> Value {
+/// One hit as a binding returns it: the summary of an entry, with the snippet that the
+/// index cut around the words of the query when it cut one. One shape for the command
+/// line and the memory tools.
+#[must_use]
+pub fn hit_json(h: &Hit) -> Value {
     let mut v = json!({
         "id": h.id,
         "domain": h.domain,
@@ -133,6 +138,9 @@ fn hit_json(h: &Hit) -> Value {
         "summary": h.summary,
         "review_due": h.review_due,
     });
+    if let Some(snippet) = &h.snippet {
+        v["snippet"] = json!(snippet);
+    }
     put_reach(&mut v, h.reach, None);
     v
 }
@@ -172,6 +180,49 @@ where
     .transpose()
 }
 
+/// An RFC 3339 time, or the refusal that names the parameter.
+fn parse_time(what: &str, s: Option<String>) -> Result<Option<time::OffsetDateTime>, McpError> {
+    s.map(|v| {
+        time::OffsetDateTime::parse(&v, &Rfc3339).map_err(|e| {
+            McpError::invalid_params(format!("{what}: {e}: give an RFC 3339 time"), None)
+        })
+    })
+    .transpose()
+}
+
+/// The filters of `search`. Each one narrows the search within what this session may
+/// read.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+#[serde(deny_unknown_fields)]
+pub struct FiltersParams {
+    /// Only entries of this kind: decision, fact, convention, method, handoff, policy,
+    /// or position.
+    #[serde(default, rename = "type")]
+    pub entry_type: Option<String>,
+    /// Only entries at this trust tier or above: raw, curated, or verified.
+    #[serde(default)]
+    pub min_tier: Option<String>,
+    /// Only entries of this author, as the principal: `agent:a`.
+    #[serde(default)]
+    pub author: Option<String>,
+    /// Only entries created at this time or after it, RFC 3339.
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+/// The filters of a search as the index takes them. No filters narrow nothing.
+fn narrow(filters: Option<FiltersParams>) -> Result<Narrow, McpError> {
+    let Some(f) = filters else {
+        return Ok(Narrow::default());
+    };
+    Ok(Narrow {
+        entry_type: parse("filters.type", f.entry_type)?,
+        min_tier: parse("filters.min_tier", f.min_tier)?,
+        author: f.author,
+        since: parse_time("filters.since", f.since)?,
+    })
+}
+
 /// Parameters of `search`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct SearchParams {
@@ -187,6 +238,10 @@ pub struct SearchParams {
     /// back too, within a token budget, so one call replaces a search and several gets.
     #[serde(default)]
     pub depth: Option<String>,
+    /// Filters that narrow the search: by type, by lowest trust tier, by author, by
+    /// time of creation.
+    #[serde(default)]
+    pub filters: Option<FiltersParams>,
 }
 
 /// Parameters of `recall`.
@@ -208,13 +263,61 @@ pub struct RecallParams {
     /// Entries in the pack, 1 to 100. Default 8.
     #[serde(default)]
     pub limit: Option<usize>,
+    /// The tokens that your context holds now, approximately. The answer is smaller
+    /// when your context is full.
+    #[serde(default)]
+    pub context_tokens: Option<usize>,
+    /// The kind of answer that you need: fact, list, or overview. It sets the length of
+    /// the answer.
+    #[serde(default)]
+    pub answer_kind: Option<String>,
 }
 
 /// Parameters of `get`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct GetParams {
+    /// The address of what to read: the entry id, as a hit or T0 names it; or
+    /// `<id>#<anchor>` for one section; or `<id>@<version>` for one version.
+    pub id: String,
+}
+
+/// Parameters that name an entry.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct EntryParams {
     /// The entry id, as a hit or T0 names it.
     pub id: String,
+}
+
+/// Parameters of `approve`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ApproveParams {
+    /// The id of the task that asks for the approval.
+    pub task: String,
+    /// When the approval of a sign-off task expires, RFC 3339. 24 hours from now when
+    /// omitted.
+    #[serde(default)]
+    pub expires: Option<String>,
+}
+
+/// Parameters of `approvals`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ApprovalsParams {
+    /// One entry; every entry of the domain when omitted.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// A granted domain; the only one when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters of `export`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ExportParams {
+    /// A granted domain; the only one when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// The highest label that the bundle may hold: public, internal, or restricted.
+    pub max_label: String,
 }
 
 /// Parameters of `outside_readers`.
@@ -936,6 +1039,7 @@ const READS: &[&str] = &[
     "limits",
     "task_times",
     "landing",
+    "approvals",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -1007,15 +1111,29 @@ impl McpServer {
         }
     }
 
+    /// A server for a session of a person, with no harness behind it: a person started
+    /// it and types its calls. The session is not marked as served, so it approves as
+    /// the command line does, and its calls are on no tape. Nobody authenticates here:
+    /// the caller is trusted as the caller of the command line is.
+    #[must_use]
+    pub fn for_person(memory: Arc<Memory>) -> Self {
+        Self {
+            memory,
+            tool_router: Self::tool_router(),
+            taped: false,
+        }
+    }
+
     #[tool(
-        description = "Ranked search over memory, summaries by default; open a hit with `get` if its summary warrants it. With depth `sections` the best hits come with their bodies, within a budget, so one call does the work of a search and several gets. Search before writing a fact that may already exist."
+        description = "Ranked search over memory, summaries by default; open a hit with `get` if its summary warrants it. A hit of an entry with a body has a `snippet`: the words of the body around the match. `filters` narrows the search by `type`, `min_tier`, `author` and `since`. With depth `sections` the best hits come with their bodies, within a budget, so one call does the work of a search and several gets. Search before writing a fact that may already exist."
     )]
     async fn search(&self, p: Parameters<SearchParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
+        let narrow = narrow(p.filters)?;
         if parse::<Depth>("depth", p.depth)? == Some(Depth::Sections) {
             let pack = self
                 .memory
-                .search_sections(&p.query, p.domain.as_deref(), limit(p.limit))
+                .search_sections_with(&p.query, p.domain.as_deref(), &narrow, limit(p.limit))
                 .await
                 .map_err(mcp_err)?;
             return ok(json!({
@@ -1026,52 +1144,18 @@ impl McpServer {
         }
         let hits = self
             .memory
-            .search(&p.query, p.domain.as_deref(), limit(p.limit))
+            .search_with(&p.query, p.domain.as_deref(), &narrow, limit(p.limit))
             .await
             .map_err(mcp_err)?;
         ok(json!({ "hits": hits.iter().map(hit_json).collect::<Vec<_>>() }))
     }
 
     #[tool(
-        description = "One entry in full: its frontmatter and Markdown body. Reading it raises this session's label to the entry's classification. `read_with`, when present, gives the summaries of entries usually read alongside it."
+        description = "One entry: its frontmatter and Markdown body. `id` is an address. `<id>` gives the current version in full. `<id>#<anchor>` gives one section; an anchor is the heading in lower case with `-` between its words, and the refusal of an unknown anchor lists the anchors of the entry. `<id>@<version>` gives one version, with `current: false` when the entry has changed since; `version` in every answer is the value to cite. Reading raises this session's label to the entry's classification. `related`, when present, gives the summaries of the entries that searches return together with this one, each with its weight `p`."
     )]
     async fn get(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
-        let (e, from) = self.memory.get_following(&p.0.id).await.map_err(mcp_err)?;
-        let with = self
-            .memory
-            .read_with(&e.front.id, 2)
-            .await
-            .unwrap_or_default();
-        let f = &e.front;
-        let mut v = json!({
-            "id": f.id,
-            "domain": f.domain,
-            "type": f.entry_type.to_string(),
-            "author": f.author,
-            "created": rfc3339(f.created),
-            "trust_tier": f.trust_tier.to_string(),
-            "classification": f.classification.to_string(),
-            "cites": f.cites,
-            "supersedes": f.supersedes,
-            "review_by": f.review_by.map(|d| d.to_string()),
-            "title": e.title(),
-            "body": e.body,
-        });
-        put_reach(&mut v, f.reach, f.task.as_deref());
-        if let Some(owner) = &f.owner {
-            v["owner"] = json!(owner);
-        }
-        if !from.is_empty() {
-            // as a client shows the URL it was redirected to: cite this id, not the one asked
-            v["redirected_from"] = json!(from);
-        }
-        if !with.is_empty() {
-            v["read_with"] = json!(with
-                .iter()
-                .map(|h| json!({ "id": h.id, "title": h.title, "summary": h.summary }))
-                .collect::<Vec<_>>());
-        }
-        ok(v)
+        let fetched = self.memory.fetch(&p.0.id).await.map_err(mcp_err)?;
+        ok(fetch::to_json(&fetched))
     }
 
     #[tool(
@@ -1354,7 +1438,7 @@ impl McpServer {
     #[tool(
         description = "Why each promotion of an entry was made, oldest first: who promoted which version to which tier, the reason they gave, and whether that version reached the record (`landed`). A proposal to verified is listed from when it is made, with `landed` false until a person approves it. As an auditor, read it after you have judged the change yourself, not before, so the reasons do not lead your judgement. Only for an entry you may read, replaced ones included; reading it raises your label as a get does."
     )]
-    async fn promotions(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+    async fn promotions(&self, p: Parameters<EntryParams>) -> Result<CallToolResult, McpError> {
         let r = self.memory.promotions(&p.0.id).await.map_err(mcp_err)?;
         ok(json!({ "promotions": r }))
     }
@@ -1422,15 +1506,19 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Delegated recall, one turn either way: a question in; a cited brief out when this server has a model behind it, else the pack the brief would be written from, with the synthesis owed to you in this turn. `synthesis.by` says which. Cheaper than a search and several gets when the question spans entries."
+        description = "Delegated recall, one turn either way: a question in; a cited brief out when this server has a model behind it, else the pack the brief would be written from, with the synthesis owed to you in this turn. `synthesis.by` says which. Cheaper than a search and several gets when the question spans entries. Give `answer_kind` (fact, list or overview) and `context_tokens` to get an answer of the size that you need; `plan` then says the size that was chosen."
     )]
     async fn recall(&self, p: Parameters<RecallParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
         let depth = parse::<Depth>("depth", p.depth)?;
         let budget = recall_budget(p.limit, p.budget_tokens);
+        let ask = Ask {
+            context_tokens: p.context_tokens,
+            answer_kind: parse::<AnswerKind>("answer_kind", p.answer_kind)?,
+        };
         let r = self
             .memory
-            .recall(&p.question, p.domain.as_deref(), depth, budget)
+            .recall_for(&p.question, p.domain.as_deref(), depth, budget, ask)
             .await
             .map_err(mcp_err)?;
         ok(recall::to_json(&r))
@@ -1746,6 +1834,48 @@ impl McpServer {
     }
 
     #[tool(
+        description = "For a person, in a session that a person started with `amem serve --person`; refused in every session that a harness reaches. Approve what a task asks a person for: a proposal to verify an entry, or a sign-off task for an erasure or a copy at a lower label. The approval is of the action and the version that the task names, for the principal that asked, until `expires` or for 24 hours. The action does not run here: the requester runs it again."
+    )]
+    async fn approve(&self, p: Parameters<ApproveParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let expires = parse_time("expires", p.expires)?;
+        let signed = self
+            .memory
+            .sign_off(&p.task, expires)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(signed).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "The approvals on the ledger of a domain, or of one entry, oldest first: who approved which action on which version of which entry, for which principal, until when, and whether the approval is still in force (`in_force`). Only for entries that you may read. An approval holds ids and a digest and no text of an entry."
+    )]
+    async fn approvals(&self, p: Parameters<ApprovalsParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let found = self
+            .memory
+            .approvals(p.domain.as_deref(), p.id.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "approvals": found }))
+    }
+
+    #[tool(
+        description = "Export a domain as a bundle, at or below `max_label`. The memory server keeps the bundle under its own state; you name no path and get none that you can open. The answer holds where the bundle is kept (`kept_at`), the number of entries, the highest label inside and the digest of the manifest, and no id or text of an entry. Your label rises to the highest label inside, as after a search that returned those entries. A `max_label` above what this session may handle is refused. A second export of the same domain at the same label replaces the first."
+    )]
+    async fn export(&self, p: Parameters<ExportParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let max_label: dm_core::Label = parse("max_label", Some(p.max_label))?
+            .ok_or_else(|| McpError::invalid_params("max_label: a label", None))?;
+        let kept = self
+            .memory
+            .export_kept(p.domain.as_deref(), max_label)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(kept).unwrap_or_default())
+    }
+
+    #[tool(
         description = "Close a task without doing it: obsolete, invalid, or a duplicate of another."
     )]
     async fn invalidate_task(
@@ -1836,7 +1966,10 @@ impl McpServer {
     #[tool(
         description = "The gates that an entry of the platform needs before a person can verify it: `performance`, `safety` and `review`, each with `needed`, `met` and `why`, and `reach`, which says what the entry would change. Call it before you propose a candidate for verified."
     )]
-    async fn candidate_gates(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+    async fn candidate_gates(
+        &self,
+        p: Parameters<EntryParams>,
+    ) -> Result<CallToolResult, McpError> {
         let gates = self
             .memory
             .candidate_gates(&p.0.id)
@@ -2006,7 +2139,7 @@ impl McpServer {
 }
 
 const INSTRUCTIONS: &str = "This is your memory. Start by loading T0 for your domain (the `t0` tool or the memory://t0/<domain> resource). \
-Search before writing a fact that may exist. When you stop, write a `handoff` entry; the next session starts from it, not from your transcript. \
+Search before writing a fact that may exist. `get` takes an address: an id, `<id>#<anchor>` for one section, `<id>@<version>` for one version; cite a version when the exact text matters. When you stop, write a `handoff` entry; the next session starts from it, not from your transcript. \
 Work comes from the ledger: `claim_next`, heartbeat before the lease runs out, `complete` with your handoff.";
 
 fn t0_uri(domain: &str) -> String {
@@ -2153,6 +2286,17 @@ pub async fn serve_stdio(memory: Arc<Memory>) -> Result<(), String> {
     serve_pipe(memory, tokio::io::stdin(), tokio::io::stdout()).await
 }
 
+/// Serve one memory over stdio as the session of a person, with no harness behind it
+/// ([`McpServer::for_person`]), until the client goes away.
+///
+/// # Errors
+///
+/// When the MCP handshake fails or the service task panics.
+pub async fn serve_stdio_for_person(memory: Arc<Memory>) -> Result<(), String> {
+    let server = McpServer::for_person(memory);
+    serve_with(server, tokio::io::stdin(), tokio::io::stdout()).await
+}
+
 /// Serve over any byte pair until the peer closes: standard input and output, or one end
 /// of an in-process pipe for a client in the same process.
 ///
@@ -2250,6 +2394,9 @@ mod tests {
             "task_times",
             "landing",
             "queue_landing",
+            "approve",
+            "approvals",
+            "export",
         ] {
             assert!(
                 names.contains(&expected),
@@ -2270,23 +2417,20 @@ mod tests {
         }
     }
 
-    /// An agent reaches every tool of the memory server, so the server has no tool that
-    /// approves: a person approves at the command line. The two gated actions are tools,
-    /// and a re-run captures them as it captures a write.
+    /// The two gated actions and the approval are tools, and a re-run captures each as
+    /// it captures a write. `approvals` only reads. Who may approve is held by the tests
+    /// of the module `surface`: a session that a harness reaches approves nothing.
     #[test]
-    fn the_gated_actions_are_tools_and_no_tool_approves() {
+    fn the_gated_actions_and_the_approval_are_tools_that_a_re_run_captures() {
         let router = McpServer::tool_router();
         let tools = router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
-        for gated in ["erase", "declassify"] {
+        for gated in ["erase", "declassify", "approve", "export"] {
             assert!(names.contains(&gated), "missing tool {gated}: {names:?}");
             assert_eq!(kind_of(gated), tape::Kind::Mutation, "{gated}");
         }
-        let approving: Vec<&&str> = names
-            .iter()
-            .filter(|n| n.contains("approv") || n.contains("sign_off"))
-            .collect();
-        assert!(approving.is_empty(), "a tool that approves: {approving:?}");
+        assert!(names.contains(&"approvals"), "{names:?}");
+        assert_eq!(kind_of("approvals"), tape::Kind::Read);
     }
 
     #[test]
@@ -4181,7 +4325,7 @@ mod tests {
             assert_eq!(view["definition"], format!("tidy@{entry}").as_str());
             assert_eq!(view["level"], "person", "{view}");
             assert_eq!(view["ceiling"], "checks", "{view}");
-            let id = Parameters(GetParams { id: entry.clone() });
+            let id = Parameters(EntryParams { id: entry.clone() });
             let gates = payload(&s.candidate_gates(id).await.unwrap());
             let same = library.candidate_gates(&entry).await.unwrap();
             assert_eq!(gates, serde_json::to_value(&same).unwrap());
@@ -4432,6 +4576,391 @@ mod tests {
             assert_eq!(still.status, Status::Claimed);
             assert_eq!(still.holder.as_deref(), Some("agent:x"));
             assert_eq!(still.waiting_on, None);
+        }
+    }
+
+    /// The surface of the paper's Appendix A: an address, filters, the size of a recall,
+    /// and `approve` and `export` as tools.
+    mod surface {
+        use super::*;
+
+        const DECISION: &str = "The import runs on the staging host.\n\n## Context\n\nThe import job needs a host with the loader installed.\n\n## Decision\n\nThe import job runs on the staging host every night.\n";
+
+        fn get_at(address: &str) -> Parameters<GetParams> {
+            Parameters(GetParams { id: address.into() })
+        }
+
+        async fn written(s: &McpServer, kind: &str, title: &str, body: &str) -> String {
+            let p = WriteParams {
+                body: body.into(),
+                title: Some(title.into()),
+                entry_type: Some(kind.into()),
+                ..WriteParams::default()
+            };
+            let w = payload(&s.write(Parameters(p)).await.unwrap());
+            w["id"].as_str().unwrap().to_string()
+        }
+
+        fn approve_task(task: &str) -> Parameters<ApproveParams> {
+            Parameters(ApproveParams {
+                task: task.into(),
+                expires: None,
+            })
+        }
+
+        async fn approvals_of(s: &McpServer, id: &str) -> Vec<Value> {
+            let p = ApprovalsParams {
+                id: Some(id.into()),
+                domain: None,
+            };
+            let listed = payload(&s.approvals(Parameters(p)).await.unwrap());
+            listed["approvals"].as_array().unwrap().clone()
+        }
+
+        /// The agent asks to erase `id`: the id of the sign-off task that the refusal
+        /// names.
+        async fn asked_to_erase(agent: &McpServer, id: &str) -> String {
+            let p = EraseParams {
+                id: id.into(),
+                reason: "mistaken".into(),
+            };
+            let why = refusal_text(agent.erase(Parameters(p)).await);
+            let named = why.split_once("Task ").and_then(|(_, r)| r.split_once(' '));
+            named.map(|(task, _)| task.to_string()).expect("a task")
+        }
+
+        fn served_as(dir: &std::path::Path, author: Option<&str>) -> McpServer {
+            let m = Memory::open(dir).unwrap();
+            let m = match author {
+                Some(a) => m.with_author(a),
+                None => m,
+            };
+            McpServer::new(Arc::new(m))
+        }
+
+        fn person_as(dir: &std::path::Path, author: Option<&str>) -> McpServer {
+            let m = Memory::open(dir).unwrap();
+            let m = match author {
+                Some(a) => m.with_author(a),
+                None => m,
+            };
+            McpServer::for_person(Arc::new(m))
+        }
+
+        /// A session that a harness reaches approves nothing, the owner's author
+        /// included: the task stays open and the ledger holds no approval.
+        #[tokio::test]
+        async fn approve_is_refused_in_every_session_that_a_harness_reaches() {
+            let (dir, agent, owner) = agent_and_owner();
+            let id = entry_at(&owner, dm_core::Label::Internal, "The door code is 4417.").await;
+            let task = asked_to_erase(&agent, &id).await;
+            let as_owner = served_as(dir.path(), None);
+            for s in [&agent, &as_owner] {
+                let why = refusal_text(s.approve(approve_task(&task)).await);
+                assert!(
+                    why.contains("a session of the memory server approves nothing"),
+                    "{why}"
+                );
+            }
+            let open = owner.tasks(None, dm_ledger::Status::Open).await.unwrap();
+            let open: Vec<&str> = open.iter().map(|t| t.id.as_str()).collect();
+            assert_eq!(open, [task.as_str()]);
+            assert_eq!(approvals_of(&as_owner, &id).await, Vec::<Value>::new());
+        }
+
+        /// In a session of a person the owner approves, `approvals` lists the approval,
+        /// and the agent's erasure then runs. An agent's author in such a session is
+        /// refused as the approver by the policy.
+        #[tokio::test]
+        async fn approve_in_a_session_of_a_person_records_the_approval_of_the_owner_alone() {
+            let (dir, agent, owner) = agent_and_owner();
+            let id = entry_at(&owner, dm_core::Label::Internal, "The door code is 4417.").await;
+            let task = asked_to_erase(&agent, &id).await;
+            let other = person_as(dir.path(), Some("agent:y"));
+            let why = refusal_text(other.approve(approve_task(&task)).await);
+            assert!(!why.contains("a session of the memory server"), "{why}");
+            assert!(why.contains("agent:y"), "{why}");
+            assert_eq!(approvals_of(&other, &id).await, Vec::<Value>::new());
+            let person = person_as(dir.path(), None);
+            let signed = payload(&person.approve(approve_task(&task)).await.unwrap());
+            assert_eq!(signed["outcome"], "approved", "{signed}");
+            assert_eq!(signed["approval"]["principal"], "human:test:me");
+            assert_eq!(signed["approval"]["scope"], AGENT);
+            let listed = approvals_of(&person, &id).await;
+            assert_eq!(listed.len(), 1, "{listed:?}");
+            assert_eq!(listed[0]["target"], id.as_str());
+            assert_eq!(listed[0]["in_force"], true);
+            let bad = ApproveParams {
+                task: task.clone(),
+                expires: Some("tomorrow".into()),
+            };
+            let bad = refusal_text(person.approve(Parameters(bad)).await);
+            assert!(bad.contains("expires: "), "{bad}");
+            let erase = EraseParams {
+                id: id.clone(),
+                reason: "mistaken".into(),
+            };
+            let receipt = payload(&agent.erase(Parameters(erase)).await.unwrap());
+            assert_eq!(receipt["erased_by"], AGENT);
+        }
+
+        /// `get` takes an address. An anchor gives the section alone. The `version` of
+        /// an answer is what a later `get` by version takes, and that `get` says when
+        /// the version is no longer the current one.
+        #[tokio::test]
+        async fn get_serves_a_section_and_an_earlier_version_by_address() {
+            let (dir, s) = server().await;
+            let id = written(&s, "decision", "Where the import runs", DECISION).await;
+            let whole = payload(&s.get(get_at(&id)).await.unwrap());
+            assert_eq!(whole["body"], DECISION);
+            assert!(whole.get("anchor").is_none() && whole.get("current").is_none());
+            let first = whole["version"].as_str().unwrap().to_string();
+            assert_eq!(first.len(), 64, "{first}");
+            let part = payload(&s.get(get_at(&format!("{id}#decision"))).await.unwrap());
+            assert_eq!(
+                part["body"],
+                "## Decision\n\nThe import job runs on the staging host every night.\n"
+            );
+            assert_eq!(part["anchor"], "decision");
+            assert_eq!(part["version"], first.as_str());
+            let unknown = refusal_text(s.get(get_at(&format!("{id}#options"))).await);
+            assert!(unknown.contains("context, decision"), "{unknown}");
+            let curator = Memory::open(dir.path()).unwrap().with_author("agent:c");
+            let why = "checked against the host list";
+            curator.promote(&id, TrustTier::Curated, why).await.unwrap();
+            let now = payload(&s.get(get_at(&id)).await.unwrap());
+            assert_eq!(now["trust_tier"], "curated");
+            assert_ne!(now["version"], first.as_str());
+            let old = payload(&s.get(get_at(&format!("{id}@{first}"))).await.unwrap());
+            assert_eq!(old["current"], false);
+            assert_eq!(old["trust_tier"], "raw");
+            assert_eq!(old["version"], first.as_str());
+            assert_eq!(old["body"], DECISION);
+            let second = now["version"].as_str().unwrap();
+            let same = payload(&s.get(get_at(&format!("{id}@{second}"))).await.unwrap());
+            assert!(same.get("current").is_none(), "{same}");
+            assert_eq!(same["trust_tier"], "curated");
+        }
+
+        /// `get` carries the related entries, each with its weight, under the key
+        /// `related`. Three of four searches that returned the first entry returned
+        /// the second too.
+        #[tokio::test]
+        async fn get_carries_the_related_entries_with_their_weight() {
+            let (dir, s) = server().await;
+            let a = written(
+                &s,
+                "fact",
+                "Retry backoff",
+                "Operation R retries with backoff.\n",
+            )
+            .await;
+            let b = written(
+                &s,
+                "fact",
+                "Backoff jitter",
+                "Backoff adds jitter to spread load.\n",
+            )
+            .await;
+            for query in ["backoff", "backoff", "backoff", "operation retries"] {
+                let reader = Memory::open(dir.path()).unwrap();
+                reader.search(query, None, 5).await.unwrap();
+            }
+            let got = payload(&served_as(dir.path(), None).get(get_at(&a)).await.unwrap());
+            let related = json!([{
+                "id": b,
+                "title": "Backoff jitter",
+                "summary": "Backoff adds jitter to spread load.",
+                "p": 0.75,
+            }]);
+            assert_eq!(got["related"], related, "{got}");
+            assert!(got.get("read_with").is_none(), "{got}");
+        }
+
+        fn search_for(query: &str, filters: Option<FiltersParams>) -> Parameters<SearchParams> {
+            Parameters(SearchParams {
+                query: query.into(),
+                filters,
+                ..SearchParams::default()
+            })
+        }
+
+        /// `search` narrows by its filters, gives each hit a snippet, and refuses a
+        /// filter value that it does not know.
+        #[tokio::test]
+        async fn search_narrows_by_its_filters_and_gives_each_hit_a_snippet() {
+            let (_dir, s) = server().await;
+            let decision = written(&s, "decision", "Where the import runs", DECISION).await;
+            let note = "The import took four hours on the staging host last night.\n";
+            let fact = written(&s, "fact", "Import duration", note).await;
+            let all = payload(&s.search(search_for("import staging", None)).await.unwrap());
+            let mut ids: Vec<&str> = all["hits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|h| h["id"].as_str().unwrap())
+                .collect();
+            ids.sort_unstable();
+            let mut both = [decision.as_str(), fact.as_str()];
+            both.sort_unstable();
+            assert_eq!(ids, both);
+            for h in all["hits"].as_array().unwrap() {
+                let snippet = h["snippet"].as_str().unwrap_or_default();
+                assert!(snippet.contains("staging"), "{h}");
+            }
+            let only = FiltersParams {
+                entry_type: Some("decision".into()),
+                ..FiltersParams::default()
+            };
+            let narrowed = payload(
+                &s.search(search_for("import staging", Some(only)))
+                    .await
+                    .unwrap(),
+            );
+            let hits = narrowed["hits"].as_array().unwrap();
+            assert_eq!(hits.len(), 1, "{narrowed}");
+            assert_eq!(hits[0]["id"], decision.as_str());
+            assert_eq!(hits[0]["type"], "decision");
+            let deep = SearchParams {
+                depth: Some("sections".into()),
+                filters: Some(FiltersParams {
+                    entry_type: Some("fact".into()),
+                    ..FiltersParams::default()
+                }),
+                ..search_for("import staging", None).0
+            };
+            let deep = payload(&s.search(Parameters(deep)).await.unwrap());
+            let pieces = deep["hits"].as_array().unwrap();
+            assert_eq!(pieces.len(), 1, "{deep}");
+            assert_eq!(pieces[0]["id"], fact.as_str());
+            for (field, bad) in [
+                (
+                    "filters.min_tier",
+                    FiltersParams {
+                        min_tier: Some("gold".into()),
+                        ..FiltersParams::default()
+                    },
+                ),
+                (
+                    "filters.type",
+                    FiltersParams {
+                        entry_type: Some("rumour".into()),
+                        ..FiltersParams::default()
+                    },
+                ),
+                (
+                    "filters.since",
+                    FiltersParams {
+                        since: Some("yesterday".into()),
+                        ..FiltersParams::default()
+                    },
+                ),
+            ] {
+                let why = refusal_text(s.search(search_for("import", Some(bad))).await);
+                assert!(why.contains(field), "{field}: {why}");
+            }
+        }
+
+        /// The other filters reach the index too: the lowest tier, the author, and the
+        /// time of creation.
+        #[tokio::test]
+        async fn search_narrows_by_tier_author_and_time() {
+            let (dir, s) = server().await;
+            let id = written(&s, "decision", "Where the import runs", DECISION).await;
+            let found = |f: FiltersParams| async {
+                let hits = payload(&s.search(search_for("import", Some(f))).await.unwrap());
+                hits["hits"].as_array().unwrap().len()
+            };
+            let tier = |t: &str| FiltersParams {
+                min_tier: Some(t.into()),
+                ..FiltersParams::default()
+            };
+            let author = |a: &str| FiltersParams {
+                author: Some(a.into()),
+                ..FiltersParams::default()
+            };
+            let since = |t: &str| FiltersParams {
+                since: Some(t.into()),
+                ..FiltersParams::default()
+            };
+            assert_eq!(found(tier("curated")).await, 0);
+            assert_eq!(found(tier("raw")).await, 1);
+            assert_eq!(found(author("agent:nobody")).await, 0);
+            assert_eq!(found(author("human:test:me")).await, 1);
+            assert_eq!(found(since("2999-01-01T00:00:00Z")).await, 0);
+            assert_eq!(found(since("2000-01-01T00:00:00Z")).await, 1);
+            let curator = Memory::open(dir.path()).unwrap().with_author("agent:c");
+            curator
+                .promote(&id, TrustTier::Curated, "checked")
+                .await
+                .unwrap();
+            assert_eq!(found(tier("curated")).await, 1);
+        }
+
+        fn recall_of(kind: Option<&str>, context: Option<usize>) -> Parameters<RecallParams> {
+            Parameters(RecallParams {
+                question: "where does the import run".into(),
+                answer_kind: kind.map(Into::into),
+                context_tokens: context,
+                ..RecallParams::default()
+            })
+        }
+
+        /// `recall` takes the answer kind and the context of the caller, and `plan`
+        /// says what was chosen. A recall with neither has no plan.
+        #[tokio::test]
+        async fn recall_plans_its_size_from_the_answer_kind_and_the_context() {
+            let (_dir, s) = server().await;
+            written(&s, "decision", "Where the import runs", DECISION).await;
+            let plain = payload(&s.recall(recall_of(None, None)).await.unwrap());
+            assert!(plain.get("plan").is_none(), "{plain}");
+            let fact = payload(&s.recall(recall_of(Some("fact"), None)).await.unwrap());
+            assert_eq!(fact["plan"]["answer_kind"], "fact");
+            assert!(fact["plan"]["context_tokens"].is_null(), "{fact}");
+            let full = payload(&s.recall(recall_of(None, Some(120_000))).await.unwrap());
+            assert_eq!(full["plan"]["answer_kind"], "overview");
+            assert_eq!(full["plan"]["context_tokens"], 120_000);
+            let overview = payload(&s.recall(recall_of(Some("overview"), None)).await.unwrap());
+            assert!(
+                full["plan"]["pack_tokens"].as_u64() < overview["plan"]["pack_tokens"].as_u64(),
+                "{full} {overview}"
+            );
+            let why = refusal_text(s.recall(recall_of(Some("essay"), None)).await);
+            assert!(why.contains("answer_kind: "), "{why}");
+        }
+
+        fn export_at(label: &str) -> Parameters<ExportParams> {
+            Parameters(ExportParams {
+                domain: None,
+                max_label: label.into(),
+            })
+        }
+
+        /// `export` keeps the bundle under the root and answers with counts, labels and
+        /// a digest: no id of an entry. A label above the handling of the session is
+        /// refused.
+        #[tokio::test]
+        async fn export_keeps_a_bundle_and_names_no_entry() {
+            let (dir, agent, owner) = agent_and_owner();
+            let id = entry_at(&owner, dm_core::Label::Public, "The door opens at nine.").await;
+            let kept = payload(&agent.export(export_at("public")).await.unwrap());
+            let at = kept["kept_at"].as_str().unwrap();
+            assert!(at.starts_with("state/exports/"), "{at}");
+            assert!(at.ends_with("/dom-me-public"), "{at}");
+            assert!(dir.path().join(at).join("manifest.yaml").is_file());
+            assert_eq!(kept["entries"], 1);
+            assert_eq!(kept["highest_label"], "public");
+            assert_eq!(kept["manifest_digest"].as_str().map(str::len), Some(64));
+            assert!(!kept.to_string().contains(&id), "{kept}");
+            let bad = refusal_text(agent.export(export_at("secret")).await);
+            assert!(bad.contains("max_label: "), "{bad}");
+            let capped = Memory::open(dir.path())
+                .unwrap()
+                .with_author(AGENT)
+                .with_handling_cap(dm_core::Label::Public);
+            let capped = McpServer::new(Arc::new(capped));
+            let why = refusal_text(capped.export(export_at("internal")).await);
+            assert!(why.contains("exceeds handling public"), "{why}");
         }
     }
 }
