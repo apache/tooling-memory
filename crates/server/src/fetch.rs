@@ -59,7 +59,9 @@ impl Memory {
     /// # Errors
     ///
     /// [`Error::Denied`] for a malformed address. [`Error::NotFound`] for an entry or a
-    /// version that is absent or not for this session, and for an unknown anchor.
+    /// version that is absent or not for this session, and for an unknown anchor. A
+    /// version of an entry that the session reads now gets one refusal, whether the
+    /// version is absent or not for this session.
     /// [`Error::Gone`] for an erased entry, for a withheld entry and an author outside
     /// the security role, and past the redirect limit. Otherwise as [`Memory::get`].
     pub async fn fetch(&self, address: &str) -> Result<Fetched, Error> {
@@ -99,6 +101,10 @@ impl Memory {
     /// The version of `id` whose stored text has the digest `version`.
     async fn fetch_version(&self, id: &str, version: &str) -> Result<Fetched, Error> {
         let not_found = || Error::NotFound(id.to_string());
+        // one refusal for a version that the entry does not have and for a version that
+        // is not for this session: a different answer would confirm a guess of the text
+        // of a version that the session may not read
+        let no_version = || Error::NotFound(format!("{id} has no version {version}"));
         let own = self.session_filter()?;
         let mut wide = own.clone();
         wide.include_inactive = true;
@@ -125,9 +131,7 @@ impl Memory {
         } else {
             let history = self.store.history(&domain, id).await?;
             let old = history.iter().find(|v| dm_core::digest(&v.text) == version);
-            let old =
-                old.ok_or_else(|| Error::NotFound(format!("{id} has no version {version}")))?;
-            Entry::parse(&old.text)?
+            Entry::parse(&old.ok_or_else(no_version)?.text)?
         };
         // the version by its own frontmatter: its label, its tier, its reach and its
         // time must pass the filter too
@@ -141,12 +145,12 @@ impl Memory {
             front.task.as_deref(),
         );
         if !admitted || !own.admits_at(front.created) {
-            return Err(not_found());
+            return Err(no_version());
         }
         let label = now.front.classification.max(front.classification);
         let outside = reach::outside_content(&entry) || reach::outside_content(&now);
         if !self.observe_entry(&domain, id, label, outside)? {
-            return Err(not_found());
+            return Err(no_version());
         }
         self.note_get();
         self.reads.opened(id, &entry.body, false);
@@ -456,16 +460,26 @@ mod tests {
     async fn a_version_above_the_handling_is_not_found_and_so_is_one_of_an_entry_above_it() {
         let dir = tempfile::tempdir().unwrap();
         let (_owner, entries) = relabelled_both_ways(dir.path()).await;
-        for (id, version) in &entries {
-            let capped = agent(dir.path(), "agent:low").with_handling_cap(Label::Public);
-            let refused = capped.fetch(&format!("{id}@{version}")).await;
-            assert!(
-                matches!(&refused, Err(Error::NotFound(what)) if what == id),
-                "{id}: {refused:?}"
-            );
-            assert_eq!(capped.label(), Label::Public);
-            assert!(read_in_log(&capped, "dom-me").is_empty());
-            assert!(gets(dir.path(), &capped).is_empty());
+        let absent = "0".repeat(64);
+        // the entry that is public now: the refusal of its internal version is the
+        // refusal of a version that it does not have. The entry that is internal now:
+        // the refusal of an entry that is absent, for each version
+        let refusals = [
+            |id: &str, version: &str| format!("{id} has no version {version}"),
+            |id: &str, _: &str| id.to_string(),
+        ];
+        for ((id, version), refusal) in entries.iter().zip(refusals) {
+            for version in [version, &absent] {
+                let capped = agent(dir.path(), "agent:low").with_handling_cap(Label::Public);
+                let refused = capped.fetch(&format!("{id}@{version}")).await;
+                assert!(
+                    matches!(&refused, Err(Error::NotFound(what)) if *what == refusal(id, version)),
+                    "{id}: {refused:?}"
+                );
+                assert_eq!(capped.label(), Label::Public);
+                assert!(read_in_log(&capped, "dom-me").is_empty());
+                assert!(gets(dir.path(), &capped).is_empty());
+            }
         }
         // the entry that is public now is served as it is now
         let capped = agent(dir.path(), "agent:low").with_handling_cap(Label::Public);
@@ -506,13 +520,95 @@ mod tests {
         assert!(reader.fetch(&id).await.unwrap().current, "curated now");
         let refused = reader.fetch(&format!("{id}@{raw}")).await;
         assert!(
-            matches!(&refused, Err(Error::NotFound(what)) if *what == id),
+            matches!(&refused, Err(Error::NotFound(what)) if *what == format!("{id} has no version {raw}")),
             "{refused:?}"
         );
         assert_eq!(gets(dir.path(), &reader).len(), 1);
         // the owner is no agent, and reads the raw version
         let served = owner.fetch(&format!("{id}@{raw}")).await.unwrap();
         assert_eq!(served.entry.front.trust_tier, TrustTier::Raw);
+    }
+
+    #[tokio::test]
+    async fn a_read_of_a_raw_version_with_tap_reach_marks_the_session_as_one_that_read_outside_content(
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::testing::root(dir.path());
+        let spec = dm_ledger::TaskSpec {
+            title: "From the tracker".into(),
+            body: "Do it.\n".into(),
+            domain: "dom-me".into(),
+            ..dm_ledger::TaskSpec::default()
+        };
+        let tap = crate::testing::as_author(dir.path(), "tap:issues");
+        let filed = tap.create_task(spec).await.unwrap();
+        let task = owner.admit(&filed.task.id).await.unwrap();
+        let a = agent(dir.path(), "agent:a");
+        a.hold_task(&task.id).await.unwrap();
+        let note = WriteRequest {
+            body: "# Note\n\nThe tracker says so.\n".into(),
+            classification: Some(Label::Public),
+            domain: Some("dom-me".into()),
+            ..WriteRequest::default()
+        };
+        let id = a.write(note).await.unwrap().id;
+        let raw = version_now(&owner, &id).await;
+        let front = owner.get(&id).await.unwrap().front;
+        assert_eq!(
+            (front.trust_tier, front.reach),
+            (TrustTier::Raw, dm_core::Reach::Tap)
+        );
+        // the current version is curated: only the version read is outside content
+        owner
+            .promote(&id, TrustTier::Curated, "Checked.")
+            .await
+            .unwrap();
+        let now = owner.store.get("dom-me", &id).await.unwrap().unwrap();
+        assert!(!reach::outside_content(&now));
+        let reader = Memory::open(dir.path()).unwrap();
+        assert!(!reader.read_outside());
+        let served = reader.fetch(&format!("{id}@{raw}")).await.unwrap();
+        assert!(!served.current);
+        assert!(reach::outside_content(&served.entry));
+        assert!(reader.read_outside(), "the session read outside content");
+        assert_eq!(read_in_log(&reader, "dom-me"), [id.as_str()]);
+        // the current version is not outside content, and leaves no mark
+        let other = Memory::open(dir.path()).unwrap();
+        other.fetch(&id).await.unwrap();
+        assert!(!other.read_outside());
+    }
+
+    #[tokio::test]
+    async fn a_version_created_after_the_snapshot_of_the_session_is_not_served() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = wrote(&owner, "# Port\n\nIt listens on 8080.\n", Label::Public).await;
+        let late = version_now(&owner, &id).await;
+        // a new version of the entry, with `created` a year back
+        let mut e = owner.store.get("dom-me", &id).await.unwrap().unwrap();
+        let snapshot = e.front.created - time::Duration::days(30);
+        e.front.created -= time::Duration::days(365);
+        let put = owner.put_logged(&e).await.unwrap();
+        owner.feed_from("dom-me", put).await.unwrap();
+        let early = version_now(&owner, &id).await;
+        let reader = agent(dir.path(), "agent:r");
+        let settings = crate::arms::Settings {
+            not_after: Some(snapshot),
+            ..crate::arms::Settings::default()
+        };
+        reader.set_settings(settings).unwrap();
+        // the current version is inside the snapshot, and the earlier one is outside it
+        assert!(reader.fetch(&id).await.unwrap().current);
+        assert!(reader.fetch(&format!("{id}@{early}")).await.is_ok());
+        let refused = reader.fetch(&format!("{id}@{late}")).await;
+        assert!(
+            matches!(&refused, Err(Error::NotFound(what)) if *what == format!("{id} has no version {late}")),
+            "{refused:?}"
+        );
+        assert_eq!(gets(dir.path(), &reader).len(), 2);
+        // a session with no snapshot reads it
+        let free = agent(dir.path(), "agent:s");
+        assert!(free.fetch(&format!("{id}@{late}")).await.is_ok());
     }
 
     #[tokio::test]

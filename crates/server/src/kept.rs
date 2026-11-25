@@ -62,7 +62,8 @@ impl Memory {
     }
 
     /// Remove the bundles of a domain that the sessions of this root keep, at every
-    /// label: a kept bundle holds bodies as they were, and an erasure reaches them.
+    /// label: a kept bundle holds bodies as they were. An erasure calls this for the
+    /// domain of the erased entry and for each domain that holds an entry it withholds.
     pub(crate) fn drop_kept(&self, domain: &str) -> Result<(), Error> {
         let exports = self.root.join(EXPORTS_DIR);
         let Ok(sessions) = std::fs::read_dir(&exports) else {
@@ -433,6 +434,66 @@ mod tests {
                 .is_file(),
             "the bundle of another domain stays"
         );
+    }
+
+    #[tokio::test]
+    async fn an_erasure_removes_the_kept_bundles_of_a_domain_that_holds_a_withheld_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = shelf(dir.path()).await;
+        // an entry of the held-out domain that names the public fact of `dom-me`
+        let citing = s
+            .owner
+            .write(WriteRequest {
+                body: format!("Drawn from {}.\n", s.open),
+                entry_type: EntryType::Convention,
+                classification: Some(Label::Public),
+                domain: Some("dom-held".into()),
+                cites: vec![s.open.clone()],
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap()
+            .id;
+        let held = s.owner.export_kept(Some("dom-held"), Label::Internal).await;
+        let held = dir.path().join(held.unwrap().kept_at);
+        let body = held.join(format!("{citing}.md"));
+        assert!(body.is_file());
+        let served = bundle::bundle_dir(dir.path(), "dom-held", Label::Public);
+        std::fs::create_dir_all(&served).unwrap();
+        let receipt = s.owner.erase(&s.open, dm_core::erasure::Reason::Requested);
+        assert_eq!(receipt.await.unwrap().withheld, [citing.as_str()]);
+        let now = s.owner.store.get("dom-held", &citing).await.unwrap();
+        assert_eq!(now.unwrap().front.status, Some(dm_core::Status::Withheld));
+        assert!(!body.exists(), "the withheld body left the kept bundle");
+        assert!(!held.exists());
+        assert!(!served.exists(), "and the served bundle of that domain");
+    }
+
+    #[tokio::test]
+    async fn an_export_keeps_the_lowest_tier_of_the_read_filter_of_the_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = shelf(dir.path()).await;
+        s.owner
+            .promote(&s.inner, TrustTier::Curated, "Checked.")
+            .await
+            .unwrap();
+        crate::testing::agents_read(dir.path(), "\"min_tier\": \"curated\"");
+        let b = as_author(dir.path(), "agent:b");
+        assert!(b.get(&s.open).await.is_err(), "a raw entry is not read");
+        let kept = b.export_kept(Some("dom-me"), Label::Internal);
+        let kept = kept.await.unwrap();
+        let (_, manifest) = manifest_at(dir.path(), &kept);
+        assert_eq!(
+            ids(&manifest),
+            [s.inner.as_str()],
+            "the curated entry, and not the raw entry {}",
+            s.open
+        );
+        assert_eq!(kept.entries, 1);
+        // the owner is no agent, and its bundle holds the raw entries too
+        let all = s.owner.export_kept(Some("dom-me"), Label::Internal).await;
+        let (_, manifest) = manifest_at(dir.path(), &all.unwrap());
+        assert_eq!(ids(&manifest), sorted(vec![&s.open, &s.inner, &s.note]));
     }
 
     #[cfg(unix)]

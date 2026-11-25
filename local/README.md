@@ -1816,7 +1816,10 @@ of `get` has `version`, and a later `get` takes `<id>@<version>`. Thus a citatio
 version reads the same text after the entry changed. The answer then has
 `current: false`. The read filter of the session must admit the entry as it is now, and
 must admit the version by its own frontmatter. The label of the session goes up to the
-higher of the two labels. A version of an erased entry is not served.
+higher of the two labels. A version of an erased entry is not served. A version that the
+session may not read gets the refusal of a version that the entry does not have:
+`<id> has no version <version>`. Thus the refusal does not confirm a guess of the text
+of that version.
 
 ```sh
 amem get mem-me-xxxxxxxx#decision
@@ -1869,8 +1872,23 @@ The memory server writes the bundle under `state/exports/<session>/<domain>-<lab
 The answer has `kept_at`, the number of entries, the highest label in the bundle and the
 digest of the manifest. It has no id, title or summary of an entry, so the label of the
 session does not go up. A `max_label` above the handling of the session is refused. A
-second export of the same domain at the same label in one session replaces the first. An
-erasure in the domain removes the kept bundles of the domain.
+second export of the same domain at the same label in one session replaces the first.
+
+The bundle holds only the entries that the session may read. Its read filter stays in
+force: the tiers, the reach of raw entries and the snapshot. Thus a session that reads
+only curated entries gets no raw entry in its bundle.
+
+An erasure removes the kept bundles of the domain of the erased entry. It also removes
+the kept bundles of each domain that holds an entry that the erasure withholds. The
+served bundles of those domains go too.
+
+Two items are open:
+
+- Nothing removes the kept bundles of a session that ended. `state/exports` grows with
+  each session that exports, until an erasure in the domain.
+- No lock holds an export against an erasure in a different process. An export that
+  read an entry before the erasure can write its body after the erasure removed the
+  kept bundles. The receipt of the erasure lists the export under `sends`.
 
 `amem export` without a destination does the same and prints the directory. With a
 destination, it writes the bundle there, as before.

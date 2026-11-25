@@ -331,8 +331,10 @@ pub fn kept_at(session: &str, domain: &str, label: Label) -> Result<String, Erro
 }
 
 /// What an export reads: `filter` narrowed to `domain`, bounded at `max_label`, with
-/// tombstones and every tier, since a bundle carries the domain whole. Fails if the
-/// filter does not cover the domain.
+/// tombstones, since a bundle carries the retired entries of the domain too. Every other
+/// part of the filter stays: the tiers, the reach of raw entries and the snapshot. Thus
+/// a bundle holds no entry that the session may not read. Fails if the filter does not
+/// cover the domain.
 ///
 /// # Errors
 ///
@@ -358,7 +360,6 @@ pub fn export_scope(
     scoped.domains = vec![domain.to_string()];
     scoped.handling = scoped.handling.min(max_label);
     scoped.include_inactive = true;
-    scoped.min_tier = TrustTier::Raw;
     Ok(scoped)
 }
 

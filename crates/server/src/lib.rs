@@ -4008,8 +4008,7 @@ impl Memory {
         }
         self.index.lock().await.vacuum()?;
         self.forget_pushed(id);
-        self.drop_bundles(domain)?;
-        self.drop_kept(domain)?;
+        self.drop_copies(domain, &receipt.withheld).await?;
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
         let missed = self.erase_from_projections(domain, id);
@@ -4166,6 +4165,32 @@ fn cites(text: &str, id: &str) -> bool {
 }
 
 impl Memory {
+    /// Remove the bundles under the root that can hold what an erasure took out of
+    /// service: those of `domain`, where the erased entry is, and those of each domain
+    /// that holds one of `withheld`, the entries on the receipt that the erasure
+    /// withholds. They are the bundles that the root serves and the bundles that its
+    /// sessions keep. A bundle holds bodies as they were, and a withheld body can be
+    /// imported from it.
+    async fn drop_copies(&self, domain: &str, withheld: &[String]) -> Result<(), Error> {
+        let mut domains = vec![domain.to_string()];
+        for other in self.domains() {
+            if domains.contains(&other) {
+                continue;
+            }
+            for id in withheld {
+                if self.store.get_text(&other, id).await?.is_some() {
+                    domains.push(other);
+                    break;
+                }
+            }
+        }
+        for d in &domains {
+            self.drop_bundles(d)?;
+            self.drop_kept(d)?;
+        }
+        Ok(())
+    }
+
     /// Remove the bundles served from this root for a domain, at every label, and the
     /// working copies an export in progress leaves beside them.
     fn drop_bundles(&self, domain: &str) -> Result<(), Error> {

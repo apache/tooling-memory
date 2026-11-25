@@ -774,7 +774,7 @@ impl Memory {
     pub(crate) fn may_sign_off(&self) -> Result<(), Error> {
         if self.served() {
             return Err(Error::Denied(
-                "a session of the memory server approves nothing: a person approves at the command line"
+                "a session of the memory server approves nothing: a person approves at the command line, or in `amem serve --person`"
                     .into(),
             ));
         }
