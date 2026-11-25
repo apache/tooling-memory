@@ -18,6 +18,7 @@ use dm_core::erasure::{self, Reason, Receipt};
 use dm_core::{
     Confidence, Entry, EntryType, Frontmatter, Label, Reach, ReadFilter, Status, TrustTier,
 };
+pub use dm_index::Narrow;
 use dm_index::{Hit, Index};
 use dm_ledger::{Claim, Created, Ledger, Task, TaskSpec};
 use dm_policy::decide::{
@@ -54,6 +55,8 @@ pub mod lineage;
 pub mod log;
 pub mod mcp;
 pub mod measure;
+#[cfg(test)]
+mod narrow;
 pub mod platform;
 pub mod positions;
 pub mod prefetch;
@@ -1236,9 +1239,32 @@ impl Memory {
         domain: Option<&str>,
         limit: usize,
     ) -> Result<Vec<Hit>, Error> {
+        self.search_with(query, domain, &Narrow::default(), limit)
+            .await
+    }
+
+    /// [`Memory::search`], narrowed by the caller: by kind, lowest tier, author, and
+    /// time of creation. The narrowing is within the session's filter. It leaves
+    /// entries out, and it brings in none that the filter refuses: a session held to
+    /// curated entries that asks for raw ones gets none. Each hit has a snippet of the
+    /// body from the index, and the read log counts the snippets.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or an index error.
+    pub async fn search_with(
+        &self,
+        query: &str,
+        domain: Option<&str>,
+        narrow: &Narrow,
+        limit: usize,
+    ) -> Result<Vec<Hit>, Error> {
         let asked = std::time::Instant::now();
         let f = self.filter_for(domain)?;
-        let hits = self.index.lock().await.search(query, &f, limit)?;
+        let ix = self.index.lock().await;
+        let hits = ix.search_narrowed(query, &f, narrow, limit);
+        drop(ix);
+        let hits = hits?;
         self.observe(&hits)?;
         let ms = u64::try_from(asked.elapsed().as_millis()).unwrap_or(u64::MAX);
         self.reads.searched(query, &hits, ms);

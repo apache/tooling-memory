@@ -378,11 +378,15 @@ fn trace(read: &Read) {
     dm_otel::event("memory.read", &attrs);
 }
 
-/// What a page of hits costs the reader: id, title, summary and a little metadata each.
+/// What a page of hits costs the reader: id, title, summary and a little metadata each,
+/// and the snippet of a hit that has one.
 #[must_use]
 pub fn hits_tokens(hits: &[Hit]) -> usize {
     hits.iter()
-        .map(|h| approx_tokens(&h.title) + approx_tokens(&h.summary) + 12)
+        .map(|h| {
+            let snippet = h.snippet.as_deref().map_or(0, approx_tokens);
+            approx_tokens(&h.title) + approx_tokens(&h.summary) + snippet + 12
+        })
         .sum()
 }
 

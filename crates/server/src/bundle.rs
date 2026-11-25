@@ -627,6 +627,7 @@ mod tests {
             summary: "Held.".into(),
             score: 0.0,
             review_due: false,
+            snippet: None,
             reach: dm_core::Reach::Fleet,
         };
         let dest = tempfile::tempdir().unwrap();
@@ -671,6 +672,7 @@ mod tests {
             summary: "Held.".into(),
             score: 0.0,
             review_due: false,
+            snippet: None,
             reach: dm_core::Reach::Fleet,
         };
         let record = |id: &str| PromotionRecord {

@@ -12,7 +12,7 @@
 //! per-session cache that `get` serves from once the index has admitted the id, so what
 //! was pushed and later asked for shows up in the read log.
 
-use crate::{lock, Error, Memory};
+use crate::{lock, Error, Memory, Narrow};
 use dm_core::{approx_tokens, Entry, EntryType, Label, ReadFilter, TrustTier};
 use dm_index::Hit;
 use serde::{Deserialize, Serialize};
@@ -526,12 +526,31 @@ impl Memory {
         depth: Depth,
         budget: Budget,
     ) -> Result<Pack, Error> {
+        self.pack_narrowed(queries, domain, depth, budget, &Narrow::default())
+            .await
+    }
+
+    /// [`Memory::pack`], with each query narrowed by the caller as
+    /// [`Memory::search_with`] narrows a search. The entries that the bodies cite are
+    /// not narrowed: a link is followed for what it says, whatever its kind or author.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or an index or store error.
+    pub async fn pack_narrowed(
+        &self,
+        queries: &[String],
+        domain: Option<&str>,
+        depth: Depth,
+        budget: Budget,
+        narrow: &Narrow,
+    ) -> Result<Pack, Error> {
         let f = self.filter_for(domain)?;
         let hits = {
             let ix = self.index.lock().await;
             let mut lists = Vec::with_capacity(queries.len());
             for q in queries {
-                lists.push(ix.search(q, &f, budget.hits.max(1))?);
+                lists.push(ix.search_narrowed(q, &f, narrow, budget.hits.max(1))?);
             }
             interleave(lists, budget.hits.max(1))
         };
@@ -623,14 +642,32 @@ impl Memory {
         domain: Option<&str>,
         limit: usize,
     ) -> Result<Pack, Error> {
+        self.search_sections_with(query, domain, &Narrow::default(), limit)
+            .await
+    }
+
+    /// [`Memory::search_sections`], narrowed by the caller: the pack has a body only of
+    /// an entry that passes the session's filter and the narrowing.
+    ///
+    /// # Errors
+    ///
+    /// An ungranted domain, or an index or store error.
+    pub async fn search_sections_with(
+        &self,
+        query: &str,
+        domain: Option<&str>,
+        narrow: &Narrow,
+        limit: usize,
+    ) -> Result<Pack, Error> {
         // a search costs what it hit and nothing more; linking is recall's
         let budget = Budget {
             hits: limit,
             links: 0,
             ..Budget::default()
         };
+        let queries = [query.to_string()];
         let pack = self
-            .pack(&[query.to_string()], domain, Depth::Sections, budget)
+            .pack_narrowed(&queries, domain, Depth::Sections, budget, narrow)
             .await?;
         self.reads
             .served("search", Some(query), pack.pieces.len(), pack.tokens, false);
@@ -848,6 +885,7 @@ mod tests {
             summary: String::new(),
             score: 0.0,
             review_due: false,
+            snippet: None,
             reach: dm_core::Reach::Fleet,
         }
     }
