@@ -244,6 +244,58 @@ impl Memory {
         writeln!(file, "{key}").map_err(io_at(&path))
     }
 
+    /// Each key of the refusal record of the domain, in the order they were added.
+    pub(crate) fn refused_keys(&self, domain: &str) -> Vec<String> {
+        std::fs::read_to_string(self.refused_file(domain))
+            .map(|text| text.lines().map(str::to_string).collect())
+            .unwrap_or_default()
+    }
+
+    /// Each held entry that has the mark of a proposal to a personal domain.
+    fn marked_proposals(&self) -> Result<Vec<Entry>, Error> {
+        let dir = self.root.join("state/quarantine");
+        let Ok(listing) = std::fs::read_dir(&dir) else {
+            return Ok(Vec::new());
+        };
+        let mut marks: Vec<PathBuf> = listing
+            .filter_map(Result::ok)
+            .map(|item| item.path())
+            .filter(|p| p.extension().is_some_and(|x| x == "personal"))
+            .collect();
+        marks.sort();
+        let mut out = Vec::new();
+        for mark in marks {
+            let path = mark.with_extension("md");
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                out.push(Entry::parse(&text)?);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Apply a refusal that the person made on another copy of this root; for a
+    /// restore. The refusal record of the domain takes the key. Each held proposal to
+    /// the domain with that key is removed, and its task is invalidated. Returns the
+    /// ids of the proposals removed.
+    pub(crate) async fn refuse_again(&self, domain: &str, key: &str) -> Result<Vec<String>, Error> {
+        if !self.was_refused(domain, key) {
+            self.record_refusal(domain, key)?;
+        }
+        let mut removed = Vec::new();
+        for entry in self.marked_proposals()? {
+            if entry.front.domain != domain || origin_key(&entry) != key {
+                continue;
+            }
+            self.release_quarantined(&entry.front.id, false).await?;
+            // a domain that the grants in force do not hold has no task to close
+            if self.grants.domains.contains_key(domain) {
+                self.close_proposal_task(&entry, "refused").await?;
+            }
+            removed.push(entry.front.id);
+        }
+        Ok(removed)
+    }
+
     /// The file that marks a held entry as a proposal to a personal domain.
     fn proposal_mark(&self, id: &str) -> PathBuf {
         self.root
@@ -351,16 +403,20 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for an author who is not the owner; [`Error::NotFound`] when no
-    /// proposal has this id; a store, index or ledger error.
+    /// [`Error::Denied`] for an author who is not the owner; [`Error::Outage`] while an
+    /// outage is declared, and nothing is done; [`Error::NotFound`] when no proposal has
+    /// this id; a store, index or ledger error.
     pub async fn answer_proposal(&self, id: &str, admit: bool) -> Result<Option<Written>, Error> {
         self.proposals_owner()?;
+        // nothing of the answer is done in an outage: the refusal record waits too
+        self.serving()?;
         self.fresh()?;
         let entry = self.held_proposal(id)?;
+        let written = self.release_quarantined(id, admit).await?;
         if !admit {
+            // after the proposal is removed: a refusal that failed leaves no key
             self.record_refusal(&entry.front.domain, &origin_key(&entry))?;
         }
-        let written = self.release_quarantined(id, admit).await?;
         let reason = if admit { "admitted" } else { "refused" };
         self.close_proposal_task(&entry, reason).await?;
         Ok(written)
@@ -707,6 +763,24 @@ mod tests {
         let err = propose(dir.path(), "# Tests\n\nThe person runs the tests first.\n").await;
         assert!(err.to_string().contains("held as a proposal"), "{err}");
         assert_eq!(owner.proposals().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_answer_in_an_outage_does_nothing_and_leaves_no_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = personal(dir.path());
+        propose(dir.path(), PROPOSAL).await;
+        let id = owner.proposals().unwrap()[0].front.id.clone();
+        owner.declare_outage("the log does not answer").unwrap();
+        let waits = owner.answer_proposal(&id, false).await.unwrap_err();
+        assert!(matches!(waits, Error::Outage(_)), "{waits}");
+        assert!(!dir.path().join(REFUSED_DIR).exists(), "nothing refused");
+        owner.end_outage().await.unwrap();
+        assert_eq!(owner.proposals().unwrap().len(), 1, "it is held as before");
+        // the person admits it, and the same text is then no refused proposal
+        owner.answer_proposal(&id, true).await.unwrap().unwrap();
+        let err = propose(dir.path(), PROPOSAL).await;
+        assert!(err.to_string().contains("held as a proposal"), "{err}");
     }
 
     #[tokio::test]

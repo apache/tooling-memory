@@ -3780,6 +3780,10 @@ impl Memory {
         receipt.promotion_whys_removed = scrubbed.records;
         close_receipt(&mut receipt, missed);
         receipt.unresolved.extend(scrubbed.beyond_reach);
+        // a recovery bundle under the root keeps the body: the receipt names each one
+        receipt
+            .unresolved
+            .extend(recovery::copies_under_root(&self.root, domain, id));
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
         Ok(receipt)

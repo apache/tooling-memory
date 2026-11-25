@@ -17,13 +17,16 @@
 //! config/...                    the grants, the registry, the prices and the policy
 //! ```
 //!
-//! Three things are kept apart from every bundle, because a restore must not roll them
+//! Four things are kept apart from every bundle, because a restore must not roll them
 //! back:
 //!
 //! - **The grants.** The restore takes the grants in force now. The grants of the bundle
 //!   go to `restored-config/` for a person to read, and nothing loads them.
 //! - **The erasure journal.** The receipts of the erasures made after the bundle. The
 //!   restore erases each of those entries again before the root serves anything.
+//! - **The refusal journal.** The refusals of proposals to a personal domain, each as
+//!   the key of its origin. The restore removes each of those proposals that the bundle
+//!   holds, and the refusal record takes each key.
 //! - **The claim epoch.** A number in a file outside the bundle. Each restore takes the
 //!   next number and begins that claim epoch on the ledger, so every claim that was made
 //!   before the restore is over.
@@ -56,6 +59,10 @@ pub const EPOCH_FILE: &str = "claim-epoch";
 /// Where a restore puts the configuration of the bundle. Nothing loads it.
 pub const RESTORED_CONFIG: &str = "restored-config";
 
+/// The file of a kept journal that holds the refusals of one domain, beside the receipts
+/// of that domain: one origin key on each line.
+const REFUSALS_FILE: &str = "refused.txt";
+
 const QUARANTINE_DIR: &str = "state/quarantine";
 const LEDGER_EVENTS: &str = "ledger.jsonl";
 
@@ -64,6 +71,40 @@ const LEDGER_EVENTS: &str = "ledger.jsonl";
 #[must_use]
 pub fn recovery_dir(root: &Path, stamp: &str) -> PathBuf {
     root.join(RECOVERY_DIR).join(stamp)
+}
+
+/// The directories under [`RECOVERY_DIR`] of a root that hold the entry with a body: a
+/// recovery bundle that a session made there, or the scratch root of a restore drill.
+/// One line for each, for the receipt of an erasure: the erasure does not change a
+/// bundle, so a person deletes the directory.
+pub(crate) fn copies_under_root(root: &Path, domain: &str, id: &str) -> Vec<String> {
+    let Ok(listing) = std::fs::read_dir(root.join(RECOVERY_DIR)) else {
+        return Vec::new();
+    };
+    let below = Path::new("record").join(domain).join(format!("{id}.md"));
+    let mut names: Vec<String> = listing
+        .filter_map(Result::ok)
+        .filter(|item| {
+            // a file that does not read or parse counts as a body: it is named too
+            match std::fs::read_to_string(item.path().join(&below)) {
+                Ok(text) => {
+                    Entry::parse(&text).map_or(true, |e| e.front.status != Some(Status::Erased))
+                }
+                Err(e) => e.kind() != std::io::ErrorKind::NotFound,
+            }
+        })
+        .map(|item| item.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+        .into_iter()
+        .map(|name| {
+            format!(
+                "{RECOVERY_DIR}/{name} under the root holds the entry with its body: \
+                 delete that directory"
+            )
+        })
+        .collect()
 }
 
 /// Refuse a root that a restore did not finish.
@@ -361,10 +402,31 @@ impl Memory {
         Ok(out)
     }
 
+    /// The refusal journal of this root: each refusal of a proposal to a personal domain,
+    /// as the refusal record of each granted domain holds it. A refusal holds the key of
+    /// an origin and no text. A person keeps a copy with the erasure journal
+    /// ([`write_refusals`]), and a restore takes it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a session that is not the owner.
+    pub fn refusal_journal(&self) -> Result<Vec<Refusal>, Error> {
+        self.owner_makes("a copy of the refusal journal")?;
+        let mut out = Vec::new();
+        for domain in self.domains() {
+            let keys = self.refused_keys(&domain);
+            out.extend(keys.into_iter().map(|key| Refusal {
+                domain: domain.clone(),
+                key,
+            }));
+        }
+        Ok(out)
+    }
+
     /// Restore `bundle` into `scratch` and check what came back, without a write to
     /// this root's record or ledger. The restore takes the grants and the registry of
-    /// this root, its erasure journal and its claim epoch file, and always a file
-    /// ledger, so a drill cannot write a ledger on a server. Only the claim epoch file of
+    /// this root, its erasure journal, its refusal journal and its claim epoch file. It
+    /// always takes a file ledger, so a drill cannot write a ledger on a server. Only the claim epoch file of
     /// this root moves. Each of the paper's five cases is reported as recovered, absent
     /// or failed. A case is recovered only when the bundle held it.
     ///
@@ -376,6 +438,7 @@ impl Memory {
         self.owner_makes("a restore drill")?;
         self.fresh()?;
         let journal = self.erasure_journal().await?;
+        let refusals = self.refusal_journal()?;
         let grants_file = self.root.join(GRANTS_FILE);
         let grants = std::fs::read_to_string(&grants_file).map_err(io(&grants_file))?;
         let registry = std::fs::read_to_string(self.root.join(REGISTRY_FILE)).ok();
@@ -387,6 +450,7 @@ impl Memory {
             grants: &grants,
             registry: registry.as_deref(),
             journal: &journal,
+            refusals: &refusals,
             epoch_file: &epoch_file,
             file_ledger: true,
         };
@@ -439,6 +503,9 @@ pub fn write_journal(dir: &Path, receipts: &[Receipt]) -> Result<(), Error> {
 pub fn read_journal(dir: &Path) -> Result<Vec<Receipt>, Error> {
     let mut out = Vec::new();
     for below in files_below(dir)? {
+        if below.file_name().is_some_and(|n| n == REFUSALS_FILE) {
+            continue;
+        }
         let path = dir.join(&below);
         let text = std::fs::read_to_string(&path).map_err(io(&path))?;
         let receipt = Receipt::from_yaml(&text)?;
@@ -453,6 +520,79 @@ pub fn read_journal(dir: &Path) -> Result<Vec<Receipt>, Error> {
             )));
         }
         out.push(receipt);
+    }
+    Ok(out)
+}
+
+/// One refusal of a proposal to a personal domain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Refusal {
+    /// The personal domain.
+    pub domain: String,
+    /// The key of the origin of the proposal: a digest, and no text of the proposal.
+    pub key: String,
+}
+
+/// A key of a refusal record: a digest in hexadecimal, and nothing else.
+fn valid_key(key: &str) -> Result<&str, Error> {
+    if key.len() == 64 && key.chars().all(|c| c.is_ascii_hexdigit()) {
+        Ok(key)
+    } else {
+        Err(Error::Denied(format!(
+            "{key:?} is not the key of a refusal"
+        )))
+    }
+}
+
+/// Keep the refusals of a refusal journal in `dir`, as `<dir>/<domain>/refused.txt`:
+/// beside the receipts that [`write_journal`] keeps. The file of a domain is written
+/// whole.
+///
+/// # Errors
+///
+/// [`Error::Denied`] for a refusal whose domain is not a name or whose key is not a
+/// digest; the file system.
+pub fn write_refusals(dir: &Path, refusals: &[Refusal]) -> Result<(), Error> {
+    let mut by_domain: std::collections::BTreeMap<&str, String> = std::collections::BTreeMap::new();
+    for r in refusals {
+        let text = by_domain.entry(valid_name(&r.domain)?).or_default();
+        text.push_str(valid_key(&r.key)?);
+        text.push('\n');
+    }
+    for (domain, text) in by_domain {
+        write_file(&dir.join(domain).join(REFUSALS_FILE), text.as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Read the refusals that [`write_refusals`] kept. A directory that is not there holds
+/// no refusal.
+///
+/// # Errors
+///
+/// [`Error::Denied`] for a file that is not in the directory of a domain, a line that
+/// is not a digest, or a symbolic link; the file system.
+pub fn read_refusals(dir: &Path) -> Result<Vec<Refusal>, Error> {
+    let mut out = Vec::new();
+    for below in files_below(dir)? {
+        if below.file_name().is_none_or(|n| n != REFUSALS_FILE) {
+            continue;
+        }
+        let path = dir.join(&below);
+        let domain = below.parent().and_then(Path::to_str).unwrap_or_default();
+        let domain = valid_name(domain).map_err(|_| {
+            Error::Denied(format!(
+                "the refusal journal: {} is not in the directory of a domain",
+                path.display()
+            ))
+        })?;
+        let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+        for key in text.lines() {
+            out.push(Refusal {
+                domain: domain.to_string(),
+                key: valid_key(key)?.to_string(),
+            });
+        }
     }
     Ok(out)
 }
@@ -513,6 +653,8 @@ pub struct Authority<'a> {
     pub registry: Option<&'a str>,
     /// The erasure journal: the receipt of each erasure that the restored root must hold.
     pub journal: &'a [Receipt],
+    /// The refusal journal: each refusal of a proposal that the restored root must hold.
+    pub refusals: &'a [Refusal],
     /// The claim epoch file ([`next_epoch`]).
     pub epoch_file: &'a Path,
     /// Whether the restored root keeps its ledger in the file under the root, whatever
@@ -533,6 +675,9 @@ pub struct Restored {
     /// The entries of the journal that the restored record does not hold with a body
     /// and had no receipt for: the receipt is beside the record now.
     pub receipts_kept: Vec<String>,
+    /// The proposals that the bundle held and the refusal journal says are refused: each
+    /// was removed.
+    pub proposals_refused: Vec<String>,
     /// How many entries the index was built from.
     pub entries: usize,
     /// How many events of the ledger were restored.
@@ -552,8 +697,11 @@ pub struct Restored {
 /// 5. Each entry of the erasure journal that the record holds with a body is erased as a
 ///    live erasure does it. For an entry that the record does not hold, the receipt is
 ///    put beside the record, so an import of that text is refused.
-/// 6. The index is built again from the record and the log.
-/// 7. The marker is removed.
+/// 6. Each refusal of the refusal journal goes into the refusal record of its domain. A
+///    proposal that the bundle holds with the key of a refusal is removed, and its task
+///    is invalidated.
+/// 7. The index is built again from the record and the log.
+/// 8. The marker is removed.
 ///
 /// # Errors
 ///
@@ -579,6 +727,7 @@ pub async fn restore(
     let ledger_events = restore_ledger(&memory, bundle, &manifest).await?;
     let (epoch, reopened) = begin_next_epoch(&memory, authority, &manifest).await?;
     let (erased, receipts_kept) = apply_journal(&memory, authority.journal).await?;
+    let proposals_refused = apply_refusals(&memory, authority.refusals).await?;
     let (entries, _) = memory.reindex().await?;
     let marker = into.join(RESTORING);
     std::fs::remove_file(&marker).map_err(io(&marker))?;
@@ -587,6 +736,7 @@ pub async fn restore(
         reopened,
         erased,
         receipts_kept,
+        proposals_refused,
         entries,
         ledger_events,
     })
@@ -758,6 +908,16 @@ async fn apply_journal(
         }
     }
     Ok((erased, kept))
+}
+
+/// Step 6 of [`restore`]. Returns the proposals removed.
+async fn apply_refusals(memory: &Memory, refusals: &[Refusal]) -> Result<Vec<String>, Error> {
+    let mut removed = Vec::new();
+    for r in refusals {
+        let (domain, key) = (valid_name(&r.domain)?, valid_key(&r.key)?);
+        removed.extend(memory.refuse_again(domain, key).await?);
+    }
+    Ok(removed)
 }
 
 /// Erase an entry that the bundle held with a body. In a granted domain this is the
@@ -1218,6 +1378,7 @@ mod tests {
                 grants: &grants,
                 registry: None,
                 journal,
+                refusals: &[],
                 epoch_file: &epoch_file,
                 file_ledger: false,
             };
@@ -1234,6 +1395,7 @@ mod tests {
                 grants: &grants,
                 registry: None,
                 journal: &[],
+                refusals: &[],
                 epoch_file: &epoch_file,
                 file_ledger: false,
             };
@@ -1441,6 +1603,7 @@ mod tests {
             grants: &narrow,
             registry: None,
             journal: &journal,
+            refusals: &[],
             epoch_file: &epoch_file,
             file_ledger: false,
         };
@@ -1477,6 +1640,7 @@ mod tests {
             grants: &with_server,
             registry: None,
             journal: &[],
+            refusals: &[],
             epoch_file: &epoch_file,
             file_ledger: true,
         };
@@ -1789,5 +1953,96 @@ mod tests {
         let moved = dir.join(DOMAIN).join("mem-me-other.yaml");
         std::fs::rename(dir.join(DOMAIN).join(format!("{id}.yaml")), moved).unwrap();
         assert!(matches!(read_journal(&dir), Err(Error::Denied(_))));
+    }
+
+    const PROPOSAL: &str = "# Commits\n\nThe person prefers small commits that a reviewer reads.\n";
+
+    /// The tasks of proposals to a personal domain that wait for the person.
+    async fn proposal_tasks(m: &Memory) -> usize {
+        let mut n = 0;
+        for status in [TaskStatus::Proposed, TaskStatus::Open] {
+            let tasks = m.tasks(None, status).await.unwrap();
+            let of_proposals = tasks
+                .iter()
+                .filter(|t| t.spec.origin.as_deref() == Some(crate::registry::PROPOSAL_ORIGIN));
+            n += of_proposals.count();
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn a_proposal_refused_after_the_bundle_is_removed_in_the_restored_root() {
+        let site = Site::new();
+        // the owner of the grants is the person, by an assertion
+        let person = "human:test,2026-11-01:me";
+        let registry = format!(
+            "[domains.{DOMAIN}]\nperson = \"{person}\"\n[[assertions]]\nwas = \"{OWNER}\"\n\
+             is = \"{person}\"\nsince = 2026-11-01\n"
+        );
+        std::fs::write(site.root().join(REGISTRY_FILE), &registry).unwrap();
+        let owner = Memory::open(&site.root()).unwrap();
+        let offer = |root: PathBuf| async move {
+            let agent = Memory::open(&root).unwrap().with_author(WORKER);
+            agent.write(req(PROPOSAL)).await.unwrap_err().to_string()
+        };
+        assert!(offer(site.root()).await.contains("held as a proposal"));
+        let id = owner.proposals().unwrap()[0].front.id.clone();
+        owner.recovery_bundle(&site.at("bundle")).await.unwrap();
+        owner.answer_proposal(&id, false).await.unwrap();
+        // the journal holds the refusal as a key, and is read back from its file
+        let refusals = owner.refusal_journal().unwrap();
+        assert_eq!(refusals.len(), 1);
+        let kept = site.at("journal");
+        assert!(read_refusals(&kept).unwrap().is_empty());
+        write_refusals(&kept, &refusals).unwrap();
+        assert_eq!(read_refusals(&kept).unwrap(), refusals);
+        assert!(read_journal(&kept).unwrap().is_empty());
+        let text = std::fs::read_to_string(kept.join(DOMAIN).join(REFUSALS_FILE)).unwrap();
+        assert!(!text.contains("small commits"), "{text}");
+        let (grants, epoch_file) = (site.grants(), site.at("claim-epoch"));
+        let authority = Authority {
+            grants: &grants,
+            registry: Some(&registry),
+            journal: &[],
+            refusals: &refusals,
+            epoch_file: &epoch_file,
+            file_ledger: false,
+        };
+        let into = site.at("restored");
+        let restored = restore(&site.at("bundle"), &into, &authority)
+            .await
+            .unwrap();
+        assert_eq!(restored.proposals_refused, vec![id]);
+        let back = Memory::open(&into).unwrap();
+        assert!(back.proposals().unwrap().is_empty());
+        assert_eq!(files_below(&into.join(QUARANTINE_DIR)).unwrap().len(), 0);
+        assert_eq!(proposal_tasks(&back).await, 0);
+        // offered again in the restored root: refused, and nothing is held
+        let again = offer(into.clone()).await;
+        assert!(again.contains("refused this proposal"), "{again}");
+        assert!(back.proposals().unwrap().is_empty());
+        // a drill takes the refusal journal of its root
+        let scratch = site.at("scratch");
+        owner.drill(&site.at("bundle"), &scratch).await.unwrap();
+        let drilled = Memory::open(&scratch).unwrap();
+        assert!(drilled.proposals().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_refusal_journal_takes_a_digest_in_the_directory_of_a_domain_and_nothing_else() {
+        let dir = tempfile::tempdir().unwrap();
+        let refusal = |domain: &str, key: &str| Refusal {
+            domain: domain.into(),
+            key: key.into(),
+        };
+        let key = "a".repeat(64);
+        for bad in [refusal("../escape", &key), refusal(DOMAIN, "../../x")] {
+            let err = write_refusals(dir.path(), &[bad]).unwrap_err();
+            assert!(matches!(err, Error::Denied(_)), "{err}");
+        }
+        assert_eq!(files_below(dir.path()).unwrap().len(), 0);
+        write_file(&dir.path().join(DOMAIN).join(REFUSALS_FILE), b"not a key\n").unwrap();
+        let err = read_refusals(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("is not the key"), "{err}");
     }
 }

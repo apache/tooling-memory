@@ -20,6 +20,8 @@
 //! a lease that ran out in the outage is refused and does not give the claim back. A
 //! handoff goes through the ordinary write as its author, so the gates screen it. When
 //! the claim of its task is over, the handoff is left on the task as a late handoff.
+//! The replay reads no higher than the session did when it queued the handoff. A queued
+//! line that fails is kept in [`FAILED_FILE`], so the text of a handoff is not lost.
 
 use crate::{io, lock, reads, Error, Memory, WriteRequest};
 use dm_core::{EntryType, Label};
@@ -38,6 +40,9 @@ pub const OUTAGE_FILE: &str = "state/outage.json";
 pub const QUEUE_FILE: &str = "state/outage/queue.jsonl";
 /// The queue while [`Memory::end_outage`] replays it.
 const REPLAY_FILE: &str = "state/outage/queue.replaying.jsonl";
+/// The queued lines that a replay could not apply, under the root: each line as it was
+/// queued. A person reads the file, and nothing serves it.
+pub const FAILED_FILE: &str = "state/outage/failed.jsonl";
 
 /// A declared outage.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -62,7 +67,8 @@ pub struct Replayed {
     /// or the claim is over.
     pub heartbeats_refused: usize,
     /// One line for each queued line that failed, with the reason. A line that failed
-    /// does not stop the lines after it.
+    /// does not stop the lines after it. A handoff that failed, and a line that does not
+    /// parse, are kept in [`FAILED_FILE`].
     pub failed: Vec<String>,
 }
 
@@ -108,6 +114,9 @@ enum Queued {
         generation: Option<u64>,
         /// The label of the session: the entry is classified no lower.
         label: Label,
+        /// The highest classification that the session could read when it queued the
+        /// handoff. The replay reads no higher.
+        handling: Label,
         /// Whether the session had read content from outside the fleet.
         outside: bool,
     },
@@ -267,19 +276,49 @@ impl Memory {
             Err(e) => return Err(io(&path)(e)),
         }
         let mut done = Replayed::default();
-        for (n, line) in self.take_queue()?.lines().enumerate() {
-            match serde_json::from_str::<Queued>(line) {
+        let text = self.take_queue()?;
+        // the lines that failed and that the file of failed lines did not take
+        let mut not_kept = String::new();
+        for (n, line) in text.lines().enumerate() {
+            let applied = match serde_json::from_str::<Queued>(line) {
                 Ok(queued) => self.replay(queued, &mut done).await,
-                Err(e) => done
-                    .failed
-                    .push(format!("line {}: it does not parse ({e})", n + 1)),
+                Err(e) => {
+                    done.failed.push(format!(
+                        "line {}: it does not parse ({e}). The line is kept in {FAILED_FILE}",
+                        n + 1
+                    ));
+                    false
+                }
+            };
+            if !applied && !self.keep_failed(line, &mut done) {
+                not_kept.push_str(line);
+                not_kept.push('\n');
             }
         }
         let replayed = self.root.join(REPLAY_FILE);
-        if replayed.exists() {
+        if !not_kept.is_empty() {
+            // the next end of an outage tries these lines again
+            std::fs::write(&replayed, not_kept).map_err(io(&replayed))?;
+        } else if replayed.exists() {
             std::fs::remove_file(&replayed).map_err(io(&replayed))?;
         }
         Ok(done)
+    }
+
+    /// Keep a queued line that failed in [`FAILED_FILE`]. Returns false, and says so in
+    /// `done`, when the file did not take the line.
+    fn keep_failed(&self, line: &str, done: &mut Replayed) -> bool {
+        let path = self.root.join(FAILED_FILE);
+        match reads::try_append_line(&path, line) {
+            Ok(()) => true,
+            Err(e) => {
+                done.failed.push(format!(
+                    "{FAILED_FILE} did not take a line that failed ({e}). The line stays on \
+                     the queue"
+                ));
+                false
+            }
+        }
     }
 
     /// The text of the queue, moved aside so a line that comes later is not lost. A
@@ -302,7 +341,9 @@ impl Memory {
         Ok(text)
     }
 
-    async fn replay(&self, queued: Queued, done: &mut Replayed) {
+    /// Apply one queued line. Returns false for a handoff that the record did not take:
+    /// the caller keeps the line.
+    async fn replay(&self, queued: Queued, done: &mut Replayed) -> bool {
         match queued {
             Queued::Heartbeat {
                 task,
@@ -324,6 +365,7 @@ impl Memory {
                         .failed
                         .push(format!("heartbeat of {holder} on {task}: {e}")),
                 }
+                true
             }
             Queued::Handoff {
                 request,
@@ -332,6 +374,7 @@ impl Memory {
                 task,
                 generation,
                 label,
+                handling,
                 outside,
                 ..
             } => {
@@ -341,16 +384,22 @@ impl Memory {
                     task,
                     generation,
                     label,
+                    handling,
                     outside,
                 };
-                self.replay_handoff(*request, &from, done).await;
+                self.replay_handoff(*request, &from, done).await
             }
         }
     }
 
     /// Write a queued handoff as its author, and leave it on the task of the session
-    /// when the claim of that task is over.
-    async fn replay_handoff(&self, request: WriteRequest, from: &Sender, done: &mut Replayed) {
+    /// when the claim of that task is over. Returns whether the record took the handoff.
+    async fn replay_handoff(
+        &self,
+        request: WriteRequest,
+        from: &Sender,
+        done: &mut Replayed,
+    ) -> bool {
         let written = match self.session_of(from).await {
             Ok(view) => view.write(request).await,
             Err(e) => Err(e),
@@ -359,15 +408,15 @@ impl Memory {
             Ok(w) => w.id,
             Err(e) => {
                 done.failed.push(format!(
-                    "handoff of {} in session {}: {e}",
+                    "handoff of {} in session {}: {e}. The line is kept in {FAILED_FILE}",
                     from.author, from.session
                 ));
-                return;
+                return false;
             }
         };
         done.handoffs.push(id.clone());
         let (Some(task), Some(generation)) = (&from.task, from.generation) else {
-            return;
+            return true;
         };
         let by = dm_ledger::Held {
             holder: &from.author,
@@ -382,15 +431,20 @@ impl Memory {
                 "handoff {id} is written, and is not on {task}: {e}"
             )),
         }
+        true
     }
 
     /// A session of this root that writes as the sender of a queued handoff did: its
-    /// author, its session id, its held task, and no lower a label.
+    /// author, its session id, its held task, no higher a handling and no lower a
+    /// label. So the write finds only the entries that the sender could read.
     async fn session_of(&self, from: &Sender) -> Result<Memory, Error> {
         let mut view = Memory::open(&self.root)?;
         view.session_id.clone_from(&from.session);
         view.reads = Arc::new(reads::ReadLog::new(&self.root, &from.session));
-        let view = view.with_author(from.author.clone());
+        // the cap first: it starts the label of the session again
+        let view = view
+            .with_author(from.author.clone())
+            .with_handling_cap(from.handling);
         {
             let mut s = lock(&view.session);
             s.observe(from.label);
@@ -476,7 +530,8 @@ impl Memory {
         match self.queue_handoff(req) {
             Ok(()) => Error::Outage(format!(
                 "an outage is declared since {since}. The handoff is queued. It lands in \
-                 the record when the outage ends, if the gates allow it"
+                 the record when the outage ends, if the gates and the checks of a write \
+                 allow it. A handoff that fails then is kept for the owner"
             )),
             Err(e) => e,
         }
@@ -500,6 +555,7 @@ impl Memory {
             task,
             generation,
             label: self.label(),
+            handling: self.grants.handling,
             outside: self.read_outside(),
         })
     }
@@ -547,6 +603,7 @@ struct Sender {
     task: Option<String>,
     generation: Option<u64>,
     label: Label,
+    handling: Label,
     outside: bool,
 }
 
@@ -928,6 +985,96 @@ mod tests {
         owner.search("retries", None, 5).await.unwrap();
     }
 
+    /// A fact of the owner at the highest classification.
+    async fn restricted(owner: &Memory) -> String {
+        let fact = WriteRequest {
+            classification: Some(Label::Restricted),
+            ..entry(EntryType::Fact, FACT)
+        };
+        owner.write(fact).await.unwrap().id
+    }
+
+    fn failed_lines(root: &Path) -> Vec<String> {
+        let text = std::fs::read_to_string(root.join(FAILED_FILE)).unwrap_or_default();
+        text.lines().map(str::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn a_replayed_handoff_replaces_no_entry_that_its_session_could_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = init(dir.path());
+        let secret = restricted(&owner).await;
+        let capped = agent(dir.path()).with_handling_cap(Label::Public);
+        let replace = || WriteRequest {
+            supersedes: Some(secret.clone()),
+            ..entry(EntryType::Handoff, HANDOFF)
+        };
+        // with no outage the write does not find the entry
+        let live = capped.write(replace()).await.unwrap_err();
+        assert!(matches!(live, Error::NotFound(_)), "{live}");
+        owner.declare_outage("the log does not answer").unwrap();
+        waits(capped.write(replace()).await);
+        let done = owner.end_outage().await.unwrap();
+        assert_eq!(done.handoffs, Vec::<String>::new());
+        assert_eq!(done.failed.len(), 1, "{:?}", done.failed);
+        assert!(done.failed[0].contains("not found"), "{:?}", done.failed);
+        // the entry is as it was: nothing replaced it
+        let still = owner.get(&secret).await.unwrap();
+        assert_eq!(still.body, FACT);
+        assert_eq!(still.front.classification, Label::Restricted);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_handoff_has_the_label_and_the_outside_mark_of_its_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = init(dir.path());
+        let secret = restricted(&owner).await;
+        let a = agent(dir.path());
+        a.get(&secret).await.unwrap();
+        lock(&a.session).read_outside();
+        assert_eq!(a.label(), Label::Restricted);
+        owner.declare_outage("the log does not answer").unwrap();
+        waits(a.write(entry(EntryType::Handoff, HANDOFF)).await);
+        let done = owner.end_outage().await.unwrap();
+        assert_eq!(done.failed, Vec::<String>::new());
+        let landed = owner.get(&done.handoffs[0]).await.unwrap();
+        assert_eq!(landed.front.classification, Label::Restricted);
+        assert_eq!(landed.front.reach, dm_core::Reach::Tap);
+    }
+
+    #[tokio::test]
+    async fn a_handoff_that_fails_at_the_end_of_the_outage_is_kept_with_its_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = init(dir.path());
+        let a = agent(dir.path());
+        owner.declare_outage("the log does not answer").unwrap();
+        let missing = WriteRequest {
+            supersedes: Some("mem-me-nothere1".into()),
+            ..entry(EntryType::Handoff, HANDOFF)
+        };
+        waits(a.write(missing).await);
+        let done = owner.end_outage().await.unwrap();
+        assert_eq!(done.handoffs, Vec::<String>::new());
+        assert_eq!(done.failed.len(), 1, "{:?}", done.failed);
+        assert!(done.failed[0].contains(FAILED_FILE), "{:?}", done.failed);
+        // the line is kept as it was queued, with the text of the handoff
+        let kept = failed_lines(dir.path());
+        assert_eq!(kept.len(), 1);
+        match serde_json::from_str::<Queued>(&kept[0]).unwrap() {
+            Queued::Handoff {
+                request, author, ..
+            } => {
+                assert_eq!(request.body, HANDOFF);
+                assert_eq!(author, AGENT);
+            }
+            Queued::Heartbeat { .. } => panic!("a heartbeat was kept"),
+        }
+        // the queue is gone, and a second end replays nothing and keeps nothing more
+        assert!(!dir.path().join(REPLAY_FILE).exists());
+        assert_eq!(owner.end_outage().await.unwrap(), Replayed::default());
+        assert_eq!(failed_lines(dir.path()).len(), 1);
+    }
+
     #[tokio::test]
     async fn a_queued_line_that_fails_is_reported_and_the_rest_is_replayed() {
         let dir = tempfile::tempdir().unwrap();
@@ -941,5 +1088,6 @@ mod tests {
         assert_eq!(done.handoffs.len(), 1);
         assert_eq!(done.failed.len(), 1);
         assert!(done.failed[0].starts_with("line 1: "), "{:?}", done.failed);
+        assert_eq!(failed_lines(dir.path()), vec!["{\"kind\":\"nothing\"}"]);
     }
 }

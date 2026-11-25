@@ -261,7 +261,15 @@ two weeks. It is also the reason that none of it is the production shape.
     from a recovery bundle.
   - The erasure journal is a copy of the receipts that a person makes with a command. A
     restore keeps the reason of an erasure, and gives the new receipt the time of the
-    restore.
+    restore. The same command copies the refusal journal.
+  - An erasure does not change a recovery bundle under the root. The receipt names each
+    such bundle that holds the body, and a person deletes it.
+  - The restore drill of a root with a PostgreSQL ledger is refused when two domains
+    hold an event with the same number. The drill restores into a file ledger.
+  - A recovery bundle that is made in the middle of a write can hold an event of the log
+    for a version that its record does not hold.
+  - A queued handoff that fails at the end of an outage is kept in a file. No command
+    reads that file.
   - Nothing detects an outage. The owner declares one, and it is one state for the
     ledger and for retrieval. In an outage, a tap and a spawn are refused, and nothing
     buffers them.

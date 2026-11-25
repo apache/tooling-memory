@@ -1081,7 +1081,7 @@ that hold a root.
 | `amem proposal admit <id>`, `refuse <id>` | `answer_proposal` | Admits or refuses a proposal. Only the owner |
 | `amem proposal expire [--today D]` | none | Removes each proposal that waited longer than `proposal_days` |
 | `amem recover bundle <dest>` | `recovery_bundle` | Makes a recovery bundle. The memory tool makes it under `state/recovery/` |
-| `amem recover journal <dest>` | none | Copies the erasure journal to a directory |
+| `amem recover journal <dest>` | none | Copies the erasure journal and the refusal journal to a directory |
 | `amem recover drill <bundle> [--scratch DIR]` | `recovery_drill` | Runs a restore drill. The memory tool takes the name of a bundle under `state/recovery/` |
 | `amem --root <new root> recover restore <bundle> --grants F --epoch-authority F [--registry F] [--journal DIR]` | none | Restores a recovery bundle into a new root |
 | `amem outage status` | `outage_status` | Gives the declared outage |
@@ -1166,11 +1166,13 @@ and no text. An expired proposal keeps nothing, so the author can offer it again
 
 A copy of the record alone loses the tasks that were not finished. A recovery bundle
 holds the record, the event logs with their cursors, the events of the ledger, the
-quarantine and the configuration. It does not hold the index. Keep three things apart
+quarantine and the configuration. It does not hold the index. Keep four things apart
 from each bundle, because a restore must not roll them back:
 
 - the grants that are in force now
 - the erasure journal: the receipts of the erasures
+- the refusal journal: the key of each refused proposal to a personal domain. `amem
+  recover journal` puts it in the same directory as the erasure journal
 - the claim epoch file, `<root>/claim-epoch` by default
 
 ```sh
@@ -1195,6 +1197,20 @@ A case is `recovered` only when the bundle held it. The drill does not write the
 or the ledger of the root. It moves only the claim epoch file. Remove the scratch root
 when you have read the report.
 
+An erasure does not change a recovery bundle. A bundle or a scratch root under
+`state/recovery/` can hold the erased entry with its body. The receipt of the erasure
+names each such directory in `unresolved`. Delete each directory that the receipt names,
+and make a new bundle. These items are open:
+
+- The restore drill restores into a file ledger, which numbers the events of all domains
+  together. A PostgreSQL ledger numbers the events of each domain apart. Thus the drill
+  of a root with a PostgreSQL ledger is refused when two domains hold an event with the
+  same number.
+- A write appends to the event log, and then puts the version in the record. A bundle
+  that is made between those two steps holds an event for a version that its record does
+  not hold. The drill then reports `write-awaiting-materialisation` as `failed`. Make the
+  bundle again.
+
 A restore makes a new root. `--root` names a directory that is empty or not there:
 
 ```sh
@@ -1205,7 +1221,8 @@ amem --root /srv/memory-new recover restore /backup/2026-11-25 \
 
 The restore begins the next claim epoch on the ledger. Thus each task that was claimed
 is open again, and the ledger refuses each claim from before the restore. The restore
-then erases each entry that the erasure journal names. The grants of the bundle go to
+then erases each entry that the erasure journal names. It removes each proposal that
+the refusal journal names, and the refusal record takes each key. The grants of the bundle go to
 `restored-config/`, and nothing loads them. While a restore runs, the root holds
 `state/restoring`, and `amem` refuses to open it.
 
@@ -1234,6 +1251,12 @@ as its author, so the policy screens it. A heartbeat goes to the ledger, and the
 the ledger decides: a lease that ran out in the outage stays lost. The `outage_status`
 memory tool also names the domains whose T0 the session loaded, and its last confirmed
 lease.
+
+The replay of a handoff reads no higher than the session did when it queued the handoff.
+Thus a handoff cannot replace an entry that its session could not read. A handoff that
+the record does not take is not lost: `amem outage end` names it in `failed`, and keeps
+the queued line in `state/outage/failed.jsonl`. No command reads that file. The owner
+reads it, and gives the text to a session or removes the file.
 
 ### The horizon scanner
 

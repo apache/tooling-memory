@@ -173,6 +173,18 @@ fn served(s: &Source, cached: bool) -> Value {
     v
 }
 
+/// Who observes what a granted tool fetches: the owner's browser, a tool server, or
+/// the tap host.
+fn observer(grant: &dm_policy::TapGrant) -> &'static str {
+    if grant.browser {
+        OBSERVED_BY_BROWSER
+    } else if grant.hosted.is_some() {
+        OBSERVED_BY_TOOL_SERVER
+    } else {
+        OBSERVED_BY_TAP
+    }
+}
+
 impl Memory {
     /// Give this session its tools: the binary's WASI host.
     pub fn set_tools(&self, tools: Arc<dyn Tools>) {
@@ -213,11 +225,15 @@ impl Memory {
     ///
     /// # Errors
     ///
+    /// [`Error::Outage`] while an outage is declared: no source is served, and the tool
+    /// is not called.
     /// [`Error::Denied`] when the tool is not granted, the server runs no tools, the
     /// session may not read the tool's results label, or the answer is held;
     /// [`Error::Tool`] when the tool fails or a request it needed was refused, with
     /// what it said withheld when the scan finds anything in that.
     pub async fn use_tool(self: &Arc<Self>, tool: &str, args: Value) -> Result<Value, Error> {
+        // a stored source is a read, and a call to the tool is a change: both wait
+        self.serving()?;
         // a stored source is released under the same check as a search
         self.fresh()?;
         self.definition_allows(tool).await?;
@@ -269,14 +285,7 @@ impl Memory {
             author: self.author.clone(),
             kept_at: now,
             retain_until: now + Duration::days(i64::from(days)),
-            observed_by: if grant.browser {
-                OBSERVED_BY_BROWSER
-            } else if grant.hosted.is_some() {
-                OBSERVED_BY_TOOL_SERVER
-            } else {
-                OBSERVED_BY_TAP
-            }
-            .to_string(),
+            observed_by: observer(grant).to_string(),
             reached,
             findings: findings.clone(),
             held,
@@ -720,6 +729,48 @@ mod tests {
             "{err}"
         );
         assert_eq!(agent.label(), Label::Internal);
+    }
+
+    #[tokio::test]
+    async fn a_tool_call_waits_in_an_outage_for_a_kept_source_and_for_a_new_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let agent = root(dir.path(), "upstream says no", "agent:test");
+        let args = json!({"q": "kept"});
+        let now = OffsetDateTime::now_utc();
+        let kept = Source {
+            id: source_id("lookup", &args),
+            tool: "lookup".into(),
+            args: args.clone(),
+            domain: "dom-me".into(),
+            classification: Label::Public,
+            session: "sess-before".into(),
+            author: "agent:test".into(),
+            kept_at: now,
+            retain_until: now + Duration::days(1),
+            observed_by: "tap:lookup".into(),
+            reached: Vec::new(),
+            findings: Vec::new(),
+            held: false,
+            released: None,
+            answer: json!({"text": "kept answer"}),
+        };
+        agent.put_source(&kept).await.unwrap();
+        // with no outage the kept source is served
+        let served = agent.use_tool("lookup", args.clone()).await.unwrap();
+        assert!(served.to_string().contains("kept answer"), "{served}");
+        let owner = Memory::open(dir.path()).unwrap();
+        owner.declare_outage("the log does not answer").unwrap();
+        let events = || crate::log::read(dir.path(), "dom-me", 0).unwrap().len();
+        let before = events();
+        let cached = agent.use_tool("lookup", args).await.unwrap_err();
+        assert!(matches!(cached, Error::Outage(_)), "{cached}");
+        // a call with no kept source does not reach the tool
+        let new = agent
+            .use_tool("lookup", json!({"q": "new"}))
+            .await
+            .unwrap_err();
+        assert!(matches!(new, Error::Outage(_)), "{new}");
+        assert_eq!(events(), before, "the log takes no event");
     }
 
     #[tokio::test]

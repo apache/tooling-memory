@@ -72,7 +72,8 @@ pub enum RecoverOp {
         dest: PathBuf,
     },
     /// Copy the erasure journal of this root, the receipt of each erasure, to a
-    /// directory. Keep it apart from the bundles: a restore takes it.
+    /// directory, with the refusal of each proposal to a personal domain. Keep it apart
+    /// from the bundles: a restore takes it.
     Journal {
         /// The directory for the journal.
         dest: PathBuf,
@@ -204,14 +205,15 @@ async fn restore(
         |path: &Path| std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
     let grants = read(grants)?;
     let registry = registry.map(read).transpose()?;
-    let journal = match journal {
-        Some(dir) => recovery::read_journal(dir)?,
-        None => Vec::new(),
+    let (journal, refusals) = match journal {
+        Some(dir) => (recovery::read_journal(dir)?, recovery::read_refusals(dir)?),
+        None => (Vec::new(), Vec::new()),
     };
     let authority = Authority {
         grants: &grants,
         registry: registry.as_deref(),
         journal: &journal,
+        refusals: &refusals,
         epoch_file: epoch_authority,
         file_ledger: false,
     };
@@ -231,9 +233,16 @@ pub async fn recover(root: &Path, op: RecoverOp) -> Fallible {
             crate::json(&Memory::open(root)?.recovery_bundle(&dest).await?)
         }
         RecoverOp::Journal { dest } => {
-            let receipts = Memory::open(root)?.erasure_journal().await?;
+            let m = Memory::open(root)?;
+            let receipts = m.erasure_journal().await?;
+            let refusals = m.refusal_journal()?;
             recovery::write_journal(&dest, &receipts)?;
-            crate::json(&json!({ "journal": dest, "receipts": receipts.len() }))
+            recovery::write_refusals(&dest, &refusals)?;
+            crate::json(&json!({
+                "journal": dest,
+                "receipts": receipts.len(),
+                "refusals": refusals.len(),
+            }))
         }
         RecoverOp::Drill { bundle, scratch } => {
             let m = Memory::open(root)?;

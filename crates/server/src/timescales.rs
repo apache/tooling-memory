@@ -303,6 +303,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_erasure_names_each_directory_under_the_root_that_holds_the_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), OWNER, "dom-me").unwrap();
+        let written = m.write(note("# Port\n\nThe service listens on 8080.\n"));
+        let id = written.await.unwrap().id;
+        let made = m.recovery_bundle_here().await.unwrap();
+        let run = m.drill_named(&made.name).await.unwrap();
+        let receipt = m
+            .erase(&id, dm_core::erasure::Reason::Sensitive)
+            .await
+            .unwrap();
+        assert!(receipt.is_finished(), "{:?}", receipt.unresolved);
+        let named: Vec<&String> = receipt
+            .unresolved
+            .iter()
+            .filter(|line| line.contains("delete that directory"))
+            .collect();
+        assert_eq!(named.len(), 2, "{:?}", receipt.unresolved);
+        assert!(named[0].starts_with(&made.bundle), "{named:?}");
+        assert!(named[1].starts_with(&run.scratch), "{named:?}");
+        // a bundle that is made after the erasure holds the stub, and is not named
+        m.recovery_bundle_here().await.unwrap();
+        let copies = crate::recovery::copies_under_root(dir.path(), "dom-me", &id);
+        assert_eq!(copies.len(), 2, "{copies:?}");
+    }
+
+    #[tokio::test]
     async fn a_list_shows_a_proposal_without_its_body() {
         let dir = tempfile::tempdir().unwrap();
         Memory::init(dir.path(), OWNER, "dom-me").unwrap();
