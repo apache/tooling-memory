@@ -74,13 +74,10 @@ impl PgServer {
         if let Err(e) = installed {
             return unavailable(format!("embedded PostgreSQL cannot be installed here: {e}"));
         }
-        let mut pg = PostgreSQL::new(settings()?);
-        if let Err(e) = pg.setup().await {
-            return unavailable(format!("embedded PostgreSQL cannot be set up here: {e}"));
-        }
-        if let Err(e) = pg.start().await {
-            return unavailable(format!("embedded PostgreSQL did not start: {e}"));
-        }
+        let pg = match started(0).await {
+            Ok(pg) => pg,
+            Err(why) => return unavailable(why),
+        };
         create_database(&pg.settings().url(BOOTSTRAP_DATABASE), "ledger")
             .await
             .map_err(|e| format!("embedded PostgreSQL will not create a database: {e}"))?;
@@ -114,6 +111,50 @@ impl PgServer {
             url: with_db(admin, &name),
         })
     }
+}
+
+/// An embedded server of the installed release, started on `port`, or on a free port
+/// for `0`; else the reason that it cannot be had.
+async fn started(port: u16) -> Result<PostgreSQL, String> {
+    let mut pg = PostgreSQL::new(Settings {
+        port,
+        ..settings()?
+    });
+    if let Err(e) = pg.setup().await {
+        return Err(format!("embedded PostgreSQL cannot be set up here: {e}"));
+    }
+    let asked = std::time::Instant::now();
+    if let Err(e) = pg.start().await {
+        let took = asked.elapsed();
+        return Err(format!(
+            "embedded PostgreSQL did not start: {e}{}",
+            start_evidence(&pg, took)
+        ));
+    }
+    Ok(pg)
+}
+
+/// What a failed start leaves behind, for the error to carry: how long `pg_ctl` ran, the
+/// port, and the server's own log. `pg_ctl` sends the server's output to `start.log` in
+/// the data directory, which goes when the server is dropped. On Windows
+/// `postgresql_commands` 0.22 does not read what `pg_ctl` itself prints, so its error
+/// there is `Command error: stdout=; stderr=` whatever the cause.
+fn start_evidence(pg: &PostgreSQL, took: std::time::Duration) -> String {
+    let data = &pg.settings().data_dir;
+    let log = match std::fs::read_to_string(data.join("start.log")) {
+        Ok(text) if text.trim().is_empty() => "start.log is empty".to_string(),
+        Ok(text) => format!("start.log:\n{}", text.trim_end()),
+        Err(e) => format!("start.log cannot be read: {e}"),
+    };
+    let pid_file = if data.join("postmaster.pid").exists() {
+        "present"
+    } else {
+        "absent"
+    };
+    format!(
+        "\npg_ctl ran for {took:?} on port {}; postmaster.pid is {pid_file}; {log}",
+        pg.settings().port
+    )
 }
 
 /// Makes database `name` on the server `admin` names, with tokio-postgres, which sets no
@@ -181,7 +222,34 @@ impl Drop for PgServer {
 
 #[cfg(test)]
 mod tests {
-    use super::with_db;
+    use super::{started, unavailable, with_db, PgServer};
+    use std::net::TcpListener;
+
+    /// The error of a start that fails says why, in the server's own words. The port is
+    /// held here on each loopback address, so the server finds no address to listen on.
+    #[tokio::test]
+    async fn a_start_that_fails_gives_the_log_of_the_server() {
+        // the release is installed by the first start, and where it cannot be, this skips
+        let Some(_installed) = PgServer::start().await.unwrap() else {
+            return;
+        };
+        let v4 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = v4.local_addr().unwrap().port();
+        // a host with no IPv6 loopback has no second address for the server either
+        let _v6 = TcpListener::bind(("::1", port));
+        let why = match started(port).await {
+            Ok(_) => panic!("a server started on port {port}, which this test holds"),
+            Err(why) if why.contains("did not start") => why,
+            // the setup failed before the start: as each test here takes it
+            Err(why) => {
+                assert!(unavailable(why).unwrap().is_none());
+                return;
+            }
+        };
+        assert!(why.contains("start.log:"), "{why}");
+        assert!(why.contains("could not bind"), "the server's reason: {why}");
+        assert!(why.contains(&format!("on port {port}")), "{why}");
+    }
 
     #[test]
     fn the_database_is_swapped_and_the_rest_kept() {
