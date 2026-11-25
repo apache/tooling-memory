@@ -56,8 +56,15 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Replay, in part.** Frozen-context replay is built: `amem replay` runs on the decision
   contexts that the egress records. Live re-execution is also built: `amem reenact` runs a
   prompted session again on its prompt, at its commit. A tape of what its memory tool
-  calls returned answers those calls, until the run diverges. These limits
-  apply:
+  calls returned answers those calls, until the run diverges. Each decision context and
+  each tape holds a replay manifest: the log offset of each domain, the policy version,
+  the grants and the session settings that the session began with. `amem reenact state`
+  compares the manifest with the record as it is now. A run that left its tape is marked
+  incomplete when that state moved. These limits apply:
+  - The manifest holds ids and log offsets. `amem` does not serve the record as it was
+    at an offset, so an incomplete run stays incomplete.
+  - The index checkpoint of the manifest is a count of entries for each domain. It holds
+    no screening state and no registry.
   - An interactive session has no prompt to run again.
   - The tape of a session that works a task does not yet carry the prompt of that task.
   - A session on a login that runs through a tunnel has no decision contexts, because the
@@ -106,7 +113,11 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Drift over many runs.** The detectors read answers and also metadata: fingerprint
   digests, flip rate, formats and refusals. Logprob divergence and change-point detection
   over many runs are missing. The probes run in each curation cycle with `--drift`,
-  against fixed thresholds.
+  against fixed thresholds. Confirmed drift opens a drift window for the destination and
+  the model, and the owner can open one by hand (`amem drift window`). The freeze is
+  built: nothing that an agent wrote inside a window is promoted. The freeze holds every
+  entry that an agent wrote inside a window, on any model. An entry records its session
+  and not its model, and the freeze does not read the session.
 - **Costing, in part.** `amem` measures and prices these (`amem cost`, `amem usage`, the
   evaluation):
   - tokens and calls
@@ -115,26 +126,89 @@ two weeks. It is also the reason that none of it is the production shape.
     session
 
   These are not built yet:
-  - the duration of a task, from claim to completion
   - accelerator time, which only the gateway can count
   - bytes stored
   - CPU or memory limits on the sandbox
 - **The task record, in part.** A claim has a generation, and the ledger refuses a
   holder that gives an earlier one. A task can be `blocked` on a task that it depends on.
-  A claim and a completion can carry an attempt key. These parts are not built: an
-  attempt key for the other operations, a block on a new claim
-  while an external effect is uncertain, and a `blocked` state for a task that waits on an
-  outside event. The generation does not prove who the caller is.
-- **Task definitions, in part, and autonomy levels.** A task can name a task definition.
+  A claim and a completion can carry an attempt key. A holder can give a task up until an
+  outside event comes, and a task with an external action that is not settled goes to no
+  other session. These parts are not built: an attempt key for the other operations, a
+  connector that makes external actions in sequence and settles them, and taps that
+  report the events. The generation does not prove who the caller is.
+- **Task definitions, in part.** A task can name a task definition.
   It then takes the checks of the definition, and its holder can call only the tools that
   the definition declares. Triage requires a definition only when the grants say so,
-  because the tasks that the system files name none. No suite gates a version of a
-  definition, and the data scope is not enforced. The autonomy level has no effect, and
-  there is no held-out suite and no evaluator.
-- **Positions.** There is no `position` entry, and a task cannot be pinned.
-- **Approval events.** An approval is the completion of a promotion task. It has no
-  scope and no expiry, and the perimeter does not check it when an action runs. There is
-  no `declassify` and no guard.
+  because the tasks that the system files name none. The data scope is not enforced.
+- **Positions, in part.** A verified entry of type `position` gives a standing role a
+  charter and an authority envelope, and a task can be pinned to that position. Only a
+  session that fills the position claims a pinned task, and that session gets the
+  position's commitments and handoff cache first in T0.
+
+  These parts are not built:
+  - the platform's standing roles as positions, made when a domain is registered
+  - a position that a curator proposes, and an unused position sent to its owner
+  - a session that the memory server starts when a pinned task is admitted: a launcher
+    with `--wake` starts it, and not on the `wslc` sandbox backend
+  - a record of a live session other than the lease that it holds, and one session in
+    a position at a time
+  - the position in the principal chain and in the input of the policy
+  - a tap that posts for a position
+  - a check that a `separation` pin names a position other than the author's
+  - the data scope of the authority envelope
+  - a version in force while its next version waits for review
+  - a retirement that a second person approves
+  - the pin on a retry of a pinned task
+  - the writes of a subagent kept out of the history of its parent's position
+  - a check on the entries that an import brings with a citation of a position
+- **Approvals, in part.** An approval is an event on the ledger. It names the person,
+  the action, the entry, the version, the principal that it is for, and an expiry. The
+  policy checks the approval when an erasure or a declassification runs. A
+  declassification lands a copy at the lower label. The copy cites the entry and names
+  the guard. The copy of a raw entry keeps the reach and the task of the entry. These
+  parts are not built:
+  - The copy of an approval in the event log of the domain names the approver, the
+    entry and the time. The action, the version, the scope and the expiry stay in the
+    event of the ledger.
+  - A copy at a lower label has no write event in the event log. Lineage does not name
+    the copy as made from its source. An erasure of the source withholds the copy,
+    because the copy cites the source.
+  - No approval gates an external action of a task, a change that leaves the fleet, or a
+    higher spend limit.
+  - A guard that is not the owner cannot approve, because the command line acts only as
+    the owner.
+  - The memory tool `approve` approves only in a session of a person, which the owner
+    starts with `amem serve --person`. Nobody authenticates there. Thus the tool is as
+    strong as the command line, and it stops an agent only when the harness is
+    confined.
+  - The erasure of a transcript makes no approval.
+- **The surface of Appendix A, in part.** `get` takes an address: an entry id, an id
+  with `#<anchor>` for one section, or an id with `@<version>` for one version. A fetch
+  carries the related entries, each with a weight. `search` takes filters by type,
+  lowest trust tier, author and time, and each hit has a snippet from the index. `recall`
+  takes the answer kind and the tokens in the context of the caller, and it plans the
+  size of the answer from them. `approve`, `approvals` and `export` are memory tools.
+  These parts are not built:
+  - No cheap model expands the query or ranks the hits again inside `search`.
+  - The size of a recall comes from the answer kind and the context of the caller only.
+    The model of the caller and the results of a recall suite do not change it.
+  - Nothing checks that the deputy kept its brief under the planned length. No replay
+    checks the choice that the read log holds.
+  - The weight of a related entry is the share of the searches that returned both
+    entries. It is not the share of the sessions that opened the second entry after the
+    first. A fetch never carries the body of a related entry.
+  - `approve` takes the sign-off task and an expiry. It does not take an action, a
+    version and a scope, because the task names them.
+  - A bundle that the `export` tool writes stays under the root. Nothing sends it to a
+    destination under the ceiling of that destination.
+  - `get` by version checks the creation time of the entry against the snapshot of a
+    session, and not the time that the version was written.
+  - `get` by version reads each earlier version of the entry to find one digest.
+  - `get` serves no version of a demoted entry. The archive reads only the current
+    version of such an entry.
+  - A citation names an entry for lineage only when the id starts with `mem-`.
+  - No audit counts the citations that name no version.
+  - `write` has no fast lane for a handoff.
 - **The rule lifecycle, in part.** `check_policy` gives all the rules in force for a
   domain. It does not select rules by the action. The lint reports a rule after its
   review date and an unused rule, from the full decision log and not from one review
@@ -160,7 +234,6 @@ two weeks. It is also the reason that none of it is the production shape.
   - No task is filed for a withheld entry.
   - The reads of a helper session count for its parent only through the entries that
     the helper wrote.
-  - An erasure does not go through an approval.
 - **Raw reach, in part.** Each entry has a reach: `chain`, `fleet` or `tap`. Each read
   filter has a raw reach: `chain`, `fleet` or `all`. By default, an agent reads the raw
   entries of its task chain and each raw entry whose reach is not `tap`. When a session
@@ -194,6 +267,9 @@ two weeks. It is also the reason that none of it is the production shape.
   - A session of the web launcher keeps the record for one request, as it keeps its
     session label.
   - A re-run from a tape does not restore the record.
+  - A session that read outside content can name the event that its task waits on, and
+    the id of an external action. Each is one token. The task does not become outside
+    content.
 - **Curation and audit, in part.** A demotion puts an entry behind a tombstone, and a
   person can restore the entry. An agent demotes only a dead entry, on a task of a curator
   or of the auditor. The convention checks cover freshness, ownership, cross-links and
@@ -212,6 +288,9 @@ two weeks. It is also the reason that none of it is the production shape.
     dispute.
   - Only a person records an outcome. A revert or a rejection in an outside tracker is
     not recorded.
+  - An outcome event and a work outcome are two records. An outcome event `rejected` or
+    `reverted` does not lower an autonomy level. A work outcome, and a verdict that
+    rejects the work, make no correction.
   - A correction that puts the method at fault ends as a task. No loop tests the proposed
     change.
   - The qualification calls a model only through a gateway key. Without a key, the
@@ -236,15 +315,116 @@ two weeks. It is also the reason that none of it is the production shape.
   and each of its memory calls and model calls is refused. A read that waits does not
   check again before it gives its answer. Some commands of the owner do not do the
   check. A grant has no expiry of its own.
-- **The improvement loop.** The only gate on a platform artifact is that a person
-  verifies it. There is no performance gate, no safety gate, and no check that a change
-  adds no permission.
-- **Measurement, in part.** `amem` computes four read metrics, cost and usage. The paper
-  names 21 metrics. Upkeep share, induced work and the landing queue are not built. The
-  only limit is a spend limit in tokens.
-- **The evaluation arms.** Act 6 compares memory with an empty record. The paper's five
-  arms, the paired seeds and the margin are not built. No scorecard is kept in the
-  platform domain.
+- **Autonomy and the improvement loop, in part.** Each version of a task definition
+  earns an autonomy level on a held-out suite, and a reverted or rejected task lowers the
+  level. A candidate version passes a safety gate and a performance gate, and repeated
+  refusals of one agent raise a probing alarm (demo act 7). These parts are open:
+  - The evaluator's check is a substring test. No model grades.
+  - `amem` does not run the scenarios. Nothing checks that a graded handoff was written
+    under the graded version.
+  - The level `review` compares principals. The server does not know the model or the
+    vendor of a session.
+  - A task that names no definition has no level.
+  - A reverted task stays `done`, and its dependents are not sent back.
+  - A work outcome comes from a person, not from a tap.
+  - A prompt, an agent definition and a harness setting have the review of a person
+    only, with no suite of their own. A ranking or rubric change has no canary.
+  - The safety gate compares tools, scope and declared autonomy. It runs no red-team
+    suite.
+  - Every session that reads the platform domain reads its raw entries.
+  - Probing counts refusals for each principal and clock hour against a fixed number. It
+    counts neither a lineage of several principals nor queries that walk the index.
+  - The owner at the command line reads the held-out suites and writes into every
+    domain.
+  - The server does not log a task that it hides as a refusal, so probing does not count
+    it.
+  - Two processes on one ledger can each make a check and then append. A raise can then
+    follow an outcome that it did not read, two outcomes can lower the level one step,
+    and a verdict can complete a task that was rejected in the same moment.
+  - The event log of the platform domain takes a copy of each definition record: the
+    version, who recorded it and the time, at the highest label. The level, the run and
+    the work outcome stay in the event of the ledger.
+  - The copy of a raise to the level `review` names nobody. The ledger does not record
+    who raised.
+  - The event of a completion on a verdict names nobody. No record says who accepted
+    the work.
+  - The definition records are not in a bundle.
+  - A lineage answer leaves out the event log of the held-out domain for a session that
+    does not read that domain. The answer does not say so.
+  - The sign-off for the highest level is a field of the ledger record, not an approval
+    event.
+- **Measurement, in part.** `amem metrics` prints the 21 rows of the metric table of the
+  paper and the published targets. `amem limits` lists the five limits, and a person
+  raises one with an approval. A change lands through a landing queue. These points
+  are still open:
+  - No log here answers these rows: the omissions in summaries, the entries that were
+    found but misleading, the agreement between reviewers, missed commitments, the cost
+    of verification, pinned tasks, and the queue of each position. The first two need a
+    model or paired replays. Missed commitments and the last two are about positions, and
+    this table reads no position.
+  - Only the command line gives the cost of a completed task. The memory server cannot
+    read the meter of the egress.
+  - The search latency is the only target that is measured. The other targets are
+    published, and nothing is measured against them.
+  - The memory server checks the share of throughput, the outbound rate and the share of
+    upkeep in its own code. No policy module decides them.
+  - A spend limit is raised by a change to the grants file, not by an approval.
+  - A session does not see its running cost. Nothing tells a principal that it used a
+    fraction of its spend limit.
+  - The share of upkeep counts tasks. It does not count tokens or time.
+  - The ceiling on upkeep holds at admission. It does not hold at the claim.
+  - A part of a person's task that an agent files and completes itself counts as
+    upkeep. The ceiling does not hold that part back at admission, because the root of
+    a task decides there.
+  - At the ceiling on upkeep, an agent is told that its task is not admitted. The
+    ceiling counts tasks that the agent possibly cannot read, so that answer tells the
+    agent one fact about them.
+  - Only a person at the command line gets the four rows of the metric table that come
+    from the read log. A line of the read log has no domain and no label, so no agent
+    session gets those rows.
+  - Two processes on one ledger can each count the claims of one agent and then claim.
+    The agent can then pass its share of throughput by one claim for each process.
+  - The count for the share of throughput reads every event of the domain at each claim
+    of an agent.
+  - Nothing sends a task to the landing queue of its domain. Its holder can complete
+    it, and then no person lands the change.
+  - A person lands a change at the command line. No tap reports a landing, and the
+    landing queue lands no change in a repository.
+  - A task that is queued for landing does not wait for the verdict of its task
+    definition.
+  - The price vector is a file under the root, with a version. It is not an entry of
+    the record. No setting is computed again when the price vector changes.
+  - Accelerator time and bytes stored are not measured.
+- **Evaluation, in part.** The five arms are built as session settings that only the
+  launcher gives (`amem launch --arm`). A plan fixes the arms, the seeds and the margin
+  before the runs. The scorer pairs each arm with the baseline across tasks and seeds,
+  checks the five replay traps, and keeps a scorecard in the platform domain
+  (`amem eval`, demo act 6). These parts are open:
+  - A run reads the record through a snapshot bound on the read filter. It does not get
+    a copy of the record as it was. An entry that was replaced or demoted after the
+    snapshot stays hidden, and a write of a run goes to the record.
+  - The raw-only arm leaves out each entry above raw. It does not serve the raw version
+    of a promoted entry.
+  - The disclosure depth has two values, T0 and full. A depth of summaries only is not
+    built.
+  - A seed is the number of a repeated run. Nothing passes it to the model.
+  - The only judge is the regular expression of each task. A judging model that is held
+    fixed is not built.
+  - The scorer takes success and cost from the caller. It does not read the cost from
+    the egress, and it does not charge the cost of writes and curation to an arm.
+  - An evaluation run is a launch. It is not a task in the platform domain with a budget
+    of its own, and `amem cost` counts it with production.
+  - The plan is a file with a digest. Nothing makes a person review a change to the
+    frozen task set.
+  - The demo's task set has no task with a recorded failure, so the survivorship trap
+    stays open and each verdict of the demo is inconclusive.
+  - The snapshot bounds entries and transcripts only. A run reads the tasks of the
+    ledger as they are now, so text that one run files as a task can reach a later run
+    in any arm. The leakage trap does not see this.
+  - The tape of a transcript-replay run does not hold the replayed text or its digest.
+  - The standing holdout is not built. A scorecard compares arms only, not a change of
+    model or of harness.
+  - The arm flags do not reach the `wslc` sandbox backend or `amem work`.
 - **Long timescales, in part.** The registry (`registry.toml`) names the unit and the
   owners of each domain, and `amem registry check` flags a domain with no owner. A write
   to a personal domain by another author is a proposal, which the owner admits, refuses
@@ -253,8 +433,11 @@ two weeks. It is also the reason that none of it is the production shape.
   outage, a session works from the T0 that it loaded, and its handoff waits on a queue
   (demo act 4). Each curation cycle files an evidence task for the horizon scanner of a
   unit. These parts are not built:
-  - The restore drill reports two of the five cases as absent: the cross-domain
-    dependency and the uncertain external action.
+  - The restore drill always reports one of the five cases as absent: the cross-domain
+    dependency. For the uncertain external action, the drill checks only that the
+    restored ledger holds the task back. No connector reconciles the action.
+  - A recovery bundle holds the drift windows as they were when it was made. A restore
+    does not take a drift window that was opened later.
   - Only the ledger refuses a claim of an earlier claim epoch. No tap and no outside
     tracker reads a generation.
   - The record is not encrypted. Thus there is no key for erased content to keep apart
@@ -264,6 +447,9 @@ two weeks. It is also the reason that none of it is the production shape.
     restore. The same command copies the refusal journal.
   - An erasure does not change a recovery bundle under the root. The receipt names each
     such bundle that holds the body, and a person deletes it.
+  - The erasure journal holds the receipts of entries only. A restore brings back a
+    transcript that was erased after the bundle was made, and the receipt of that erasure
+    names no recovery bundle.
   - The restore drill of a root with a PostgreSQL ledger is refused when two domains
     hold an event with the same number. The drill restores into a file ledger.
   - A recovery bundle that is made in the middle of a write can hold an event of the log
@@ -274,8 +460,9 @@ two weeks. It is also the reason that none of it is the production shape.
     ledger and for retrieval. In an outage, a tap and a spawn are refused, and nothing
     buffers them.
   - The owner of a root is compared as text. A person under an earlier identifier is not
-    the owner, although the registry check and the gate of a personal domain follow an
-    assertion.
+    the owner. These follow an assertion: the registry check, the gate of a personal
+    domain, and the rule that nobody gives the verdict on its own work. No other
+    comparison of two principals follows an assertion.
   - A change to the registry stops each open session, as a change to the grants does.
   - No clock runs the registry check, the restore drill or the schedule of the horizon
     scanner. A curation cycle or a command runs them.
@@ -341,6 +528,11 @@ These parts do what the paper says, on one laptop. Each item names what replaces
 - **Transcripts' citations**: `amem` finds them on every lookup, with a read of all the
   entries of a domain. It finds the citations that keep a tool's source past its clock
   in the same way.
+- **Positions**: `amem` reads every entry of type `position` in a domain to find the
+  position in force. It does this on each claim, each read, each tool call and each T0
+  of a session in a position.
+  A read of the handoff cache looks at the newest 200 handoffs of the domain only.
+  Production: a lookup in the index, by the name of the position and by citation.
 - **Tools** fetch and search in one of these ways:
   - from the launcher's own machine, with one compiled component for each call. The
     component connects to the address that the policy checked.
@@ -361,14 +553,16 @@ These parts do what the paper says, on one laptop. Each item names what replaces
   process tree only as far as each level reaps its children. Peak memory is that of the
   largest process, not the sum of the tree. Production: the per-key spend of the gateway,
   with each call tagged with its task and trace.
-- **The evaluation** is four questions, graded by regular expression, under four
-  conditions:
+- **The evaluation** is four questions, graded by regular expression. It runs them under
+  the five arms of a plan with two seeds, or under four older conditions:
   - with this memory
   - with an empty one
   - the bare harness
   - the bare harness with its own tools off
 
-  It runs on any number of harnesses, but on one model per run.
+  It runs on any number of harnesses, but on one model per run. A scorecard is JSON of
+  this project's own shape. Production: runs in a copy of the record at a snapshot, on a
+  budget of their own, with spans in the OpenTelemetry conventions for generative AI.
 - **The registry and the outage** are files that the owner edits or makes:
   `registry.toml` beside the grants, and `state/outage.json`. The claim epoch is a
   number in a file beside the root. Production: the registry in the identity system of
@@ -441,7 +635,7 @@ names another. The process touches nothing outside the root:
 | `grants.toml` | The perimeter's data: `security` for the authors in the security role, domains and their labels, destinations and their ceilings, `[gates]`, `[spend.<destination>]`, `[taps.<name>]` for taps and tools (`hosted` for a tool that a tool server serves), `platform = "<domain>"`, and `[ledger]` for PostgreSQL |
 | `credentials.env` | API keys, `LLMAO_KEY`, `GH_TOKEN`, as `NAME=value`, mode 600. The environment overrides this file |
 | `profiles.toml` | Named launches: harness, auth, model, subagents |
-| `prices.toml` | USD per million tokens per model, and per CPU-hour and GiB-hour under `[resources]`, for `amem cost` |
+| `prices.toml` | The price vector: USD per million tokens per model, and per CPU-hour and GiB-hour under `[resources]`, for `amem cost` and for a spend limit in money. It has a version: the key `version`, or the digest of the file |
 | `policy/*.rego` | Optional: replaces the built-in policy |
 | `record/<domain>/` | The entries, as Markdown with frontmatter. Nothing edits an entry in place. Beside them: `.history`, `.erasures`, `.transcripts`, `.contexts` and `.tapes` (re-enactment's tapes, which are the owner's alone) |
 | `state/` | Operational data. All of it is rebuildable, except the event log. It holds: `log/<domain>.jsonl`, the event log, which is the order of record that the index is rebuilt from; `index.db`, `ledger.db`, `telemetry.db`; the read, write and decision logs as JSONL; the quarantine; drift, replay and re-enactment runs |
@@ -518,13 +712,17 @@ claude mcp add memory -- /path/to/amem --root ~/memory serve --author "agent:cla
 ```
 
 The agent gets `t0`, `search`, `get`, `write`, `list`, `recall`, `promote`, the ledger's
-memory tools and `transcript_turn`. Its writes go in at raw trust, under the author that
+memory tools, `transcript_turn`, `settings` and `scorecards`. The owner also gets
+`score_evaluation`. Its writes go in at raw trust, under the author that
 you give. Such a harness has no sandbox, and its model calls do not go through an egress.
 The policy still decides what it reads and writes over MCP. But the harness keeps its own
 network and credentials. Nothing meters its model calls. No model's ceiling applies to
 what it may read. `amem launch --unconfined` is the middle case. At this time it is only
 for Claude Code and Codex. It gives no sandbox, but the model calls still go through the
-egress.
+egress. A harness with no sandbox has a shell on the host. From that shell, an agent can
+run `amem approve` as the owner, because nobody authenticates at the command line. It can
+also start `amem serve --person` and call `approve` there. Thus an approval stops an
+agent only when the harness is confined.
 
 ## The parts, and their commands
 
@@ -534,20 +732,25 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 
 | Part | What it does | Commands |
 |---|---|---|
-| The read path | T0, BM25 search with summaries first, one body on `get`, recall as a cited brief or a pack, prefetch on claim and at fetch | `t0`, `search`, `get`, `list`, `recall`, `write` |
-| The task fabric | Tasks with leases and handoffs. A rubric from the L1 strategy ranks along the ledger's edges, at admission and in the triage cycle. Workers only claim. Subagents go on the board as children, with a continuation | `task create, admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` |
+| The read path | T0, BM25 search with summaries first, filters and a snippet for each hit. One body on `get`, or one section or one version of it by address, with the related entries and their weights. Recall as a cited brief or a pack, sized from the answer kind and the context of the caller. Prefetch on claim and at fetch | `t0`, `search` (with `--type`, `--min-tier`, `--author`, `--since`), `get` (`<id>`, `<id>#<anchor>`, `<id>@<version>`, `--json`), `list`, `recall` (with `--answer-kind`, `--context-tokens`), `write` |
+| The task fabric | Tasks with leases and handoffs. A rubric from the L1 strategy ranks along the ledger's edges, at admission and in the triage cycle. Workers only claim. Subagents go on the board as children, with a continuation | `task create` (with `--position` and `--pin-reason` for a pinned task), `task admit, claim-next, complete, release, tree, retry, rescore, stats`, `work` (with `--position` or `--wake` for a session in a position) |
+| Positions | A standing role as a verified entry: a charter and an authority envelope. A task pinned to a position goes only to a session that fills it. That session gets the position's commitments and handoff cache first in T0. A session under another agent definition is seconded. The owner retires a position | `position list, show, retire`, `write --kind position`, `serve --position`; MCP `position`, `positions`, `retire_position` |
 | Trust tiers | Raw, curated, verified. Only a person who did not propose an entry can make it verified. Review clocks and decay. Raw reach: a raw entry from a session that read outside content is served only to its task chain, to triage and to curators | `promote`, `approve`; `reach` and `task` in the answers of `write`, `search` and `get` |
+| Approvals | An erasure and a declassification run only under an approval: a person approves one action on one version of one entry, for one principal, until an expiry. An action without an approval is refused, and a sign-off task asks the owner or the guard | `approve`, `approvals`, `declassify`, `erase`, `serve --person`; MCP `erase`, `declassify`, `approvals`, and `approve` in a session of a person |
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine` |
 | The curator | A survey of what needs curation, an independent auditor, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `curator`, `curate`, `audit`, `canary` |
 | The duties of the curator and the auditor | Demotion of a dead entry behind a tombstone, and its restore. Convention checks, each failure a task. Outcome events on a task, and corrections for a curator. Overlapping rules and repeated work. The qualification of the auditor on planted cases, and its mode. A curation against the entries that it cites, entries tested together, and a sample of handoffs | `demote`, `restore`, `dead`, `conventions`, `task outcome, outcomes`, `corrections`, `policy curate`, `auditor mode, qualify, case, together, handoffs`; MCP `demote`, `restore`, `dead`, `check_conventions`, `record_outcome`, `outcomes`, `corrections`, `policy_curation`, `auditor_mode`, `curation_case`, `test_together` |
 | The egress | It forwards, meters and times model calls, holds spend limits per destination, and records decision contexts. It keeps the wall clock, CPU and peak memory of each session beside the session's tokens | `launch`, `usage`, `cost` |
-| Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
+| Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned. A replay manifest on each decision context and tape, and the replay state of a tape | `transcript`, `replay`, `reenact run, report, state, tapes, show, pin, unpin` |
 | The event log | Each write, read and send goes into the append-only log of its domain, with a label, and with ids and digests only. The log feeds the index, against a bound of 60 seconds. A materializer builds the index again from the log and replays the ledger's events. Lineage reads the log back and forward. An erasure withholds the entries that are one step forward. The log marks each event of a session that read outside content | `log show, feed, freshness, materialize, outside`, `lineage`, `withheld list, release`; MCP `log`, `lineage`, `outside_readers` |
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain. They load only after a person verifies them | `platform list, show`, `golden --platform` |
 | Long timescales | Dated identifiers and the registry of units, owners and personal domains, with its check. Proposals to a personal domain. A recovery bundle, its restore with the erasure journal and a claim epoch, and the restore drill. A declared outage, in which a session works from its loaded T0 and its handoff waits on a queue. Evidence tasks for the horizon scanner | `registry check, resolve`, `proposal list, admit, refuse, expire`, `recover bundle, journal, drill, restore`, `outage status, declare, end`, `horizon schedule` |
-| Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
-| Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory | `savings`, `golden`, `scripts/eval.py` |
-| Interchange | Bundles at or below a label, erasure with a stub and a receipt, and taps as WASI components | `export`, `import`, `erase`, `tap` |
+| Autonomy levels | Each version of a task definition has a level: `person`, `review` or `checks`. Work that is handed in below `checks` waits for a verdict. The evaluator grades handoffs on a held-out suite, and a passed run lets the level go up one step. A work outcome puts it down one step. A candidate version passes a safety gate and a performance gate. Repeated refusals of one agent are a probing alarm of the curator | `task verdict, outcome`, `platform level, grade, raise, gates`, `curator --telemetry`; MCP `verdict`, `autonomy`, `grade`, `raise_autonomy`, `candidate_gates` |
+| Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector. Confirmed drift opens a drift window, and nothing that an agent wrote inside a window is promoted | `drift probe`, `drift check`, `drift window open, close, list` |
+| Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory. The metric table of the paper with its targets, and the times of a task | `savings`, `golden`, `scripts/eval.py`, `metrics`, `task times`; MCP `metrics`, `task_times` |
+| Limits and landing | The five limits, each in its own unit, and the raise of a limit by an approval. A landing queue, in which the change of a task waits until a person lands it | `limits`, `limits raise`, `task queue-landing`, `landing show, land`; MCP `limits`, `landing`, `queue_landing` |
+| Evaluation | The five arms as session settings that the launcher gives. A plan with a margin and seeds, runs paired with a baseline arm, the replay traps, and a scorecard kept in the platform domain | `eval arms, plan, score, scorecards`, `launch --arm --as-of --eval-plan --eval-task --eval-seed`, `serve --arm --as-of`, `scripts/eval.py`; MCP `settings`, `scorecards`, `score_evaluation` |
+| Interchange | Bundles at or below a label, erasure with a stub and a receipt, and taps as WASI components. An export without a destination stays under the root, and its answer names no entry | `export`, `import`, `erase`, `tap`; MCP `export` |
 | Tools | Fetch and search as taps that an agent calls in a turn. The policy decides every request at the session label. The answers are scanned and kept as sources. Or hosted: a tool server serves the same components, and another launcher calls it through its egress. This path reaches only the hosts that the calling session may reach, and says where it went. The source keeps that | `tool`, `source`, `tool-server`; MCP `fetch`, `web_search` |
 | Gofannon | Its deployed agents as a tool tap on the same terms: listed, run and read back. Also a worker that runs one of them on the ledger's tasks and files its result as the handoff | `gofannon agents`, `gofannon work`; MCP `gofannon` |
 | Traces | OpenTelemetry spans for model calls, reads, policy decisions and task transitions, to any OTLP collector | `OTEL_EXPORTER_OTLP_ENDPOINT` |
@@ -557,11 +760,15 @@ From the command line:
 ```sh
 echo "Stopped at step 3. Next: digests." | amem write --kind handoff --title "Import, step 3"
 amem search digests
+amem search digests --type handoff --since 2026-11-01T00:00:00Z
 amem get mem-me-xxxxxxxx
+amem get mem-me-xxxxxxxx#decision          # one section, by its anchor
+amem get mem-me-xxxxxxxx --json            # with its version and the related entries
 amem task create "Finish the import" --priority 5
 amem task admit task-me-xxxxxxxx
 amem work --harness claude                 # claim the top task, run the harness on it
 amem recall "how does the import retry?" --provider anthropic
+amem recall "how does the import retry?" --answer-kind fact --context-tokens 120000
 amem curate --auth gateway --contradictions  # one curation cycle
 amem quarantine list
 amem lineage mem-me-xxxxxxxx               # what was written and sent after a read of a bad entry
@@ -572,6 +779,10 @@ amem reenact report <session>              # each harness and model against the 
 amem cost                                  # spend, wall clock, CPU and memory per session and task
 amem savings                               # the paper's read-path claims, measured
 amem savings --judge-provider anthropic   # with a small model judging what was "used"
+amem metrics                               # the paper's metric table and its targets
+amem limits                                # the five limits, each in its own unit
+amem limits raise upkeep --to 40           # your approval raises a limit for 24 hours
+amem landing show main                     # the changes that wait to land
 ```
 
 `crates/memory/tests/cli.rs` runs the paper's first milestone from end to end against the
@@ -612,15 +823,20 @@ It says what is missing and how to fix it. At the end, it shows the command to r
    in at curated. A person approves an entry for verified.
 3. **The perimeter.** The policy holds in quarantine a write that speaks to agents. Then
    lineage from the event log, policy as memory with a scoped exception, and the read
-   filter. A spend limit refuses a call.
-4. **The task fabric.** The rubric, compiled from a strategy. A rescore along the edges.
-   Subagents go on the board. A follow-up task brings back their reports, and its
-   completion closes the task that delegated.
-5. **Watching it.** Traces in a collector, the read metrics, drift probes, transcripts by
-   citation, and replay.
-6. **Memory against no memory.** The same questions go to a harness with memory and with
-   an empty one. The demo grades and times the answers, and counts them in tokens, CPU and
-   memory.
+   filter. An erasure and a copy at a lower label wait for a person's approval of one
+   version. A spend limit refuses a call.
+4. **The task fabric.** The rubric, compiled from a strategy. A position, a task pinned
+   to it, a seconded session and a retirement. A rescore along the edges. Subagents go on
+   the board. A follow-up task brings back their reports, and its completion closes the
+   task that delegated.
+5. **Watching it.** Traces in a collector, the read metrics, the metric table of the
+   paper, the limits with a ceiling on upkeep and a landing queue, drift probes,
+   transcripts by citation, and replay. Then the freeze: a drift window, and a promotion
+   that it stops.
+6. **The evaluation.** The five arms, and one question under each arm. A plan that fixes
+   the margin and the seeds. Then the same questions go to a harness under each arm. The
+   demo grades the answers, counts their tokens, and keeps a scorecard with the replay
+   traps.
 7. **The platform.** An agent definition, an eval suite and a default model as entries in
    a platform domain. They load only after a person verifies them. A harness works a task
    under the definition. The demo scores the suite and gives the cost of the run in every

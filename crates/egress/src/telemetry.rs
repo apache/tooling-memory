@@ -3,6 +3,7 @@
 //! elsewhere, and under a subscription the price is notional.
 
 use crate::usage::Usage;
+pub use dm_policy::prices::Tokens;
 use rusqlite::{params, Connection};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -464,6 +465,58 @@ impl Telemetry {
         Ok(u64::try_from(n).unwrap_or(0))
     }
 
+    /// Tokens of metered calls at a destination, by model and class: by one session, or
+    /// since a time, or both. What the spend limits in money are priced from. A call on
+    /// a harness's own login is plan quota and is not counted.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub fn spent_by_model(
+        &self,
+        destination: &str,
+        session: Option<&str>,
+        since: Option<OffsetDateTime>,
+    ) -> Result<Vec<(String, Tokens)>, Error> {
+        let conn = lock(&self.conn);
+        let mut stmt = conn.prepare(
+            "SELECT COALESCE(model, '?'), at, input_tokens, output_tokens, cache_read, cache_write
+             FROM usage
+             WHERE destination = ?1 AND (?2 IS NULL OR session = ?2) AND billing <> ?3
+               AND COALESCE(model, '') NOT LIKE 'http %'",
+        )?;
+        let rows = stmt.query_map(params![destination, session, BILLING_PLAN], |r| {
+            let model: String = r.get(0)?;
+            let at: String = r.get(1)?;
+            let u = |i: usize| -> rusqlite::Result<u64> {
+                Ok(u64::try_from(r.get::<_, Option<i64>>(i)?.unwrap_or(0)).unwrap_or(0))
+            };
+            let t = Tokens {
+                input: u(2)?,
+                output: u(3)?,
+                cache_read: u(4)?,
+                cache_write: u(5)?,
+            };
+            Ok((model, at, t))
+        })?;
+        let mut by: std::collections::BTreeMap<String, Tokens> = std::collections::BTreeMap::new();
+        for row in rows {
+            let (model, at, t) = row?;
+            // the stored text has a varying number of digits in its fraction of a
+            // second, so the time is parsed and not compared as text
+            let within =
+                since.is_none_or(|s| OffsetDateTime::parse(&at, &Rfc3339).is_ok_and(|a| a >= s));
+            if within {
+                let sum = by.entry(model).or_default();
+                sum.input += t.input;
+                sum.output += t.output;
+                sum.cache_read += t.cache_read;
+                sum.cache_write += t.cache_write;
+            }
+        }
+        Ok(by.into_iter().collect())
+    }
+
     /// Totals by destination and model, most tokens first.
     ///
     /// # Errors
@@ -600,6 +653,59 @@ fn trace(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metered_tokens_are_summed_by_model_and_class_inside_the_window() {
+        let t = Telemetry::in_memory().unwrap();
+        let u = |model: &str| Usage {
+            model: Some(model.into()),
+            input_tokens: 10,
+            output_tokens: 5,
+            cache_read_tokens: 2,
+            cache_write_tokens: 1,
+        };
+        t.record(SystemTime::now(), "s1", "d", 200, &u("m"))
+            .unwrap();
+        t.record(SystemTime::now(), "s2", "d", 200, &u("m"))
+            .unwrap();
+        t.record(SystemTime::now(), "s1", "d", 200, &u("n"))
+            .unwrap();
+        // what a harness reports about itself is plan quota, and another destination
+        // is not this one
+        t.record_reported("s1", "d", &u("m")).unwrap();
+        t.record(SystemTime::now(), "s1", "other", 200, &u("m"))
+            .unwrap();
+        let sum = |n: u64| Tokens {
+            input: 10 * n,
+            output: 5 * n,
+            cache_read: 2 * n,
+            cache_write: n,
+        };
+        assert_eq!(
+            t.spent_by_model("d", None, None).unwrap(),
+            [("m".to_string(), sum(2)), ("n".to_string(), sum(1))]
+        );
+        assert_eq!(
+            t.spent_by_model("d", Some("s2"), None).unwrap(),
+            [("m".to_string(), sum(1))]
+        );
+        // a call of two days ago, stored with no fraction of a second
+        lock(&t.conn)
+            .execute(
+                "UPDATE usage SET at = ?1 WHERE session = 's2'",
+                params![(OffsetDateTime::now_utc() - time::Duration::days(2))
+                    .replace_nanosecond(0)
+                    .unwrap()
+                    .format(&Rfc3339)
+                    .unwrap()],
+            )
+            .unwrap();
+        let day_ago = OffsetDateTime::now_utc() - time::Duration::days(1);
+        assert_eq!(
+            t.spent_by_model("d", None, Some(day_ago)).unwrap(),
+            [("m".to_string(), sum(1)), ("n".to_string(), sum(1))]
+        );
+    }
 
     #[test]
     fn records_and_sums() {

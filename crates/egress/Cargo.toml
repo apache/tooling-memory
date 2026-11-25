@@ -12,6 +12,7 @@ axum = "0.8"
 bytes = "1.12.1"
 dm-core = { version = "0.1.0", path = "../core" }
 dm-otel = { version = "0.1.0", path = "../otel" }
+dm-policy = { version = "0.1.0", path = "../policy" }
 dm-server = { version = "0.1.0", path = "../server" }
 futures-util = "0.3.34"
 hyper = { version = "1", features = ["client", "http1"] }
@@ -33,7 +34,6 @@ libc = "0.2.189"
 workspace = true
 
 [dev-dependencies]
-dm-policy = { version = "0.1.0", path = "../policy" }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 opentelemetry_sdk = { version = "0.33", default-features = false, features = ["trace", "testing"] }
 tempfile = "3.27.0"

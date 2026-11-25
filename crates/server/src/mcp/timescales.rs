@@ -83,7 +83,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "For the owner; refused to any other author. Answer a proposal to a personal domain. With `admit` true, the proposal goes into the record as it was written, with its author. With `admit` false, the proposal is removed, and the same proposal is not held again."
+        description = "For the owner, in a session that a person started with `amem serve --person`; refused to any other author and in every session that a harness reaches. Answer a proposal to a personal domain. With `admit` true, the proposal goes into the record as it was written, with its author. With `admit` false, the proposal is removed, and the same proposal is not held again."
     )]
     async fn answer_proposal(
         &self,
@@ -118,7 +118,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "For the owner; refused to any other author. Make a recovery bundle of this root in a new directory under `state/recovery/`: the record, the logs with their cursors, the events of the ledger, the writes held in quarantine and the configuration, with a digest for each file. Returns the `name` of the bundle, its path relative to the root, and the counts of the manifest. Copy the bundle off this machine yourself: no tool sends it."
+        description = "For the owner; refused to any other author. Make a recovery bundle of this root in a new directory under `state/recovery/`: the record, the logs with their cursors, the events of the ledger, the writes held in quarantine, the drift windows and the configuration, with a digest for each file. Returns the `name` of the bundle, its path relative to the root, and the counts of the manifest. Copy the bundle off this machine yourself: no tool sends it."
     )]
     async fn recovery_bundle(&self, _p: Parameters<NoParams>) -> Result<CallToolResult, McpError> {
         let made = self.memory.recovery_bundle_here().await.map_err(mcp_err)?;
@@ -159,6 +159,34 @@ mod tests {
     fn server_of(dir: &Path, author: &str) -> McpServer {
         let memory = Memory::open(dir).unwrap().with_author(author);
         McpServer::new(Arc::new(memory))
+    }
+
+    /// A server for the session of the owner in person: no harness is behind it.
+    fn person_of(dir: &Path) -> McpServer {
+        McpServer::for_person(Arc::new(Memory::open(dir).unwrap()))
+    }
+
+    /// A session of a person has each tool that a session of a harness has.
+    #[test]
+    fn a_session_of_a_person_has_the_tools_for_the_long_timescales() {
+        let dir = tempfile::tempdir().unwrap();
+        Memory::init(dir.path(), OWNER, "dom-me").unwrap();
+        let names = |s: &McpServer| -> Vec<String> {
+            let mut names: Vec<String> = s
+                .tool_router
+                .list_all()
+                .iter()
+                .map(|t| t.name.to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        let person = names(&person_of(dir.path()));
+        assert!(
+            person.contains(&"answer_proposal".to_string()),
+            "{person:?}"
+        );
+        assert_eq!(person, names(&server_of(dir.path(), OWNER)));
     }
 
     /// A root with the registry `text`: the directory, and the owner's server.
@@ -278,6 +306,15 @@ mod tests {
         let (one, two) = (library[0].id.as_str(), library[1].id.as_str());
         let refused = agent.answer_proposal(answer(one, true)).await.unwrap_err();
         refused_with(&refused, "only the owner");
+        // a harness reaches the session of the owner that the memory server serves, so
+        // an agent may have asked: that session answers no proposal, with yes or with no
+        for admit in [true, false] {
+            let refused = owner.answer_proposal(answer(one, admit)).await.unwrap_err();
+            refused_with(&refused, "answers no proposal");
+        }
+        assert_eq!(owner.memory.proposals().unwrap().len(), 2);
+        assert!(owner.memory.get(one).await.is_err());
+        let owner = person_of(dir.path());
         let admitted = payload(&owner.answer_proposal(answer(one, true)).await.unwrap());
         assert_eq!(admitted["admitted"], true);
         assert_eq!(admitted["written"]["id"], one);

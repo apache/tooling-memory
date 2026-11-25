@@ -81,6 +81,11 @@ pub enum Action {
     /// Send a tool's outbound request: a fetch or a search, every redirect hop asked
     /// again.
     Fetch,
+    /// Approve an action that runs only under an approval: an erasure, a
+    /// declassification.
+    Approve,
+    /// Copy an entry to a lower label.
+    Declassify,
 }
 
 /// How a task is being filed.
@@ -164,6 +169,19 @@ pub struct SpendInput {
     pub session_tokens: u64,
     /// Tokens the root has spent there in the last day.
     pub day_tokens: u64,
+    /// US cents this session has spent there, on metered calls, as the price vector
+    /// prices them.
+    #[serde(default)]
+    pub session_cents: u64,
+    /// US cents the root has spent there in the last day.
+    #[serde(default)]
+    pub day_cents: u64,
+    /// The metered models with tokens that the price vector does not price.
+    #[serde(default)]
+    pub unpriced: Vec<String>,
+    /// The version of the price vector that priced the cents.
+    #[serde(default)]
+    pub prices: String,
 }
 
 /// A tool's outbound request, as the host is about to send it.
@@ -192,6 +210,45 @@ pub struct FetchInput {
     pub label: dm_core::Label,
     /// Which request of the call this is: 0 for the first, then one per redirect.
     pub hop: u32,
+}
+
+/// An action that runs only under an approval, and the approvals the ledger holds for
+/// it. For `erase` and `declassify` it is the action asked for. For `approve` it is the
+/// action that the caller wants to approve.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct ApprovalInput {
+    /// The action: `erase` or `declassify`.
+    pub of: String,
+    /// The entry the action is on.
+    pub target: String,
+    /// The version of the entry now, as the service computed it: the digest of its text.
+    pub version: String,
+    /// The label the entry has, for `declassify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<dm_core::Label>,
+    /// The label asked for, for `declassify`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<dm_core::Label>,
+    /// The approvals on the ledger for this action and this entry.
+    #[serde(default)]
+    pub events: Vec<ApprovalEvent>,
+}
+
+/// One approval on the ledger, as the policy reads it.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ApprovalEvent {
+    /// The approval's id.
+    pub id: String,
+    /// Who approved.
+    pub principal: String,
+    /// The class of who approved.
+    pub class: Class,
+    /// The version of the entry that was approved.
+    pub version: String,
+    /// The principal that may run the action under the approval.
+    pub scope: String,
+    /// Whether the approval is past its expiry, on the ledger's clock.
+    pub expired: bool,
 }
 
 /// One request.
@@ -227,6 +284,10 @@ pub struct Input {
     /// The spend, for `spend`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spend: Option<SpendInput>,
+    /// The action that needs an approval and the approvals it has, for `erase`,
+    /// `declassify` and `approve`. An `erase` without it is the owner's alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ApprovalInput>,
 }
 
 /// Who has to look before this goes further.
@@ -901,6 +962,7 @@ mod tests {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })
         .unwrap()
     }
@@ -929,6 +991,7 @@ mod tests {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })
         .unwrap()
     }
@@ -994,6 +1057,7 @@ mod tests {
                 held_task: None,
                 spend: None,
                 fetch: None,
+                approval: None,
             })
             .unwrap();
         assert!(!d.allow, "{d:?}");
@@ -1043,6 +1107,7 @@ mod tests {
                 held_task: None,
                 spend: None,
                 fetch: None,
+                approval: None,
             })
             .unwrap()
         };
@@ -1074,11 +1139,280 @@ mod tests {
                 held_task: None,
                 spend: None,
                 fetch: None,
+                approval: None,
             })
             .unwrap()
         };
         assert!(ask(Class::Owner).allow);
         assert!(!ask(Class::Agent).allow);
+    }
+
+    const OWNER: &str = "human:test:me";
+    const GUARD: &str = "human:test:guard";
+    const ASKER: &str = "agent:test:asker";
+
+    /// The grants with a guard named for the domain.
+    fn guarded() -> Grants {
+        let mut g = grants();
+        g.domains
+            .get_mut("dom-t")
+            .map(|d| d.guard = Some(GUARD.into()))
+            .unwrap_or_default();
+        g
+    }
+
+    /// An approval that holds for an erasure the asker runs: the owner gave it, for the
+    /// version `d1`, to the asker, and it has not expired.
+    fn approval_event() -> ApprovalEvent {
+        ApprovalEvent {
+            id: "apr-t-1".into(),
+            principal: OWNER.into(),
+            class: Class::Owner,
+            version: "d1".into(),
+            scope: ASKER.into(),
+            expired: false,
+        }
+    }
+
+    fn approval_of(of: &str, events: Vec<ApprovalEvent>) -> ApprovalInput {
+        ApprovalInput {
+            of: of.into(),
+            target: "mem-t-1".into(),
+            version: "d1".into(),
+            from: None,
+            to: None,
+            events,
+        }
+    }
+
+    fn under(g: &Grants, action: Action, who: (&str, Class), approval: ApprovalInput) -> Decision {
+        Policy::builtin(g)
+            .unwrap()
+            .decide(&Input {
+                action,
+                principal: Principal {
+                    id: who.0.into(),
+                    class: who.1,
+                },
+                domain: "dom-t".into(),
+                approval: Some(approval),
+                ..read_input(Class::Agent)
+            })
+            .unwrap()
+    }
+
+    /// An erasure the asker runs, with these approvals on the ledger.
+    fn erase_under(events: Vec<ApprovalEvent>) -> Decision {
+        under(
+            &grants(),
+            Action::Erase,
+            (ASKER, Class::Agent),
+            approval_of("erase", events),
+        )
+    }
+
+    /// A declassification from restricted to internal that the asker runs.
+    fn declassify_under(g: &Grants, events: Vec<ApprovalEvent>) -> Decision {
+        let approval = ApprovalInput {
+            from: Some(dm_core::Label::Restricted),
+            to: Some(dm_core::Label::Internal),
+            ..approval_of("declassify", events)
+        };
+        under(g, Action::Declassify, (ASKER, Class::Agent), approval)
+    }
+
+    fn approve(g: &Grants, who: (&str, Class), of: &str) -> Decision {
+        under(g, Action::Approve, who, approval_of(of, Vec::new()))
+    }
+
+    #[test]
+    fn an_erasure_with_no_approval_is_refused_and_goes_to_the_approver() {
+        let d = erase_under(Vec::new());
+        assert!(!d.allow && d.review == Review::Approver, "{d:?}");
+        assert!(
+            d.reason.contains("an approval of human:test:me") && d.reason.contains("mem-t-1"),
+            "{d:?}"
+        );
+        // the owner too, when the service asks with the approvals: none is on the ledger
+        let owner = under(
+            &grants(),
+            Action::Erase,
+            (OWNER, Class::Owner),
+            approval_of("erase", Vec::new()),
+        );
+        assert!(
+            !owner.allow && owner.review == Review::Approver,
+            "{owner:?}"
+        );
+    }
+
+    #[test]
+    fn an_erasure_runs_under_the_owner_s_approval_of_this_version() {
+        let d = erase_under(vec![approval_event()]);
+        assert!(d.allow && d.review == Review::None, "{d:?}");
+    }
+
+    #[test]
+    fn an_approval_of_another_version_permits_nothing() {
+        let d = erase_under(vec![ApprovalEvent {
+            version: "d0".into(),
+            ..approval_event()
+        }]);
+        assert!(!d.allow && d.review == Review::Approver, "{d:?}");
+        assert!(d.reason.contains("another version"), "{d:?}");
+        // one of this version beside it permits the erasure
+        let both = erase_under(vec![
+            ApprovalEvent {
+                version: "d0".into(),
+                ..approval_event()
+            },
+            approval_event(),
+        ]);
+        assert!(both.allow, "{both:?}");
+    }
+
+    #[test]
+    fn an_expired_approval_permits_nothing() {
+        let d = erase_under(vec![ApprovalEvent {
+            expired: true,
+            ..approval_event()
+        }]);
+        assert!(!d.allow && d.review == Review::Approver, "{d:?}");
+        assert!(!d.reason.contains("another version"), "{d:?}");
+    }
+
+    #[test]
+    fn an_approval_given_to_another_principal_permits_nothing() {
+        let d = erase_under(vec![ApprovalEvent {
+            scope: "agent:test:other".into(),
+            ..approval_event()
+        }]);
+        assert!(!d.allow && d.review == Review::Approver, "{d:?}");
+    }
+
+    #[test]
+    fn an_approval_that_no_person_gave_permits_nothing() {
+        for class in [Class::Agent, Class::Tap, Class::System] {
+            let d = erase_under(vec![ApprovalEvent {
+                class,
+                ..approval_event()
+            }]);
+            assert!(!d.allow && d.review == Review::Approver, "{class:?} {d:?}");
+        }
+    }
+
+    #[test]
+    fn an_approval_of_a_person_who_is_not_the_approver_permits_nothing() {
+        let d = erase_under(vec![ApprovalEvent {
+            principal: "human:test:other".into(),
+            class: Class::Human,
+            ..approval_event()
+        }]);
+        assert!(!d.allow && d.review == Review::Approver, "{d:?}");
+    }
+
+    #[test]
+    fn an_erasure_does_not_run_under_the_approvals_of_another_action() {
+        let d = under(
+            &grants(),
+            Action::Erase,
+            (ASKER, Class::Agent),
+            approval_of("declassify", vec![approval_event()]),
+        );
+        assert!(!d.allow, "{d:?}");
+    }
+
+    #[test]
+    fn a_declassification_runs_under_the_approval_of_the_guard() {
+        let by_guard = ApprovalEvent {
+            principal: GUARD.into(),
+            class: Class::Human,
+            ..approval_event()
+        };
+        let d = declassify_under(&guarded(), vec![approval_event()]);
+        assert!(
+            !d.allow && d.review == Review::Approver,
+            "the owner's: {d:?}"
+        );
+        assert!(d.reason.contains(GUARD), "{d:?}");
+        let d = declassify_under(&guarded(), vec![by_guard.clone()]);
+        assert!(d.allow, "the guard's: {d:?}");
+        // no guard in the grant: the owner is the guard, and nobody else
+        let d = declassify_under(&grants(), vec![approval_event()]);
+        assert!(d.allow, "{d:?}");
+        let d = declassify_under(&grants(), vec![by_guard]);
+        assert!(!d.allow, "{d:?}");
+        let d = declassify_under(&grants(), Vec::new());
+        assert!(!d.allow && d.review == Review::Approver, "{d:?}");
+    }
+
+    #[test]
+    fn a_declassification_to_the_same_or_a_higher_label_is_refused_whatever_was_approved() {
+        use dm_core::Label::{Internal, Public, Restricted};
+        let ask = |from, to| {
+            let approval = ApprovalInput {
+                from,
+                to,
+                ..approval_of("declassify", vec![approval_event()])
+            };
+            under(
+                &grants(),
+                Action::Declassify,
+                (ASKER, Class::Agent),
+                approval,
+            )
+        };
+        for (from, to) in [
+            (Internal, Internal),
+            (Internal, Restricted),
+            (Public, Public),
+            (Public, Restricted),
+        ] {
+            let d = ask(Some(from), Some(to));
+            assert!(!d.allow && d.review == Review::None, "{from} {to} {d:?}");
+            assert!(d.reason.contains("not lower"), "{d:?}");
+        }
+        assert!(!ask(None, Some(Public)).allow, "no label to lower from");
+        assert!(!ask(Some(Restricted), None).allow, "no label asked for");
+        assert!(ask(Some(Restricted), Some(Public)).allow);
+        assert!(ask(Some(Internal), Some(Public)).allow);
+    }
+
+    #[test]
+    fn an_approval_is_a_person_s_to_give() {
+        // a session that carries the owner's name is still no person
+        for (id, class) in [
+            (OWNER, Class::Agent),
+            (ASKER, Class::Agent),
+            ("tap:github-issues", Class::Tap),
+            ("curation", Class::System),
+        ] {
+            for of in ["erase", "declassify"] {
+                let d = approve(&grants(), (id, class), of);
+                assert!(!d.allow, "{id} {class:?} {of} {d:?}");
+                assert!(d.reason.contains("a person's"), "{d:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_owner_approves_an_erasure() {
+        let d = approve(&guarded(), (GUARD, Class::Human), "erase");
+        assert!(!d.allow, "{d:?}");
+        assert!(d.reason.starts_with(OWNER), "names the approver: {d:?}");
+        assert!(approve(&guarded(), (OWNER, Class::Owner), "erase").allow);
+    }
+
+    #[test]
+    fn the_guard_approves_a_declassification_and_the_owner_where_none_is_named() {
+        let d = approve(&guarded(), (OWNER, Class::Owner), "declassify");
+        assert!(!d.allow, "{d:?}");
+        assert!(d.reason.starts_with(GUARD), "names the approver: {d:?}");
+        assert!(approve(&guarded(), (GUARD, Class::Human), "declassify").allow);
+        assert!(approve(&grants(), (OWNER, Class::Owner), "declassify").allow);
+        assert!(!approve(&grants(), (GUARD, Class::Human), "declassify").allow);
+        let d = approve(&grants(), (OWNER, Class::Owner), "verify");
+        assert!(!d.allow, "no rule gives that approval: {d:?}");
     }
 
     fn read_input(class: Class) -> Input {
@@ -1097,6 +1431,7 @@ mod tests {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         }
     }
 
@@ -1284,6 +1619,7 @@ mod tests {
             held_task: held.map(str::to_string),
             spend: None,
             fetch: None,
+            approval: None,
         }
     }
 
@@ -1749,6 +2085,7 @@ mod tests {
             crate::SpendLimit {
                 session_tokens: Some(1000),
                 day_tokens: Some(5000),
+                ..crate::SpendLimit::default()
             },
         );
         let p = Policy::builtin(&g).unwrap();
@@ -1770,8 +2107,10 @@ mod tests {
                     destination: dest.into(),
                     session_tokens: session,
                     day_tokens: day,
+                    ..SpendInput::default()
                 }),
                 fetch: None,
+                approval: None,
             })
             .unwrap()
         };
@@ -1784,6 +2123,104 @@ mod tests {
             ask("anthropic", 1_000_000, 1_000_000).allow,
             "no limit set there"
         );
+    }
+
+    fn ask_spend(limit: crate::SpendLimit, spend: SpendInput) -> Decision {
+        let mut g = grants();
+        g.spend.insert("llmao".into(), limit);
+        Policy::builtin(&g)
+            .unwrap()
+            .decide(&Input {
+                action: Action::Spend,
+                principal: Principal {
+                    id: "agent:x".into(),
+                    class: Class::Agent,
+                },
+                domain: String::new(),
+                filing: None,
+                task: None,
+                parent: None,
+                write: None,
+                promote: None,
+                held_task: None,
+                spend: Some(SpendInput {
+                    destination: "llmao".into(),
+                    prices: "v7".into(),
+                    ..spend
+                }),
+                fetch: None,
+                approval: None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn a_model_call_over_a_limit_in_money_does_not_leave() {
+        let money = || crate::SpendLimit {
+            session_usd_cents: Some(100),
+            day_usd_cents: Some(500),
+            ..crate::SpendLimit::default()
+        };
+        let cents = |session_cents: u64, day_cents: u64| SpendInput {
+            session_cents,
+            day_cents,
+            ..SpendInput::default()
+        };
+        assert!(ask_spend(money(), cents(99, 499)).allow, "one cent under");
+        let d = ask_spend(money(), cents(100, 100));
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(
+            d.reason,
+            "spend limit: this session has spent 100 US cents at llmao, its limit is 100 US cents (price vector v7)"
+        );
+        let d = ask_spend(money(), cents(10, 500));
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(
+            d.reason,
+            "spend limit: the root has spent 500 US cents at llmao in the last day, its limit is 500 US cents (price vector v7)"
+        );
+    }
+
+    #[test]
+    fn a_limit_in_money_refuses_a_model_that_has_no_price() {
+        let unpriced = || SpendInput {
+            unpriced: vec!["qwen".into()],
+            ..SpendInput::default()
+        };
+        let d = ask_spend(
+            crate::SpendLimit {
+                day_usd_cents: Some(500),
+                ..crate::SpendLimit::default()
+            },
+            unpriced(),
+        );
+        assert!(!d.allow, "{d:?}");
+        assert_eq!(
+            d.reason,
+            "spend limit: qwen has no price in price vector v7, so a limit in money cannot be checked"
+        );
+        let tokens_only = crate::SpendLimit {
+            session_tokens: Some(1000),
+            ..crate::SpendLimit::default()
+        };
+        assert!(
+            ask_spend(tokens_only.clone(), unpriced()).allow,
+            "limits in tokens need no price"
+        );
+        // the limits in tokens come first, with their own text
+        let both = crate::SpendLimit {
+            session_usd_cents: Some(1),
+            ..tokens_only
+        };
+        let d = ask_spend(
+            both,
+            SpendInput {
+                session_tokens: 1000,
+                session_cents: 5,
+                ..SpendInput::default()
+            },
+        );
+        assert!(d.reason.contains("1000 tokens"), "{d:?}");
     }
 
     fn fetch_grants() -> Grants {
@@ -1829,6 +2266,7 @@ mod tests {
             held_task: None,
             spend: None,
             fetch: Some(f),
+            approval: None,
         })
         .unwrap()
     }

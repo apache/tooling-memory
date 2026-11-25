@@ -6,7 +6,7 @@
 use dm_core::approx_tokens;
 use dm_index::Hit;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -42,6 +42,15 @@ pub struct Read {
     /// How a recall was served: `brief`, or `pack:sections` and `pack:summaries`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// How a recall was sized from what its caller said:
+    /// `<kind>/context=<n or none>/brief=<n>/pack=<n>`. Absent for a recall whose caller
+    /// said nothing, and in lines written before this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
+    /// How long the server took to answer, in milliseconds: kept for a search. Absent
+    /// in lines written before this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ms: Option<u64>,
 }
 
 /// The log file under a root.
@@ -58,6 +67,27 @@ pub struct ReadLog {
     author: Mutex<String>,
     lock: Mutex<()>,
     enabled: AtomicBool,
+    /// The entries served since the last decision context was kept. In memory only.
+    returned: Mutex<Returned>,
+    /// The digest of the T0 last served. In memory only.
+    t0: Mutex<Option<String>>,
+}
+
+/// Entry ids, each once, in the order they were first served.
+#[derive(Default)]
+struct Returned {
+    order: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl Returned {
+    fn add(&mut self, ids: &[String]) {
+        for id in ids {
+            if self.seen.insert(id.clone()) {
+                self.order.push(id.clone());
+            }
+        }
+    }
 }
 
 /// A line appended to a JSONL file under the state directory; a failure is dropped,
@@ -142,7 +172,29 @@ impl ReadLog {
             author: Mutex::new(String::new()),
             lock: Mutex::new(()),
             enabled: AtomicBool::new(true),
+            returned: Mutex::new(Returned::default()),
+            t0: Mutex::new(None),
         }
+    }
+
+    /// The entries served since this was last asked, each once, in the order they were
+    /// first served. The answer is taken: the next call starts from nothing. A decision
+    /// context keeps it, so a context names what its session was served since the
+    /// context before it.
+    pub fn take_returned(&self) -> Vec<String> {
+        let mut r = self
+            .returned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *r).order
+    }
+
+    /// The digest of the T0 last served to this session; none when none was.
+    pub fn last_t0(&self) -> Option<String> {
+        self.t0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Record reads as this author's from now on.
@@ -200,9 +252,36 @@ impl ReadLog {
         via: Option<&str>,
         ids: &[String],
     ) {
+        self.record(tool, query, (hits, tokens), cached, (via, None), ids, None);
+    }
+
+    /// A recall answered: `size` is the hits and the tokens served, `via` is its regime,
+    /// and `choice` is how it was sized, for a recall whose caller said what it needs.
+    pub fn recalled(&self, question: &str, size: (usize, usize), via: &str, choice: Option<&str>) {
+        let how = (Some(via), choice);
+        self.record("recall", Some(question), size, false, how, &[], None);
+    }
+
+    /// Append one read, and trace it. `size` is the hits and the tokens served. `how` is
+    /// the regime of a recall and how it was sized.
+    #[allow(clippy::too_many_arguments)] // one per thing a read is
+    fn record(
+        &self,
+        tool: &str,
+        query: Option<&str>,
+        size: (usize, usize),
+        cached: bool,
+        how: (Option<&str>, Option<&str>),
+        ids: &[String],
+        ms: Option<u64>,
+    ) {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
+        self.returned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add(ids);
         let read = Read {
             at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
@@ -215,11 +294,13 @@ impl ReadLog {
                 .clone(),
             tool: tool.to_string(),
             query: query.map(str::to_string),
-            hits,
-            tokens,
+            hits: size.0,
+            tokens: size.1,
             cached,
             ids: ids.to_vec(),
-            via: via.map(str::to_string),
+            via: how.0.map(str::to_string),
+            choice: how.1.map(str::to_string),
+            ms,
         };
         trace(&read);
         let _g = self
@@ -240,6 +321,21 @@ impl ReadLog {
         }
     }
 
+    /// A search answered with these hits, in `ms` milliseconds.
+    pub fn searched(&self, query: &str, hits: &[Hit], ms: u64) {
+        let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
+        let size = (hits.len(), hits_tokens(hits));
+        self.record(
+            "search",
+            Some(query),
+            size,
+            false,
+            (None, None),
+            &ids,
+            Some(ms),
+        );
+    }
+
     /// A list or search answered with these hits.
     pub fn hits(&self, tool: &str, query: Option<&str>, hits: &[Hit]) {
         let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
@@ -256,6 +352,12 @@ impl ReadLog {
 
     /// Text served whole: a T0, or an entry's body.
     pub fn text(&self, tool: &str, text: &str) {
+        if tool == "t0" && self.enabled.load(Ordering::Relaxed) {
+            *self
+                .t0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dm_core::digest(text));
+        }
         self.append(tool, None, 1, approx_tokens(text));
     }
 
@@ -292,14 +394,24 @@ fn trace(read: &Read) {
     if let Some(v) = &read.via {
         attrs.push(("memory.via", v.as_str().into()));
     }
+    if let Some(c) = &read.choice {
+        attrs.push(("memory.choice", c.as_str().into()));
+    }
+    if let Some(ms) = read.ms {
+        attrs.push(("memory.ms", ms.into()));
+    }
     dm_otel::event("memory.read", &attrs);
 }
 
-/// What a page of hits costs the reader: id, title, summary and a little metadata each.
+/// What a page of hits costs the reader: id, title, summary and a little metadata each,
+/// and the snippet of a hit that has one.
 #[must_use]
 pub fn hits_tokens(hits: &[Hit]) -> usize {
     hits.iter()
-        .map(|h| approx_tokens(&h.title) + approx_tokens(&h.summary) + 12)
+        .map(|h| {
+            let snippet = h.snippet.as_deref().map_or(0, approx_tokens);
+            approx_tokens(&h.title) + approx_tokens(&h.summary) + snippet + 12
+        })
         .sum()
 }
 
@@ -344,9 +456,42 @@ pub fn co_retrieved(
     together
 }
 
+/// How many searches returned each entry, over a read log: the first five hits of every
+/// search, the same rule as [`co_retrieved`]. A pair count over this count is the share
+/// of the searches for one entry that returned the other with it.
+#[must_use]
+pub fn searches_with(reads: &[Read]) -> BTreeMap<String, usize> {
+    let mut searches: BTreeMap<String, usize> = BTreeMap::new();
+    for r in reads.iter().filter(|r| r.tool == "search") {
+        for id in r.ids.iter().take(5) {
+            *searches.entry(id.clone()).or_default() += 1;
+        }
+    }
+    searches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn searches_with_counts_the_first_five_hits_of_each_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReadLog::new(dir.path(), "sess-1");
+        let ids = |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).into()).collect() };
+        let six = ids(&["a", "b", "c", "d", "e", "f"]);
+        log.served_ids("search", Some("q"), 6, 10, false, None, &six);
+        log.served_ids("search", Some("q"), 2, 10, false, None, &ids(&["a", "f"]));
+        log.served_ids("list", None, 1, 10, false, None, &ids(&["a"]));
+        let n = searches_with(&all(dir.path()).unwrap());
+        assert_eq!(n.get("a"), Some(&2), "a list is no search");
+        assert_eq!(n.get("e"), Some(&1));
+        assert_eq!(
+            n.get("f"),
+            Some(&1),
+            "the sixth hit of a search does not count"
+        );
+    }
 
     #[test]
     fn reads_append_and_read_back() {
@@ -361,6 +506,98 @@ mod tests {
         assert_eq!(reads[0].tokens, 6 + 2);
         assert_eq!(reads[1].query.as_deref(), Some("import"));
         assert_eq!(reads[1].session, "sess-1");
+    }
+
+    #[test]
+    fn a_line_without_the_time_of_the_answer_reads_back_and_a_search_keeps_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"at":"2026-10-10T00:00:00Z","session":"s-old","tool":"search","query":"import","hits":2,"tokens":40,"ids":["mem-a","mem-b"]}"#;
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        std::fs::write(path(dir.path()), format!("{old}\n")).unwrap();
+        let log = ReadLog::new(dir.path(), "sess-new");
+        log.searched("import", &[], 7);
+        log.text("t0", "a text");
+        let reads = all(dir.path()).unwrap();
+        assert_eq!(reads.len(), 3, "the old line parses: {reads:?}");
+        assert_eq!((reads[0].session.as_str(), reads[0].ms), ("s-old", None));
+        assert_eq!(reads[0].choice, None);
+        assert_eq!(reads[0].ids, ["mem-a", "mem-b"]);
+        assert_eq!((reads[1].tool.as_str(), reads[1].ms), ("search", Some(7)));
+        assert_eq!(reads[2].ms, None, "only a search is timed");
+        let text = std::fs::read_to_string(path(dir.path())).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[1].contains(r#""ms":7"#), "{}", lines[1]);
+        assert!(
+            !lines[2].contains("\"ms\""),
+            "an untimed read has no ms: {}",
+            lines[2]
+        );
+    }
+
+    #[test]
+    fn a_recall_line_keeps_its_regime_and_its_choice_and_an_older_line_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"at":"2026-10-10T00:00:00Z","session":"s-old","tool":"recall","query":"import","hits":2,"tokens":40,"via":"pack:sections"}"#;
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        std::fs::write(path(dir.path()), format!("{old}\n")).unwrap();
+        let log = ReadLog::new(dir.path(), "sess-new");
+        log.served_via("recall", Some("import"), 2, 40, false, Some("brief"));
+        log.recalled("import", (2, 40), "brief", None);
+        let choice = "fact/context=none/brief=150/pack=1500";
+        log.recalled("import", (3, 70), "pack:summaries", Some(choice));
+        let reads = all(dir.path()).unwrap();
+        assert_eq!(reads.len(), 4, "the old line parses: {reads:?}");
+        assert_eq!(reads[0].via.as_deref(), Some("pack:sections"));
+        assert_eq!(reads[0].choice, None);
+        let same = |r: &Read| {
+            (
+                r.tool.clone(),
+                r.query.clone(),
+                r.hits,
+                r.tokens,
+                r.via.clone(),
+            )
+        };
+        assert_eq!(same(&reads[1]), same(&reads[2]), "a recall with no choice");
+        assert_eq!(reads[3].via.as_deref(), Some("pack:summaries"));
+        assert_eq!(reads[3].choice.as_deref(), Some(choice));
+        assert_eq!((reads[3].hits, reads[3].tokens), (3, 70));
+        let text = std::fs::read_to_string(path(dir.path())).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let keys = |l: &str| l.replace(|c: char| c.is_ascii_digit(), "");
+        assert_eq!(keys(lines[1]), keys(lines[2]), "the same keys");
+        assert!(!lines[2].contains("choice"), "{}", lines[2]);
+    }
+
+    #[test]
+    fn replay_state_a_read_log_keeps_the_ids_served_and_the_digest_of_t0() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReadLog::new(dir.path(), "sess-1");
+        let ids = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(log.take_returned().is_empty() && log.last_t0().is_none());
+        log.served_ids("search", None, 2, 9, false, None, &ids(&["mem-b", "mem-a"]));
+        log.opened("mem-a", "The body.", false);
+        log.opened("mem-c", "Another body.", false);
+        assert_eq!(
+            log.take_returned(),
+            ids(&["mem-b", "mem-a", "mem-c"]),
+            "each id once, in the order first served"
+        );
+        assert!(log.take_returned().is_empty(), "taken");
+        log.opened("mem-a", "The body.", false);
+        assert_eq!(log.take_returned(), ids(&["mem-a"]), "served again");
+        // only a T0 is the T0
+        log.text("transcripts", "A transcript.");
+        assert_eq!(log.last_t0(), None);
+        log.text("t0", "The first T0.");
+        log.text("t0", "The second T0.");
+        assert_eq!(log.last_t0(), Some(dm_core::digest("The second T0.")));
+        // a disabled log keeps nothing
+        log.disable();
+        log.opened("mem-d", "A body.", false);
+        log.text("t0", "A third T0.");
+        assert!(log.take_returned().is_empty());
+        assert_eq!(log.last_t0(), Some(dm_core::digest("The second T0.")));
     }
 
     #[test]

@@ -198,8 +198,8 @@ impl Memory {
     /// Whether this session may write an entry that replaces `old`. The entry is not
     /// written yet: `tier`, `reach` and `task` are what the session gives it.
     ///
-    /// The read filter of the session must admit `old`, as an active entry or as one
-    /// that the archive keeps. A write that replaces an entry takes that entry out of the
+    /// The read filter of the session, before its settings, must admit `old`, as an
+    /// active entry or as one that the archive keeps. A write that replaces an entry takes that entry out of the
     /// active set, so a session that cannot read an entry cannot replace it.
     ///
     /// A raw entry with tap reach is served only to the chain of its task and to the
@@ -220,7 +220,9 @@ impl Memory {
         reach: Reach,
         task: Option<&str>,
     ) -> Result<(), Error> {
-        let mut f = self.session_filter()?;
+        // a read on behalf of a write: under the grants, the policy and the task chain.
+        // The settings of the session do not narrow it
+        let mut f = self.chained_filter()?;
         f.include_inactive = true;
         let meta = self.index.lock().await.meta(old, &f)?;
         let Some(meta) = meta else {
@@ -324,6 +326,7 @@ mod tests {
     use super::*;
     use crate::log::{read, Event};
     use crate::sources::{Answer, Answered, Tools};
+    use crate::testing::agents_read;
     use crate::{lock, WriteRequest, Written};
     use dm_core::{EntryType, Label};
     use dm_ledger::{Status, Task, TaskSpec};
@@ -995,19 +998,6 @@ mod tests {
         o.ledger.lock().await.create(spec).await.unwrap().task
     }
 
-    /// Give the agents of a root one more key in their read filter.
-    fn agents_read(root: &Path, pair: &str) {
-        let text = dm_policy::decide::BUILTIN.replace(
-            "read_filter := base_filter\n",
-            &format!(
-                "read_filter := object.union(base_filter, {{{pair}}}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n"
-            ),
-        );
-        assert_ne!(text, dm_policy::decide::BUILTIN);
-        std::fs::create_dir_all(root.join("policy")).unwrap();
-        std::fs::write(root.join("policy/local.rego"), text).unwrap();
-    }
-
     #[tokio::test]
     async fn a_session_that_holds_an_outside_task_writes_with_tap_reach() {
         let dir = tempfile::tempdir().unwrap();
@@ -1211,6 +1201,28 @@ mod tests {
         let outside = agent(dir.path(), "agent:other");
         let none = outside.unposted("dom-me", Label::Restricted).await.unwrap();
         assert!(none.is_empty(), "{none:?}");
+    }
+
+    /// The handoff that a release names is read on behalf of the release, with the
+    /// task chain: the session that wrote a handoff with tap reach releases its task
+    /// with it, and a session outside the chain is told that there is no such entry.
+    #[tokio::test]
+    async fn a_session_releases_its_task_with_its_handoff_that_has_tap_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let t = tap_task(dir.path(), "From the tracker").await;
+        let a = holder(dir.path(), "agent:a", &t.id).await;
+        a.claim(&t.id, Duration::minutes(5)).await.unwrap();
+        let h = wrote(&a, EntryType::Handoff).await;
+        assert_eq!((h.reach, h.task.as_deref()), (Reach::Tap, Some(&*t.id)));
+        // a session on an unrelated task does not release its task with that handoff
+        let other = o.file_own(spec("Other work")).await.unwrap().task;
+        let b = holder(dir.path(), "agent:b", &other.id).await;
+        b.claim(&other.id, Duration::minutes(5)).await.unwrap();
+        let refused = b.release(&other.id, None, Some(&h.id)).await;
+        assert!(matches!(refused, Err(Error::NotFound(_))), "{refused:?}");
+        let released = a.release(&t.id, None, Some(&h.id)).await.unwrap();
+        assert_eq!(released.handoff.as_deref(), Some(h.id.as_str()));
     }
 
     #[tokio::test]

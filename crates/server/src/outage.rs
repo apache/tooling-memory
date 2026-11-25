@@ -119,6 +119,11 @@ enum Queued {
         handling: Label,
         /// Whether the session had read content from outside the fleet.
         outside: bool,
+        /// Whether the memory server served the session to a harness. A line that does
+        /// not say is of a served session: such a session signs nothing off and does
+        /// not read the held-out domain, whatever its author.
+        #[serde(default = "yes")]
+        served: bool,
     },
     /// A heartbeat that a session sent in the outage.
     Heartbeat {
@@ -134,6 +139,10 @@ enum Queued {
         /// The lease asked, in milliseconds.
         lease_ms: i64,
     },
+}
+
+fn yes() -> bool {
+    true
 }
 
 fn rfc3339(at: OffsetDateTime) -> String {
@@ -376,6 +385,7 @@ impl Memory {
                 label,
                 handling,
                 outside,
+                served,
                 ..
             } => {
                 let from = Sender {
@@ -386,6 +396,7 @@ impl Memory {
                     label,
                     handling,
                     outside,
+                    served,
                 };
                 self.replay_handoff(*request, &from, done).await
             }
@@ -436,7 +447,9 @@ impl Memory {
 
     /// A session of this root that writes as the sender of a queued handoff did: its
     /// author, its session id, its held task, no higher a handling and no lower a
-    /// label. So the write finds only the entries that the sender could read.
+    /// label. So the write finds only the entries that the sender could read. A session
+    /// that the memory server served is a served session here too: the name of the owner
+    /// on it does not let the write into the held-out domain.
     async fn session_of(&self, from: &Sender) -> Result<Memory, Error> {
         let mut view = Memory::open(&self.root)?;
         view.session_id.clone_from(&from.session);
@@ -445,6 +458,9 @@ impl Memory {
         let view = view
             .with_author(from.author.clone())
             .with_handling_cap(from.handling);
+        if from.served {
+            view.mark_served();
+        }
         {
             let mut s = lock(&view.session);
             s.observe(from.label);
@@ -547,6 +563,9 @@ impl Memory {
         let generation = task
             .as_ref()
             .and_then(|t| lock(&self.claims).get(t).copied());
+        // what the grants, the policy and the envelope of a position let the session
+        // read. The granted filter does not wait in an outage, and nothing is read here
+        let handling = self.granted_filter()?.handling.min(self.grants.handling);
         self.queue(&Queued::Handoff {
             at: OffsetDateTime::now_utc(),
             request: Box::new(req),
@@ -555,8 +574,9 @@ impl Memory {
             task,
             generation,
             label: self.label(),
-            handling: self.grants.handling,
+            handling,
             outside: self.read_outside(),
+            served: self.served(),
         })
     }
 
@@ -605,6 +625,7 @@ struct Sender {
     label: Label,
     handling: Label,
     outside: bool,
+    served: bool,
 }
 
 #[cfg(test)]
@@ -814,13 +835,87 @@ mod tests {
         waits(owner.retry_task(&open).await);
         waits(
             owner
-                .record_outcome(&held, OutcomeKind::Accepted, "taken")
+                .record_outcome_event(&held, OutcomeKind::Accepted, "taken")
                 .await,
         );
         assert_eq!(events(&owner).await, before);
         let l = owner.ledger.lock().await;
         assert_eq!(l.get(&held).await.unwrap().status, Status::Claimed);
         assert_eq!(l.get(&open).await.unwrap().status, Status::Open);
+    }
+
+    /// A root with a share of throughput and the landing queue `main`.
+    fn with_limits(dir: &Path) -> Memory {
+        init(dir);
+        let path = dir.join(crate::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        let queue = dm_policy::LandingQueue {
+            domain: DOMAIN.into(),
+            per_day: None,
+            count_after_hours: None,
+        };
+        g.landing.insert("main".into(), queue);
+        let shares = dm_policy::DomainLimits {
+            claims_per_hour: Some(5),
+            ..dm_policy::DomainLimits::default()
+        };
+        g.limits.insert(DOMAIN.into(), shares);
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        Memory::open(dir).unwrap()
+    }
+
+    /// The names of the actions that did not wait.
+    fn did_not_wait(answers: Vec<(&'static str, Result<(), Error>)>) -> Vec<String> {
+        answers
+            .into_iter()
+            .filter(|(_, r)| !matches!(r, Err(Error::Outage(_))))
+            .map(|(name, r)| format!("{name}: {:?}", r.err().map(|e| e.to_string())))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reported_event_a_raise_of_a_limit_and_a_kept_export_wait() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = with_limits(dir.path());
+        let waiting = task(&owner, "Waiting").await;
+        let a = agent(dir.path());
+        a.claim(&waiting, Duration::minutes(10)).await.unwrap();
+        a.wait_for(&waiting, None, "check:42", None).await.unwrap();
+        let inner = WriteRequest {
+            classification: Some(Label::Internal),
+            ..entry(EntryType::Fact, FACT)
+        };
+        owner.write(inner).await.unwrap();
+        let kept = owner.export_kept(None, Label::Internal).await.unwrap();
+        let kept = dir.path().join(kept.kept_at);
+        assert!(kept.is_dir());
+        owner.declare_outage("the ledger does not answer").unwrap();
+        let count = || async { owner.ledger.lock().await.event_count().await.unwrap() };
+        let before = count().await;
+        let day = Duration::days(1);
+        let throughput = crate::limits::Limit::Throughput;
+        let answers = vec![
+            (
+                "event_arrived",
+                owner.event_arrived(None, "check:42").await.map(|_| ()),
+            ),
+            (
+                "raise_limit",
+                owner
+                    .raise_limit(None, &throughput, 9, Some(AGENT), day)
+                    .await
+                    .map(|_| ()),
+            ),
+            (
+                "export_kept",
+                owner.export_kept(None, Label::Internal).await.map(|_| ()),
+            ),
+        ];
+        assert_eq!(did_not_wait(answers), Vec::<String>::new());
+        assert_eq!(count().await, before, "the ledger takes no event");
+        assert!(kept.is_dir(), "the kept bundle of before the outage stays");
+        let l = owner.ledger.lock().await;
+        assert_eq!(l.get(&waiting).await.unwrap().status, Status::Blocked);
     }
 
     #[tokio::test]
@@ -966,7 +1061,11 @@ mod tests {
         owner.declare_outage("the ledger does not answer").unwrap();
         // the egress asks this before each model call
         a.fresh().unwrap();
-        assert!(a.check_spend("anthropic", 0, 0).unwrap().allow);
+        let spend = dm_policy::decide::SpendInput {
+            destination: "anthropic".into(),
+            ..dm_policy::decide::SpendInput::default()
+        };
+        assert!(a.check_spend(spend).unwrap().allow);
         // a view is made, and each read of the view waits
         let view = a.for_request().unwrap();
         waits(view.search("retries", None, 5).await);
@@ -1022,6 +1121,34 @@ mod tests {
         let still = owner.get(&secret).await.unwrap();
         assert_eq!(still.body, FACT);
         assert_eq!(still.front.classification, Label::Restricted);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_handoff_of_a_served_session_does_not_reach_the_held_out_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::testing::held_out_root(dir.path());
+        let suite = "# A suite\n\nThe answer names the bird.\n";
+        let suite = crate::testing::written_in(&owner, "dom-held", suite, false).await;
+        let replace = || WriteRequest {
+            domain: Some(DOMAIN.into()),
+            supersedes: Some(suite.clone()),
+            ..entry(EntryType::Handoff, HANDOFF)
+        };
+        // a harness reaches this session of the owner, so an agent may have asked: the
+        // session does not read the held-out domain, and its write does not find the entry
+        let served = Memory::open(dir.path()).unwrap();
+        served.mark_served();
+        let live = served.write(replace()).await.unwrap_err();
+        assert!(matches!(live, Error::NotFound(_)), "{live}");
+        owner.declare_outage("the log does not answer").unwrap();
+        waits(served.write(replace()).await);
+        let done = owner.end_outage().await.unwrap();
+        assert_eq!(done.handoffs, Vec::<String>::new());
+        assert_eq!(done.failed.len(), 1, "{:?}", done.failed);
+        assert!(done.failed[0].contains("not found"), "{:?}", done.failed);
+        // the entry of the held-out domain is as it was: nothing replaced it
+        let still = owner.get(&suite).await.unwrap();
+        assert_eq!(still.front.status, None);
     }
 
     #[tokio::test]

@@ -5,10 +5,10 @@
 //!
 //! The paper judges "used" with a sampled cheap-model judge. Here an entry is used when
 //! the session's handoff cites it by id, which needs no model and undercounts what a
-//! session used without saying so; [`super::judge`] runs the paper's judge on a sample
-//! when a destination is named, and reports how often the two agree.
+//! session used without saying so; the judge of `amem savings` runs the paper's judge on a
+//! sample when a destination is named, and reports how often the two agree.
 
-use dm_server::reads::{Read, Wrote};
+use crate::reads::{Read, Wrote};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -321,6 +321,8 @@ mod tests {
             cached: false,
             ids: ids.iter().map(|i| (*i).to_string()).collect(),
             via: None,
+            choice: None,
+            ms: None,
         }
     }
 

@@ -211,6 +211,12 @@ impl Memory {
         Ok((filed, already))
     }
 
+    /// Whether two principals are one: the same identifier, or two identifiers that the
+    /// assertions of the registry give to one person.
+    pub(crate) fn same_principal(&self, a: &str, b: &str) -> bool {
+        a == b || self.registry().is_some_and(|r| r.same_person(a, b))
+    }
+
     /// The person of a personal domain, when this session's author is another person or
     /// an agent. The assertions of the registry decide whether two identifiers name one
     /// person.
@@ -395,7 +401,8 @@ impl Memory {
         Ok(())
     }
 
-    /// Answer a proposal to a personal domain; the owner's act. An admitted proposal
+    /// Answer a proposal to a personal domain; the owner's act, in a session that the
+    /// memory server does not serve. An admitted proposal
     /// goes into the record as it was written, with its author. A refused proposal is
     /// removed, and the refusal record of the domain takes the digest of its origin, so
     /// the same proposal is not held again. The task of the proposal is invalidated,
@@ -403,11 +410,18 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// [`Error::Denied`] for an author who is not the owner; [`Error::Outage`] while an
-    /// outage is declared, and nothing is done; [`Error::NotFound`] when no proposal has
-    /// this id; a store, index or ledger error.
+    /// [`Error::Denied`] for an author who is not the owner, and for a session that the
+    /// memory server serves: a harness reaches such a session, so an agent may have
+    /// asked; [`Error::Outage`] while an outage is declared, and nothing is done;
+    /// [`Error::NotFound`] when no proposal has this id; a store, index or ledger error.
     pub async fn answer_proposal(&self, id: &str, admit: bool) -> Result<Option<Written>, Error> {
         self.proposals_owner()?;
+        if self.served() {
+            return Err(Error::Denied(
+                "a session of the memory server answers no proposal to a personal domain: the owner answers at the command line, or in `amem serve --person`"
+                    .into(),
+            ));
+        }
         // nothing of the answer is done in an outage: the refusal record waits too
         self.serving()?;
         self.fresh()?;

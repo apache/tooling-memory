@@ -25,6 +25,7 @@
 //! deny-by-default the paper asks for.
 
 pub mod decide;
+pub mod prices;
 pub mod record;
 pub mod registry;
 pub mod scan;
@@ -63,8 +64,8 @@ pub enum Error {
     Registry(String),
 }
 
-/// What one destination's model calls may spend, in tokens in and out: per session,
-/// and across the root in the last day. Checked by the egress before a call leaves.
+/// What one destination's model calls may spend, in tokens in and out and in money: per
+/// session, and across the root in the last day. Checked by the egress before a call leaves.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SpendLimit {
     /// Tokens one session may spend here.
@@ -73,6 +74,13 @@ pub struct SpendLimit {
     /// Tokens the root may spend here in the last day.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub day_tokens: Option<u64>,
+    /// US cents one session may spend here, as the price vector prices its metered
+    /// tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_usd_cents: Option<u64>,
+    /// US cents the root may spend here in the last day.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub day_usd_cents: Option<u64>,
 }
 
 /// The gates on writes whose blast radius is not routine; `[gates]` in the file.
@@ -137,6 +145,11 @@ pub struct DomainGrant {
     /// owner sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_retention_days: Option<u32>,
+    /// The guard of the domain: the person whose approval lets an entry of the domain be
+    /// copied to a lower label. The owner when unset. A guard is a person, so the name
+    /// starts `human:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
 }
 
 /// How long a transcript is kept whole when the domain says nothing.
@@ -247,6 +260,15 @@ pub struct Grants {
     /// `human:<system>:<user-id>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<String>,
+    /// The domain that holds the held-out suites: the scenarios that grade a task
+    /// definition. Only the evaluator and the owner in person read it, so it is never
+    /// the platform's domain, which every session reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_out: Option<String>,
+    /// The principal that grades work on the held-out suites, `agent:<name>`. It reads
+    /// the held-out domain and claims no task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator: Option<String>,
     /// Domains the owner holds, by id.
     #[serde(default)]
     pub domains: BTreeMap<String, DomainGrant>,
@@ -262,9 +284,90 @@ pub struct Grants {
     /// Spend limits per resource class, by destination: `[spend.llmao]`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub spend: BTreeMap<String, SpendLimit>,
+    /// Landing queues by name: `[landing.main]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub landing: BTreeMap<String, LandingQueue>,
+    /// The shares of a domain, by domain: `[limits.dom-a]`.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub limits: BTreeMap<String, DomainLimits>,
     /// Where the task ledger lives when not in the SQLite file under the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ledger: Option<LedgerSettings>,
+}
+
+/// A queue through which finished changes land, one at a time, when a person says so:
+///
+/// ```toml
+/// [landing.main]
+/// domain = "dom-a"
+/// per_day = 4
+/// count_after_hours = 24
+/// ```
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LandingQueue {
+    /// The domain whose tasks the queue lands.
+    pub domain: String,
+    /// The share of the fleet: how many changes of agents the queue lands in 24 hours.
+    /// Absent is no share. The changes of people are not counted against it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub per_day: Option<u32>,
+    /// The hours after which a landing counts as progress; 24 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count_after_hours: Option<u32>,
+}
+
+impl LandingQueue {
+    /// The hours after which a landing counts when the file names none.
+    pub const COUNT_AFTER_HOURS: u32 = 24;
+
+    /// The fixed delay after which a landing counts as progress.
+    #[must_use]
+    pub fn count_after(&self) -> time::Duration {
+        let hours = self.count_after_hours.unwrap_or(Self::COUNT_AFTER_HOURS);
+        time::Duration::hours(i64::from(hours))
+    }
+}
+
+/// The shares of one domain. A person raises one for a time with an approval; the file
+/// holds the value that stands without one:
+///
+/// ```toml
+/// [limits.dom-a]
+/// claims_per_hour = 6
+/// upkeep_percent = 30
+/// window_days = 7
+///
+/// [limits.dom-a.outbound]
+/// github = 20
+/// ```
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DomainLimits {
+    /// Share of throughput: the claims that one agent may make in this domain in 60
+    /// minutes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claims_per_hour: Option<u32>,
+    /// Share of upkeep: the highest percentage of the completed tasks of the window
+    /// that may be upkeep.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upkeep_percent: Option<u8>,
+    /// The window of the upkeep share, in days; 7 when absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_days: Option<u32>,
+    /// Outbound rate: the handoffs posted back in 24 hours, by the family of the
+    /// task's origin (`github`, `issues`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub outbound: BTreeMap<String, u32>,
+}
+
+impl DomainLimits {
+    /// The days of the window of the upkeep share when the file names none.
+    pub const WINDOW_DAYS: u32 = 7;
+
+    /// The window of the upkeep share, in days.
+    #[must_use]
+    pub fn window(&self) -> u32 {
+        self.window_days.unwrap_or(Self::WINDOW_DAYS)
+    }
 }
 
 /// The ledger's backend, when it is a server rather than the file under the root:
@@ -297,6 +400,7 @@ impl Grants {
                 default_classification: Label::Internal,
                 admit_own: true,
                 transcript_retention_days: None,
+                guard: None,
             },
         );
         let mut destinations = BTreeMap::new();
@@ -325,12 +429,16 @@ impl Grants {
             handling: Label::Restricted,
             platform: None,
             security: Vec::new(),
+            held_out: None,
+            evaluator: None,
             domains,
             destinations,
             taps: BTreeMap::new(),
             ledger: None,
             gates: Gates::default(),
             spend: BTreeMap::new(),
+            landing: BTreeMap::new(),
+            limits: BTreeMap::new(),
         }
     }
 
@@ -339,7 +447,9 @@ impl Grants {
     /// # Errors
     ///
     /// [`Error::Parse`] for bad TOML or a value outside the schema, [`Error::Invalid`] for
-    /// an empty owner or no domains.
+    /// an empty owner, no domains, a guard that is not a person, a platform or held-out
+    /// domain the owner does not hold, a held-out domain that is the platform's, or an
+    /// evaluator that is not an agent or has no held-out domain.
     pub fn parse(text: &str) -> Result<Grants, Error> {
         let g: Grants = toml::from_str(text)?;
         if g.owner.trim().is_empty() {
@@ -348,6 +458,7 @@ impl Grants {
         if g.domains.is_empty() {
             return Err(Error::Invalid("at least one domain is required".into()));
         }
+        g.guards_are_people()?;
         for (name, t) in &g.taps {
             if let Some(url) = &t.hosted {
                 let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
@@ -384,7 +495,54 @@ impl Grants {
                 "platform = {p:?} names a domain the owner does not hold"
             )));
         }
+        g.held_out_is_apart()?;
         Ok(g)
+    }
+
+    /// The held-out domain is one the owner holds and is not the platform's, and the
+    /// evaluator is an agent that has a held-out domain to read.
+    fn held_out_is_apart(&self) -> Result<(), Error> {
+        if let Some(h) = self.held_out.as_deref() {
+            if !self.domains.contains_key(h) {
+                return Err(Error::Invalid(format!(
+                    "held_out = {h:?} names a domain the owner does not hold"
+                )));
+            }
+            if self.platform.as_deref() == Some(h) {
+                return Err(Error::Invalid(format!(
+                    "held_out = {h:?} is the platform's domain: every session reads the platform, and only the evaluator reads the held-out suites"
+                )));
+            }
+        }
+        let Some(evaluator) = self.evaluator.as_deref() else {
+            return Ok(());
+        };
+        let named = evaluator
+            .strip_prefix("agent:")
+            .is_some_and(|name| !name.trim().is_empty());
+        if !named {
+            return Err(Error::Invalid(format!(
+                "evaluator = {evaluator:?}: the evaluator is an agent, named `agent:<name>`"
+            )));
+        }
+        if self.held_out.is_none() {
+            return Err(Error::Invalid(format!(
+                "evaluator = {evaluator:?} needs held_out = \"<domain>\": the evaluator grades on the suites of that domain"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A guard approves in person, so a grant that names one names a person.
+    fn guards_are_people(&self) -> Result<(), Error> {
+        for (name, d) in &self.domains {
+            if let Some(guard) = d.guard.as_deref().filter(|p| !p.starts_with("human:")) {
+                return Err(Error::Invalid(format!(
+                    "[domains.{name}] guard = {guard:?}: a guard is a person, named `human:<system>:<name>`"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Read and parse the file.
@@ -413,6 +571,14 @@ impl Grants {
     #[must_use]
     pub fn read_filter(&self) -> ReadFilter {
         ReadFilter::for_domains(self.domains.keys().cloned(), self.handling)
+    }
+
+    /// The guard of a domain: the person the domain's grant names, or the owner when it
+    /// names none. `None` when the domain is not granted.
+    #[must_use]
+    pub fn guard(&self, domain: &str) -> Option<&str> {
+        let d = self.domains.get(domain)?;
+        Some(d.guard.as_deref().unwrap_or(&self.owner))
     }
 
     /// A tap's grant, if the file names it and its domain is one the owner holds.
@@ -729,6 +895,103 @@ ceiling = "public"
     }
 
     #[test]
+    fn a_guard_is_a_person_and_the_owner_when_the_grant_names_none() {
+        let named = "owner = \"human:local:me\"\n[domains.dom-a]\nguard = \"human:local:guard\"\n[domains.dom-b]\n";
+        let g = Grants::parse(named).unwrap();
+        assert_eq!(g.guard("dom-a"), Some("human:local:guard"));
+        assert_eq!(g.guard("dom-b"), Some("human:local:me"), "the owner");
+        assert_eq!(g.guard("dom-else"), None, "not granted");
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        for not_a_person in ["agent:x", "tap:github-issues", "curation", ""] {
+            let text = format!(
+                "owner = \"human:local:me\"\n[domains.dom-a]\nguard = \"{not_a_person}\"\n"
+            );
+            assert!(
+                matches!(Grants::parse(&text), Err(Error::Invalid(_))),
+                "{not_a_person:?}"
+            );
+        }
+    }
+
+    const HELD_OUT: &str = "owner = \"human:local:me\"\nplatform = \"dom-plat\"\nheld_out = \"dom-held\"\nevaluator = \"agent:evaluator\"\n[domains.dom-me]\n[domains.dom-plat]\n[domains.dom-held]\n";
+
+    #[test]
+    fn a_held_out_domain_and_its_evaluator_round_trip() {
+        let g = Grants::parse(HELD_OUT).unwrap();
+        assert_eq!(g.held_out.as_deref(), Some("dom-held"));
+        assert_eq!(g.evaluator.as_deref(), Some("agent:evaluator"));
+        let text = g.render().unwrap();
+        assert_eq!(Grants::parse(&text).unwrap(), g);
+        // a held-out domain with no evaluator is the owner's alone
+        let alone = HELD_OUT.replace("evaluator = \"agent:evaluator\"\n", "");
+        let g = Grants::parse(&alone).unwrap();
+        assert_eq!(
+            (g.held_out.as_deref(), &g.evaluator),
+            (Some("dom-held"), &None)
+        );
+        // a file without the keys renders without them
+        let starter = Grants::starter("human:local:me", "dom-me");
+        assert_eq!((&starter.held_out, &starter.evaluator), (&None, &None));
+        let text = starter.render().unwrap();
+        assert!(
+            !text.contains("held_out") && !text.contains("evaluator"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_held_out_domain_is_held_and_is_not_the_platform_s() {
+        for (domain, why) in [
+            ("dom-else", "names a domain the owner does not hold"),
+            ("dom-plat", "is the platform's domain"),
+        ] {
+            let text = HELD_OUT.replace(
+                "held_out = \"dom-held\"",
+                &format!("held_out = \"{domain}\""),
+            );
+            let refused = Grants::parse(&text);
+            assert!(
+                matches!(&refused, Err(Error::Invalid(said)) if said.contains(why)),
+                "{domain}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_evaluator_is_an_agent_and_needs_a_held_out_domain() {
+        let alone = HELD_OUT.replace("held_out = \"dom-held\"\n", "");
+        let refused = Grants::parse(&alone);
+        assert!(
+            matches!(&refused, Err(Error::Invalid(said)) if said.contains("needs held_out")),
+            "{refused:?}"
+        );
+        for not_an_agent in [
+            "human:local:me",
+            "human:local:grader",
+            "tap:grader",
+            "agent:",
+            "agent: ",
+            "evaluator",
+            "",
+        ] {
+            let text = HELD_OUT.replace("agent:evaluator", not_an_agent);
+            let refused = Grants::parse(&text);
+            assert!(
+                matches!(&refused, Err(Error::Invalid(said)) if said.contains("is an agent")),
+                "{not_an_agent:?}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grants_file_without_a_guard_renders_without_the_key() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("guard"), "{text}");
+        assert_eq!(Grants::parse(&text).unwrap(), g);
+    }
+
+    #[test]
     fn bad_files_are_errors() {
         assert!(matches!(Grants::parse("owner = 1"), Err(Error::Parse(_))));
         assert!(matches!(
@@ -747,5 +1010,80 @@ ceiling = "public"
             Grants::load(Path::new("/nonexistent/grants.toml")),
             Err(Error::Io { .. })
         ));
+    }
+
+    #[test]
+    fn a_file_without_a_landing_queue_reads_and_renders_as_before() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("landing"), "{text}");
+        assert!(Grants::parse(FILE).unwrap().landing.is_empty());
+    }
+
+    #[test]
+    fn a_landing_queue_round_trips_and_its_delay_defaults_to_a_day() {
+        let mut g = Grants::starter("human:local:me", "dom-me");
+        let text = format!(
+            "{}\n[landing.main]\ndomain = \"dom-me\"\nper_day = 2\n",
+            g.render().unwrap()
+        );
+        let back = Grants::parse(&text).unwrap();
+        let q = LandingQueue {
+            domain: "dom-me".into(),
+            per_day: Some(2),
+            count_after_hours: None,
+        };
+        assert_eq!(q.count_after(), time::Duration::hours(24));
+        g.landing.insert("main".into(), q);
+        assert_eq!(back, g);
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        let short = LandingQueue {
+            count_after_hours: Some(6),
+            ..g.landing["main"].clone()
+        };
+        assert_eq!(short.count_after(), time::Duration::hours(6));
+    }
+
+    #[test]
+    fn a_file_without_limits_reads_and_renders_as_before() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("limits"), "{text}");
+        assert!(Grants::parse(FILE).unwrap().limits.is_empty());
+    }
+
+    #[test]
+    fn the_shares_of_a_domain_round_trip_and_the_window_defaults_to_a_week() {
+        let mut g = Grants::starter("human:local:me", "dom-me");
+        let text = format!(
+            "{}\n[limits.dom-me]\nclaims_per_hour = 6\nupkeep_percent = 30\n\n[limits.dom-me.outbound]\ngithub = 20\n",
+            g.render().unwrap()
+        );
+        let back = Grants::parse(&text).unwrap();
+        let limits = DomainLimits {
+            claims_per_hour: Some(6),
+            upkeep_percent: Some(30),
+            window_days: None,
+            outbound: BTreeMap::from([("github".to_string(), 20)]),
+        };
+        assert_eq!(limits.window(), 7);
+        g.limits.insert("dom-me".into(), limits);
+        assert_eq!(back, g);
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        let short = DomainLimits {
+            window_days: Some(2),
+            ..DomainLimits::default()
+        };
+        assert_eq!(short.window(), 2);
+        let none = format!(
+            "{}\n[limits.dom-me]\n",
+            Grants::starter("human:local:me", "dom-me")
+                .render()
+                .unwrap()
+        );
+        assert_eq!(
+            Grants::parse(&none).unwrap().limits["dom-me"],
+            DomainLimits::default()
+        );
     }
 }

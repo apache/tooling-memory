@@ -1,6 +1,7 @@
 """One tool call through `amem serve` over stdio, as the author given: how the demo
 speaks as an agent without a harness. A held task, if given, is in MEMORY_TASK, as the
-launcher sets it for a harness working a task.
+launcher sets it for a harness working a task. The author `person` starts
+`amem serve --person`: the session of the owner in person.
 
     python3 mcp.py <amem> <root> <author> <tool> '<json arguments>' [task-id]
     python3 mcp.py <amem> <root> <author> batch '[{"tool": t, "arguments": {...}}, ...]'
@@ -20,7 +21,9 @@ amem, root, author, tool, args = sys.argv[1:6]
 env = dict(os.environ)
 if len(sys.argv) > 6 and sys.argv[6]:
     env["MEMORY_TASK"] = sys.argv[6]
-p = subprocess.Popen([amem, "--root", root, "serve", "--author", author],
+# the author `person` is the owner in person: a session that no harness reaches
+who = ["--person"] if author == "person" else ["--author", author]
+p = subprocess.Popen([amem, "--root", root, "serve", *who],
                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env)
 
 

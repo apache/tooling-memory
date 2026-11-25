@@ -5,7 +5,8 @@
 # the grants file as `data.grants` and one request as `input`.
 #
 # input:
-#   action      file_task | write | erase | read | promote | spend | fetch
+#   action      file_task | write | erase | read | promote | spend | fetch | approve |
+#               declassify
 #   principal   {id, class}           class: owner | human | agent | tap | system
 #   domain      the domain acted on
 #   filing      own | held | session   (file_task) the system on the owner's behalf, a
@@ -15,9 +16,17 @@
 #   parent      {requirements}         (file_task, filing == held) the task held
 #   write       {supersedes, supersedes_tier, supersedes_author, session_supersedes}
 #   promote     {phase, to, author, proposer}  phase: direct | propose | approve
-#   spend       {destination, session_tokens, day_tokens}
+#   spend       {destination, session_tokens, day_tokens, session_cents, day_cents,
+#                unpriced, prices}     cents: US cents of metered calls; unpriced: the
+#                models with no price; prices: the version of the price vector
 #   fetch       {tool, method, scheme, host, port, path, private_address,
 #                loopback_address, label, hop}
+#   approval    {of, target, version, from, to, events}   (erase, declassify, approve)
+#                of: erase | declassify, the action that needs the approval; version:
+#                the version of the target now; from, to: the label the entry has and
+#                the label asked for (declassify); events: the approvals on the ledger
+#                for this action and target, each {id, principal, class, version, scope,
+#                expired}
 #
 # decision: {allow, admit, review, reason}
 #   review: none | human | approver    who has to look before this goes further
@@ -144,11 +153,140 @@ write_decision := {"allow": true, "admit": false, "review": "none", "reason": "w
 	not blocked_blast
 }
 
-# ---- erasure: irreversible, the owner only ----
+# ---- approvals: what cannot be taken back runs under a person's approval ----
 
-erase_decision := {"allow": true, "admit": false, "review": "none", "reason": "the owner erases"} if class == "owner"
+# An approval is an event on the ledger: a person approved one action on one version of
+# one entry, for one principal, until a time. The service reads the events and gives
+# them here; the action runs only when one of them holds now. The approver of an
+# erasure is the owner. The approver of a declassification is the domain's guard, the
+# person its grant names, or the owner when it names none. An approval counts when a
+# person gave it, that person is the approver, it has not expired, and it was given to
+# the principal that asks. It permits the version it names and no other: when the entry
+# has changed since, the person has not seen what would be acted on.
+gated if input.approval.of
 
-erase_decision := {"allow": false, "admit": false, "review": "human", "reason": "erasure is irreversible and the owner's alone"} if class != "owner"
+guard := object.get(object.get(data.grants.domains, input.domain, {}), "guard", data.grants.owner)
+
+approver := data.grants.owner if input.approval.of == "erase"
+
+approver := guard if input.approval.of == "declassify"
+
+usable_approvals contains e if {
+	some e in input.approval.events
+	e.class in {"owner", "human"}
+	e.principal == approver
+	not e.expired
+	e.scope == input.principal.id
+}
+
+approved if {
+	some e in usable_approvals
+	e.version == input.approval.version
+}
+
+stale_approval if {
+	not approved
+	count(usable_approvals) > 0
+}
+
+# Who may approve: the approver, in person. An approval is a person's to give, so an
+# agent, a tap or the system gives none, whatever it was told.
+person if class in {"owner", "human"}
+
+approvable if input.approval.of in {"erase", "declassify"}
+
+approve_decision := {"allow": true, "admit": false, "review": "none", "reason": sprintf("%v approves %v in %v", [approver, input.approval.of, input.domain])} if {
+	approvable
+	person
+	input.principal.id == approver
+}
+
+approve_decision := {"allow": false, "admit": false, "review": "approver", "reason": sprintf("an approval is a person's: %v gives none. %v approves %v in %v", [input.principal.id, approver, input.approval.of, input.domain])} if {
+	approvable
+	not person
+}
+
+approve_decision := {"allow": false, "admit": false, "review": "approver", "reason": sprintf("%v approves %v in %v; %v does not", [approver, input.approval.of, input.domain, input.principal.id])} if {
+	approvable
+	person
+	input.principal.id != approver
+}
+
+approve_decision := {"allow": false, "admit": false, "review": "none", "reason": "the request names no action that takes an approval"} if {
+	not approvable
+}
+
+# ---- erasure: irreversible ----
+
+# An erasure asked with `approval` runs under an approval of the owner for the version
+# of the entry that is there now. One asked without it is the owner's alone.
+erase_decision := {"allow": true, "admit": false, "review": "none", "reason": "the owner erases"} if {
+	not gated
+	class == "owner"
+}
+
+erase_decision := {"allow": false, "admit": false, "review": "human", "reason": "erasure is irreversible and the owner's alone"} if {
+	not gated
+	class != "owner"
+}
+
+erase_decision := {"allow": true, "admit": false, "review": "none", "reason": sprintf("%v approved the erasure of this version of `%v`", [approver, input.approval.target])} if {
+	input.approval.of == "erase"
+	approved
+}
+
+erase_decision := {"allow": false, "admit": false, "review": "approver", "reason": sprintf("the approval names another version of `%v`; a person approved what that person saw. Ask again for this version", [input.approval.target])} if {
+	input.approval.of == "erase"
+	stale_approval
+}
+
+erase_decision := {"allow": false, "admit": false, "review": "approver", "reason": sprintf("an erasure cannot be taken back; it runs under an approval of %v for this version of `%v`", [approver, input.approval.target])} if {
+	input.approval.of == "erase"
+	not approved
+	not stale_approval
+}
+
+erase_decision := {"allow": false, "admit": false, "review": "none", "reason": sprintf("the approval asked about is of %v, and the action is an erasure", [input.approval.of])} if {
+	gated
+	input.approval.of != "erase"
+}
+
+# ---- declassification: a copy at a lower label, through the guard ----
+
+# The copy is readable where the entry was not, and what was read cannot be taken back.
+# So it runs under an approval of the guard for the version of the entry that is there
+# now. A request that does not lower the label is no declassification.
+declassifies if input.approval.of == "declassify"
+
+lowers if label_rank[input.approval.to] < label_rank[input.approval.from]
+
+declassify_decision := {"allow": false, "admit": false, "review": "none", "reason": sprintf("%v is not lower than %v; a declassification copies an entry to a lower label", [object.get(input.approval, "to", "no label"), object.get(input.approval, "from", "no label")])} if {
+	declassifies
+	not lowers
+}
+
+declassify_decision := {"allow": true, "admit": false, "review": "none", "reason": sprintf("%v approved a copy of this version of `%v` at %v", [approver, input.approval.target, input.approval.to])} if {
+	declassifies
+	lowers
+	approved
+}
+
+declassify_decision := {"allow": false, "admit": false, "review": "approver", "reason": sprintf("the approval names another version of `%v`; a person approved what that person saw. Ask again for this version", [input.approval.target])} if {
+	declassifies
+	lowers
+	stale_approval
+}
+
+declassify_decision := {"allow": false, "admit": false, "review": "approver", "reason": sprintf("a copy at %v can be read where `%v` cannot; it runs under an approval of %v, the guard of %v, for this version", [input.approval.to, input.approval.target, approver, input.domain])} if {
+	declassifies
+	lowers
+	not approved
+	not stale_approval
+}
+
+declassify_decision := {"allow": false, "admit": false, "review": "none", "reason": "the request names no declassification"} if {
+	not declassifies
+}
 
 # ---- reads: the session's filter, evaluated once and pushed into the index ----
 
@@ -242,7 +380,8 @@ default promote_decision := {"allow": false, "admit": false, "review": "none", "
 # ---- spend: limits per resource class, checked before a model call leaves ----
 
 # The grants file sets them per destination, `[spend.<destination>]`: tokens one
-# session may spend there, and tokens the root may spend there in a day. The egress
+# session may spend there, and tokens the root may spend there in a day, and the same
+# two in US cents. The egress
 # asks before every model call with what it has metered; over a limit, the call does
 # not leave. A record policy may add its own limits in the rules package.
 spend_limits := object.get(object.get(data.grants, "spend", {}), input.spend.destination, {})
@@ -258,6 +397,44 @@ spend_decision := {"allow": false, "admit": false, "review": "human", "reason": 
 spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: the root has spent %v tokens at %v in the last day, its limit is %v", [input.spend.day_tokens, input.spend.destination, spend_limits.day_tokens])} if {
 	not over_session
 	over_day
+}
+
+# Limits in money, in US cents, priced by the price vector whose version the input
+# names. A limit in money cannot be checked for a model that has no price, so such a
+# call does not leave. The limits in tokens come first.
+money_limited if spend_limits.session_usd_cents
+
+money_limited if spend_limits.day_usd_cents
+
+over_tokens if over_session
+
+over_tokens if over_day
+
+unpriced_model if {
+	money_limited
+	count(object.get(input.spend, "unpriced", [])) > 0
+}
+
+over_session_money if object.get(input.spend, "session_cents", 0) >= spend_limits.session_usd_cents
+
+over_day_money if object.get(input.spend, "day_cents", 0) >= spend_limits.day_usd_cents
+
+spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: %v has no price in price vector %v, so a limit in money cannot be checked", [input.spend.unpriced[0], object.get(input.spend, "prices", "none")])} if {
+	not over_tokens
+	unpriced_model
+}
+
+spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: this session has spent %v US cents at %v, its limit is %v US cents (price vector %v)", [input.spend.session_cents, input.spend.destination, spend_limits.session_usd_cents, object.get(input.spend, "prices", "none")])} if {
+	not over_tokens
+	not unpriced_model
+	over_session_money
+}
+
+spend_decision := {"allow": false, "admit": false, "review": "human", "reason": sprintf("spend limit: the root has spent %v US cents at %v in the last day, its limit is %v US cents (price vector %v)", [input.spend.day_cents, input.spend.destination, spend_limits.day_usd_cents, object.get(input.spend, "prices", "none")])} if {
+	not over_tokens
+	not unpriced_model
+	not over_session_money
+	over_day_money
 }
 
 default spend_decision := {"allow": true, "admit": false, "review": "none", "reason": "within the spend limits"}
@@ -370,6 +547,10 @@ base_decision := file_decision if input.action == "file_task"
 base_decision := write_decision if input.action == "write"
 
 base_decision := erase_decision if input.action == "erase"
+
+base_decision := declassify_decision if input.action == "declassify"
+
+base_decision := approve_decision if input.action == "approve"
 
 # ---- the record's rules: modules from verified policy entries ----
 

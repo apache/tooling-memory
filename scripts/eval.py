@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Memory against no memory, and harness against harness, on a set of tasks.
+"""Memory against no memory, the five arms, and harness against harness, on a set of tasks.
 
 Each task in the set is a prompt and a regular expression its answer must match. Each
 run is one prompted launch; the conditions are:
@@ -17,6 +17,17 @@ run is one prompted launch; the conditions are:
   isolated  the bare harness with its web, shell and subagent tools off: what it knows
             without memory and without rediscovery. Claude Code only, so far.
 
+A condition can also be one of the five arms of the paper's evaluation: no-memory,
+transcript-replay, t0-only, raw-only, full (`amem eval arms` says what each stands for).
+An arm run is a run of the plan, the `[plan]` table of the set: `amem launch --arm <arm>
+--as-of <snapshot> --eval-plan <set> --eval-task <id> --eval-seed <n>`, with the plan's
+prompt. Each task runs once per seed in each arm (`--seeds`, else the plan's). The
+snapshot is one time for every run, five seconds before the first run starts, so no
+run reads what another run wrote. The outcomes of the arm runs go to
+evals/out/<set>-<stamp>.outcomes.json, a list of {session, success, cost, judge}, where
+cost is the tokens the harness counted: input, output, cache read and cache write. That
+file is what `amem eval score <set> <outcomes>` takes.
+
 Both conditions report the tokens the harness itself counted, read from the transcript
 it left, so the two are measured the same way; `amem usage` holds the egress's count
 for the memory condition as well. The answer is what the harness printed; the grade is
@@ -25,6 +36,10 @@ whether it matches `expect`.
   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness claude --auth subscription
   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex,claude --auth gateway --model qwen3.8-27b
   scripts/eval.py evals/demo.toml --root ~/memory-demo2 --conditions memory,empty
+  scripts/eval.py evals/demo.toml --root ~/memory-demo2 --harness codex --auth gateway --model qwen3.8-27b \
+      --conditions no-memory,transcript-replay,t0-only,raw-only,full
+
+The binary is `$AMEM` when that is set, else target/release/amem.
 
 Results go to evals/out/<set>-<stamp>.json and a table to stdout. Bare runs are known
 for claude and codex; the memory condition takes every harness the launcher does.
@@ -45,7 +60,39 @@ import tomllib
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent.parent
-AMEM = HERE / "target" / "release" / "amem"
+AMEM = Path(os.environ.get("AMEM") or HERE / "target" / "release" / "amem")
+
+# the arms of the paper's evaluation, in its order; `amem eval arms` prints them
+ARMS = ["no-memory", "transcript-replay", "t0-only", "raw-only", "full"]
+# how far before the first run the snapshot is: this far covers a wall clock that steps
+# back, so the snapshot is never later than the first run
+SNAPSHOT_LEAD_S = 5
+# the judge of every outcome here: the regular expression of the task
+JUDGE = "regex"
+
+
+def snapshot(now):
+    """The snapshot of an evaluation that starts at `now`, seconds since the epoch: RFC 3339, UTC."""
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - SNAPSHOT_LEAD_S))
+
+
+def cost_of(usage):
+    """The cost of a run: every token the harness counted."""
+    return usage["input"] + usage["output"] + usage["cache_read"] + usage["cache_write"]
+
+
+def outcomes_of(results):
+    """The outcomes of the arm runs, as `amem eval score` reads them, and the runs left
+    out: a run with no session id has no tape, and a run with no usage has no cost."""
+    kept, left = [], []
+    for r in results:
+        if r["condition"] not in ARMS:
+            continue
+        if not r["session"] or not r["usage"]:
+            left.append(r)
+            continue
+        kept.append({"session": r["session"], "success": r["pass"], "cost": cost_of(r["usage"]), "judge": JUDGE})
+    return kept, left
 
 BARE = {
     "claude": lambda prompt, model: ["claude", "-p", prompt, "--dangerously-skip-permissions"] + (["--model", model] if model else []),
@@ -204,9 +251,11 @@ def main():
     ap.add_argument("--auth", default="subscription")
     ap.add_argument("--model", default=None)
     ap.add_argument("--provider", default=None)
-    ap.add_argument("--conditions", default="memory,empty,bare")
+    ap.add_argument("--conditions", default="memory,empty,bare", help="comma-separated: memory, empty, bare, isolated, and the arms " + ", ".join(ARMS))
+    ap.add_argument("--seeds", type=int, default=None, help="runs of each task in each arm; the plan's `seeds` otherwise")
     ap.add_argument("--timeout", type=int, default=600)
     ap.add_argument("--only", default=None, help="comma-separated task ids")
+    ap.add_argument("--out", default=None, help="the directory for the results; evals/out otherwise")
     args = ap.parse_args()
 
     with open(args.set, "rb") as f:
@@ -221,8 +270,22 @@ def main():
     harnesses = [h.strip() for h in args.harness.split(",") if h.strip()]
     conditions = [c.strip() for c in args.conditions.split(",") if c.strip()]
     root = Path(os.path.expanduser(args.root))
-    if "memory" in conditions and not AMEM.exists():
+    unknown = [c for c in conditions if c not in ("memory", "empty", "bare", "isolated", *ARMS)]
+    if unknown:
+        sys.exit(f"no such condition: {', '.join(unknown)}")
+    if any(c in ("memory", "empty", *ARMS) for c in conditions) and not AMEM.exists():
         sys.exit("build first: make build")
+    seeds = args.seeds
+    if any(c in ARMS for c in conditions):
+        if "plan" not in spec:
+            sys.exit(f"{args.set} has no [plan] table: an arm run is a run of a plan")
+        seeds = spec["plan"]["seeds"] if seeds is None else seeds
+        # a scorecard compares arms on one harness: the outcomes of two harnesses in
+        # one file are refused by `amem eval score`, after every run was paid for
+        if len(harnesses) > 1:
+            sys.exit("an arm run takes one harness: `amem eval score` refuses outcomes from more than one")
+    # one snapshot for every arm run, taken before the first run of any condition
+    as_of = snapshot(time.time())
     env = dict(os.environ)
     cred = root / "credentials.env"
     if cred.exists():
@@ -241,10 +304,17 @@ def main():
             if cond == "isolated" and harness not in ISOLATED:
                 print(f"skip: no isolated form known for {harness}", file=sys.stderr)
                 continue
-            for t in tasks:
+            # an arm runs each task once per seed; the other conditions run each task once
+            for t, seed in [(t, n) for n in range(seeds if cond in ARMS else 1) for t in tasks]:
                 since = time.time() - 1
-                if cond in ("memory", "empty"):
-                    cmd = [str(AMEM), "--root", str(root), "launch", "--harness", harness, "--auth", args.auth, "--no-handoff", "--prompt", t["prompt"]]
+                if cond in ("memory", "empty", *ARMS):
+                    cmd = [str(AMEM), "--root", str(root), "launch", "--harness", harness, "--auth", args.auth, "--no-handoff"]
+                    if cond in ARMS:
+                        # the prompt is the plan's: the launcher reads it from the set
+                        cmd += ["--arm", cond, "--as-of", as_of, "--eval-plan", str(Path(args.set).resolve()),
+                                "--eval-task", t["id"], "--eval-seed", str(seed)]
+                    else:
+                        cmd += ["--prompt", t["prompt"]]
                     if cond == "empty":
                         cmd.append("--empty-memory")
                     if args.model:
@@ -286,7 +356,7 @@ def main():
                 if cond == "empty" and empty_root and empty_root.group(1).startswith(tempfile.gettempdir()):
                     shutil.rmtree(empty_root.group(1), ignore_errors=True)
                 r = {
-                    "task": t["id"], "harness": harness, "condition": cond, "model": args.model,
+                    "task": t["id"], "harness": harness, "condition": cond, "seed": seed, "model": args.model,
                     "pass": passed, "exit": code, "seconds": round(secs, 1), "session": session,
                     "usage": usage, "resources": resources, "answer": answer[-600:], "transcript": transcript,
                     "stderr": err.strip()[-600:] if code != 0 else "",
@@ -294,18 +364,22 @@ def main():
                 results.append(r)
                 tok = f"{usage['input']}+{usage['cache_read']}c in, {usage['output']} out" if usage else "no transcript"
                 cpu = resources["cpu_user_s"] + resources["cpu_sys_s"]
-                print(f"{harness:<10} {cond:<7} {t['id']:<18} {'PASS' if passed else 'FAIL'}  {secs:5.0f}s  {tok}, cpu {cpu:.1f}s, peak {resources['peak_mib']:.0f} MiB", flush=True)
+                print(f"{harness:<10} {cond:<17} {t['id']:<18} seed {seed}  {'PASS' if passed else 'FAIL'}  {secs:5.0f}s  {tok}, cpu {cpu:.1f}s, peak {resources['peak_mib']:.0f} MiB", flush=True)
 
-    out_dir = HERE / "evals" / "out"
+    out_dir = Path(args.out).resolve() if args.out else HERE / "evals" / "out"
     out_dir.mkdir(parents=True, exist_ok=True)
     stamp = time.strftime("%Y%m%dT%H%M%S")
     name = Path(args.set).stem
     out_path = out_dir / f"{name}-{stamp}.json"
-    out_path.write_text(json.dumps({"set": args.set, "root": str(root), "args": vars(args), "results": results}, indent=1))
+    out_path.write_text(json.dumps({"set": args.set, "root": str(root), "args": vars(args), "as_of": as_of, "results": results}, indent=1))
+    outcomes, left = outcomes_of(results)
+    for r in left:
+        why = "no session id" if not r["session"] else "no usage"
+        print(f"left out of the outcomes: {r['condition']} {r['task']} seed {r['seed']}: {why}", file=sys.stderr)
 
     print()
-    print("| harness | condition | passed | input tokens | cached | output | seconds | cpu s | peak MiB |")
-    print("|---|---|---|---|---|---|---|---|---|")
+    print("| harness | condition | seeds | passed | input tokens | cached | output | seconds | cpu s | peak MiB |")
+    print("|---|---|---|---|---|---|---|---|---|---|")
     for harness in harnesses:
         for cond in conditions:
             rs = [r for r in results if r["harness"] == harness and r["condition"] == cond]
@@ -319,8 +393,12 @@ def main():
             secs = sum(r["seconds"] for r in rs)
             cpu = sum(r["resources"]["cpu_user_s"] + r["resources"]["cpu_sys_s"] for r in rs)
             peak = max(r["resources"]["peak_mib"] for r in rs)
-            print(f"| {harness} | {cond} | {ok}/{len(rs)} | {tin} | {tc} | {tout} | {secs:.0f} | {cpu:.1f} | {peak:.0f} |")
-    print(f"\nwritten {out_path.relative_to(HERE)}")
+            print(f"| {harness} | {cond} | {len({r['seed'] for r in rs})} | {ok}/{len(rs)} | {tin} | {tc} | {tout} | {secs:.0f} | {cpu:.1f} | {peak:.0f} |")
+    print(f"\nwritten {out_path.relative_to(HERE) if out_path.is_relative_to(HERE) else out_path}")
+    if any(c in ARMS for c in conditions):
+        outcomes_path = out_dir / f"{name}-{stamp}.outcomes.json"
+        outcomes_path.write_text(json.dumps(outcomes, indent=1))
+        print(f"outcomes {outcomes_path}")
 
 
 if __name__ == "__main__":

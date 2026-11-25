@@ -159,6 +159,9 @@ pub enum EntryType {
     /// A policy: a rule and its intent at a layer, L0 to L3, with a Rego module where it
     /// is machine-checkable, or an exception to one. Enforced only once verified.
     Policy,
+    /// The record for a standing role: its charter and its authority envelope. In force
+    /// only once verified; a session may fill it.
+    Position,
 }
 
 impl fmt::Display for EntryType {
@@ -170,6 +173,7 @@ impl fmt::Display for EntryType {
             EntryType::Method => "method",
             EntryType::Handoff => "handoff",
             EntryType::Policy => "policy",
+            EntryType::Position => "position",
         })
     }
 }
@@ -184,6 +188,7 @@ impl std::str::FromStr for EntryType {
             "method" => Ok(EntryType::Method),
             "handoff" => Ok(EntryType::Handoff),
             "policy" => Ok(EntryType::Policy),
+            "position" => Ok(EntryType::Position),
             other => Err(Error::Invalid(format!("unknown entry type {other:?}"))),
         }
     }
@@ -800,6 +805,22 @@ mod tests {
         assert_eq!("method".parse::<EntryType>().unwrap(), EntryType::Method);
         assert!("rumour".parse::<EntryType>().is_err());
         assert_eq!(EntryType::Handoff.to_string(), "handoff");
+        assert_eq!(
+            "position".parse::<EntryType>().unwrap(),
+            EntryType::Position
+        );
+        assert_eq!(EntryType::Position.to_string(), "position");
+    }
+
+    #[test]
+    fn an_entry_of_type_position_round_trips() {
+        let mut e = sample();
+        e.front.entry_type = EntryType::Position;
+        let text = e.render();
+        assert!(text.contains("\ntype: position\n"), "{text}");
+        let back = Entry::parse(&text).unwrap();
+        assert_eq!(back, e);
+        assert_eq!(back.render(), text);
     }
 
     #[test]

@@ -765,10 +765,17 @@ impl Memory {
         };
         let mut cited = Vec::new();
         let mut missing = Vec::new();
+        let mut named: Vec<&str> = Vec::new();
         for c in entry.front.cites.iter().filter(|c| c.starts_with("mem-")) {
-            let mut found = readable(self.get(c).await)?;
+            // a citation of a section or of a version names its entry by the bare id
+            let of = crate::address::entry_of(c).unwrap_or(c);
+            if named.contains(&of) {
+                continue;
+            }
+            named.push(of);
+            let mut found = readable(self.get(of).await)?;
             if found.is_none() && audits {
-                found = readable(self.archived(c).await)?;
+                found = readable(self.archived(of).await)?;
             }
             match found.filter(is_source) {
                 Some(e) => cited.push(e),
@@ -1227,6 +1234,30 @@ mod tests {
     const SOURCE: &str = "The gateway refuses an upload larger than 20 megabytes.";
     const HANDOFF_MARK: &str = "zebrafinch";
     const WHY_MARK: &str = "quillwort";
+
+    #[tokio::test]
+    async fn a_case_holds_one_time_an_entry_that_is_cited_by_section_and_by_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let source = put(&o, req(&format!("{SOURCE}\n"))).await;
+        let old = put(&o, req("Uploads have some limit.\n")).await;
+        let c = curator(dir.path(), &o, "agent:curator").await;
+        let by_section = format!("{source}#limit");
+        let by_version = format!("{source}@{}", "0".repeat(64));
+        let absent = "mem-absent#limit";
+        let id = rewrite(
+            &c,
+            &old,
+            "The limit of an upload is 20 megabytes.\n",
+            &[&by_section, &by_version, absent],
+        )
+        .await;
+        let case = o.curation_case(&id).await.unwrap();
+        assert_eq!(ids(&case.cited), vec![source.as_str()]);
+        assert_eq!(case.cited[0].body.trim(), SOURCE);
+        assert_eq!(case.missing, [absent]);
+        assert!(!case.unsupported());
+    }
 
     #[tokio::test]
     async fn a_case_holds_the_claim_the_replaced_version_and_the_cited_bodies_and_no_reasoning() {

@@ -429,6 +429,7 @@ fn a_curation_cycle_files_what_each_pass_finds_and_drift_once_the_model_is_repoi
     assert_eq!(log.lines().count(), 2, "{log}");
 
     the_ledger_holds_what_the_passes_filed(&f);
+    the_drift_opened_a_window(&f);
     // the curator's telemetry, read and filed
     let t = f.json(&["curator", "--domain", "dom-me", "--telemetry"]);
     assert_eq!(t["by_author"]["human:test:me"]["writes"], 6, "{t}");
@@ -479,7 +480,8 @@ fn bodies_of(tasks: &[serde_json::Value], origin: &str) -> Vec<String> {
 
 /// Three curations by an agent on a curator's task, a handoff with an instruction, and
 /// a correction: what the duties of a cycle look for. Returns the entry that cites
-/// nothing.
+/// nothing. It is written first, so a cycle, which takes the newest first, comes to
+/// the two that need a model before it.
 fn plant_duties(f: &Fixture) -> String {
     let source = f.written("fact", "The port", "The index listens on port 7.\n", None);
     let mut old = Vec::new();
@@ -506,9 +508,10 @@ fn plant_duties(f: &Fixture) -> String {
         let v: serde_json::Value = serde_json::from_str(&text).unwrap();
         v["id"].as_str().unwrap().to_string()
     };
+    let bare = rewrite(&old[2], "The index has a port.\n", &[]);
     rewrite(&old[0], "The index listens on port 7.\n", &[&source]);
     rewrite(&old[1], "UNSUPPORTED-CLAIM: the port is 9.\n", &[&source]);
-    rewrite(&old[2], "The index has a port.\n", &[])
+    bare
 }
 
 /// What a first cycle counts of the duties, on the record of [`plant_duties`].
@@ -634,7 +637,8 @@ fn a_spent_budget_stops_the_questions_of_the_duties_and_not_the_checks_with_no_m
     );
     assert_eq!(cycle["calls"], 1, "{cycle}");
     assert_eq!(cycle["handoffs_sampled"], 0, "{cycle}");
-    // the curation that cites nothing needs no model; the two others are not judged
+    // the curation that cites nothing needs no model, and it is judged after the budget
+    // is spent; the two others are not judged
     assert_eq!(cycle["curations_judged"], 1, "{cycle}");
     let tasks = filed_tasks(&f);
     let curations = bodies_of(&tasks, "auditor:curation");
@@ -698,6 +702,26 @@ fn a_qualification_decides_the_mode_and_the_model_of_the_auditor_in_a_cycle() {
     assert_eq!(cycle["auditor_mode"], "other-model", "{cycle}");
     assert_eq!(cycle["qualified"], true, "{cycle}");
     assert_eq!(cycle["human_review"], 1, "the other-model mode: {cycle}");
+}
+
+/// The drift that the second cycle confirmed opened one drift window, which starts at
+/// the run before the one that fired: the first cycle's run.
+fn the_drift_opened_a_window(f: &Fixture) {
+    let windows = f.json(&["drift", "window", "list"]);
+    let windows = windows.as_array().unwrap();
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    let w = &windows[0];
+    let runs = f
+        .root
+        .join("state/drift")
+        .join(w["destination"].as_str().unwrap())
+        .join(format!("{}.jsonl", w["model"].as_str().unwrap()));
+    let runs = std::fs::read_to_string(&runs).unwrap();
+    let first: serde_json::Value = serde_json::from_str(runs.lines().next().unwrap()).unwrap();
+    assert_eq!(runs.lines().count(), 2, "one run for each cycle");
+    assert_eq!(w["from"], first["at"], "{w}");
+    assert_eq!(w["until"], serde_json::Value::Null, "{w}");
+    assert!(!w["detectors"].as_array().unwrap().is_empty(), "{w}");
 }
 
 #[test]

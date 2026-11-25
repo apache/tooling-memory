@@ -28,11 +28,10 @@
 //! reader has seen, and a reader that asks for the events after a number misses none.
 
 use crate::{
-    check_holder, claimable, parse_time, Checkpointed, Claimant, Error, Event, Held,
+    check_holder, claimable, parse_time, Checkpointed, Claimer, Error, Event, Held, Moment,
     PromotionRecord, PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken,
     Task, TaskSpec, EPOCH_KEY, LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
-use dm_core::Label;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use time::OffsetDateTime;
@@ -484,6 +483,37 @@ impl Db {
         rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
     }
 
+    /// The moments of the tasks of one domain, oldest first. The join leaves out the
+    /// records that are no task's. A domain that has recorded nothing has none.
+    pub(crate) async fn moments(&self, domain: &str) -> Result<Vec<Moment>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT e.task_id, e.kind, e.at, e.payload
+                     FROM {s}.events e JOIN {s}.tasks t ON t.id = e.task_id
+                     WHERE t.domain = $1 AND e.kind IN ({}) ORDER BY e.seq",
+                    crate::moment_kinds_sql()
+                ),
+                &[&domain],
+            )
+            .await?;
+        let mut out = Vec::new();
+        for r in &rows {
+            let (at, payload): (String, String) = (r.try_get(2)?, r.try_get(3)?);
+            out.push(crate::moment_from_row(
+                r.try_get(0)?,
+                r.try_get(1)?,
+                &at,
+                &payload,
+            )?);
+        }
+        Ok(out)
+    }
+
     /// Record a promotion unless that promoter promoted that version of the entry to that
     /// tier already. The domain's lock is held from the check to the commit, so two
     /// processes recording the same promotion record it once.
@@ -525,6 +555,49 @@ impl Db {
         tx.commit().await?;
         self.remember(&spec.domain, &s);
         Ok(true)
+    }
+
+    /// Append an event that is a record and no task's, such as an approval, under `key`
+    /// in one transaction. The domain's schema is made if this is the first thing the
+    /// domain records.
+    pub(crate) async fn append_record(
+        &mut self,
+        domain: &str,
+        key: &str,
+        at: OffsetDateTime,
+        event: &Event,
+    ) -> Result<(), Error> {
+        let tx = self.client.transaction().await?;
+        let s = ensure_domain(&tx, domain).await?;
+        apply(&tx, &s, key, at, event).await?;
+        tx.commit().await?;
+        self.remember(domain, &s);
+        Ok(())
+    }
+
+    /// The payloads of a domain's events of one kind that are records and no task's,
+    /// oldest first: those under `key` when it is given, else all of them. A domain that
+    /// has recorded nothing has none.
+    pub(crate) async fn record_payloads(
+        &self,
+        domain: &str,
+        kind: &str,
+        key: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        let Some(s) = self.schema(domain).await? else {
+            return Ok(Vec::new());
+        };
+        let rows = self
+            .client
+            .query(
+                &format!(
+                    "SELECT payload FROM {s}.events
+                     WHERE kind = $1 AND ($2::text IS NULL OR task_id = $2) ORDER BY seq"
+                ),
+                &[&kind, &key],
+            )
+            .await?;
+        rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
     }
 
     /// Remove the why from an entry's promotion events and rows, in one transaction under
@@ -637,10 +710,8 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<Option<Taken>, Error> {
         let Some(s) = self.schema(domain).await? else {
             return Ok(None);
@@ -688,10 +759,10 @@ impl Db {
             .collect::<Result<Vec<_>, _>>()?;
         crate::in_queue_order(&mut candidates);
         for seen in candidates {
-            if !claimable(&seen, now, manifest, handling) {
+            if !claimable(&seen, now, who) {
                 continue;
             }
-            if take(&tx, &s, &seen.id, now, (who, until), manifest, handling).await? {
+            if take(&tx, &s, &seen.id, now, (who, until)).await? {
                 tx.commit().await?;
                 return Ok(Some(Taken::New(seen.id)));
             }
@@ -708,15 +779,18 @@ impl Db {
         who: (&str, OffsetDateTime),
     ) -> Result<bool, Error> {
         let who = (
-            Claimant {
+            Claimer {
                 holder: who.0,
+                manifest: &[],
+                handling: dm_core::Label::Restricted,
+                seat: None,
                 attempt: None,
             },
             who.1,
         );
         let tx = self.client.transaction().await?;
         let s = lock_task_domain(&tx, id).await?;
-        let taken = take(&tx, &s, id, now, who, &[], Label::Restricted).await?;
+        let taken = take(&tx, &s, id, now, who).await?;
         tx.commit().await?;
         Ok(taken)
     }
@@ -725,10 +799,8 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<(), Error> {
         let tx = self.client.transaction().await?;
         let s = lock_task_domain(&tx, id).await?;
@@ -740,9 +812,10 @@ impl Db {
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         let task = task_from_row(&row)?;
-        if !claimable(&task, now, manifest, handling)
+        if !claimable(&task, now, who)
             || !deps_complete(&tx, &task.spec.depends_on).await?
             || awaits_continuation(&tx, &s, &task.id).await?
+            || resumes_unsettled(&tx, &task).await?
         {
             return Err(Error::WrongState {
                 id: id.to_string(),
@@ -750,12 +823,7 @@ impl Db {
                 op: "claim",
             });
         }
-        let claimed = Event::Claimed {
-            holder: who.holder.to_string(),
-            until,
-            generation: task.generation + 1,
-            attempt: who.attempt.map(str::to_string),
-        };
+        let claimed = who.claimed(until, task.generation + 1);
         apply(&tx, &s, id, now, &claimed).await?;
         tx.commit().await?;
         Ok(())
@@ -1218,9 +1286,7 @@ async fn take<C: GenericClient>(
     s: &str,
     id: &str,
     now: OffsetDateTime,
-    who: (Claimant<'_>, OffsetDateTime),
-    manifest: &[String],
-    handling: Label,
+    who: (Claimer<'_>, OffsetDateTime),
 ) -> Result<bool, Error> {
     let locked = tx
         .query_opt(
@@ -1232,18 +1298,14 @@ async fn take<C: GenericClient>(
         return Ok(false);
     };
     let task = task_from_row(&locked)?;
-    if !claimable(&task, now, manifest, handling)
+    if !claimable(&task, now, who.0)
         || !deps_complete(tx, &task.spec.depends_on).await?
         || awaits_continuation(tx, s, &task.id).await?
+        || resumes_unsettled(tx, &task).await?
     {
         return Ok(false);
     }
-    let claimed = Event::Claimed {
-        holder: who.0.holder.to_string(),
-        until: who.1,
-        generation: task.generation + 1,
-        attempt: who.0.attempt.map(str::to_string),
-    };
+    let claimed = who.0.claimed(who.1, task.generation + 1);
     apply(tx, s, &task.id, now, &claimed).await?;
     Ok(true)
 }
@@ -1408,6 +1470,32 @@ async fn awaits_continuation<C: GenericClient>(conn: &C, s: &str, id: &str) -> R
         )
         .await?
         .is_some())
+}
+
+/// Whether the work of `task` is held by an effect that nobody has settled: an effect of
+/// the task it continues or retries, however far up and in whichever domain. Such an
+/// effect holds the work under each of its names, so the task is nobody's to claim.
+async fn resumes_unsettled<C: GenericClient>(conn: &C, task: &Task) -> Result<bool, Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut up = crate::resumed(task).map(str::to_string);
+    while let Some(id) = up.take() {
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        let Some(s) = schema_of_task_in(conn, &id).await? else {
+            break;
+        };
+        let above = match get_in(conn, &s, &id).await {
+            Ok(t) => t,
+            Err(Error::NotFound(_)) => break,
+            Err(e) => return Err(e),
+        };
+        if !above.effects.is_empty() {
+            return Ok(true);
+        }
+        up = crate::resumed(&above).map(str::to_string);
+    }
+    Ok(false)
 }
 
 /// Drop one domain's projection and replay its events into it.
@@ -1669,6 +1757,41 @@ async fn insert_promotion<C: GenericClient>(
     Ok(())
 }
 
+/// The projection of the events that hold a task back from a claim, or stop doing so:
+/// what it waits on and which effects are not settled live in `extra`.
+async fn project_hold<C: GenericClient>(
+    conn: &C,
+    s: &str,
+    id: &str,
+    event: &Event,
+) -> Result<(), Error> {
+    let row = conn
+        .query_opt(
+            &format!("SELECT extra FROM {s}.tasks WHERE id = $1 FOR UPDATE"),
+            &[&id],
+        )
+        .await?;
+    let extra: Option<String> = row.map(|r| r.try_get(0)).transpose()?.flatten();
+    if let Some(next) = crate::extra_after(id, extra.as_deref(), event)? {
+        conn.execute(
+            &format!("UPDATE {s}.tasks SET extra = $2 WHERE id = $1"),
+            &[&id, &next],
+        )
+        .await?;
+    }
+    if matches!(event, Event::Waiting { .. }) {
+        conn.execute(
+            &format!(
+                "UPDATE {s}.tasks SET status = 'blocked', holder = NULL, lease_until = NULL
+                 WHERE id = $1"
+            ),
+            &[&id],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Update the projection for one event. Replay calls this and nothing else.
 async fn project<C: GenericClient>(
     conn: &C,
@@ -1701,11 +1824,20 @@ async fn project<C: GenericClient>(
             "SET status = 'proposed' WHERE id = $1 AND status IN ('open', 'blocked')",
             vec![&id],
         ),
-        // the record that someone tried, spoke after its claim, or judged the result: nothing
-        // of the task moves
-        Event::ClaimRefused { .. } | Event::LateHandoff { .. } | Event::Outcome { .. } => {
-            return Ok(());
-        }
+        // the pin leaves the row, so a replay leaves the task unpinned too. The column is
+        // text, and a row with no `extra` holds no pin
+        Event::Unpinned { .. } => (
+            "SET extra = ((extra::jsonb) - 'position' - 'pin_reason')::text
+             WHERE id = $1 AND extra IS NOT NULL AND extra <> ''",
+            vec![&id],
+        ),
+        // the record that someone tried, or spoke after its claim, or judged the result,
+        // or approved an action, or of what a task definition earned: no task moves
+        Event::ClaimRefused { .. }
+        | Event::LateHandoff { .. }
+        | Event::Outcome { .. }
+        | Event::Approved(_)
+        | Event::Definition(_) => return Ok(()),
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,
                 attempts = attempts + 1 WHERE id = $1",
@@ -1729,6 +1861,10 @@ async fn project<C: GenericClient>(
                 lease_until = NULL WHERE id = $1",
             vec![&id, reason, superseded_by],
         ),
+        Event::Waiting { .. }
+        | Event::Arrived { .. }
+        | Event::EffectBegun { .. }
+        | Event::EffectSettled { .. } => return project_hold(conn, s, id, event).await,
         Event::Posted { to } => ("SET posted_to = $2 WHERE id = $1", vec![&id, to]),
         Event::Rescored { priority, .. } => {
             ("SET priority = $2 WHERE id = $1", vec![&id, priority])

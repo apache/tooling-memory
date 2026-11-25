@@ -307,6 +307,35 @@ impl Store {
         })
     }
 
+    /// Write an entry only when its id has no current version in its domain. Gives
+    /// whether this call wrote it. The backend decides in one step, so of two calls at
+    /// the same time one writes and the other does not. Nothing is read, archived or
+    /// replaced: an entry that is there stays as it is, a stub included.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadName`] for a domain or id that cannot be a path, or a backend error,
+    /// which includes a backend that has no conditional write.
+    pub async fn create(&self, entry: &Entry) -> Result<bool, Error> {
+        let path = current_path(&entry.front.domain, &entry.front.id)?;
+        let text = entry.render().into_bytes();
+        match self.op.write_with(&path, text).if_not_exists(true).await {
+            Ok(_) => Ok(true),
+            Err(e) if e.kind() == opendal::ErrorKind::ConditionNotMatch => Ok(false),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Whether `id` has a current version in `domain`, whatever its status. Nothing of
+    /// the entry is read.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::BadName`] for a domain or id that cannot be a path, or a backend error.
+    pub async fn exists(&self, domain: &str, id: &str) -> Result<bool, Error> {
+        Ok(self.op.exists(&current_path(domain, id)?).await?)
+    }
+
     /// The current version of an entry, parsed. `None` when there is none.
     ///
     /// # Errors
@@ -711,6 +740,53 @@ mod tests {
         assert_eq!(w.digest, digest(&e.render()));
         assert_eq!(s.get("dom-a", "mem-a-1").await.unwrap(), Some(e));
         assert_eq!(s.get("dom-a", "mem-a-9").await.unwrap(), None);
+    }
+
+    /// The entry that is there stays, with no history, on each backend in use.
+    async fn creates_once(s: &Store) {
+        let first = entry("dom-a", "mem-a-1", "First.\n");
+        assert!(!s.exists("dom-a", "mem-a-1").await.unwrap());
+        assert!(s.create(&first).await.unwrap(), "the id was free");
+        assert!(s.exists("dom-a", "mem-a-1").await.unwrap());
+        let second = entry("dom-a", "mem-a-1", "Second.\n");
+        assert!(!s.create(&second).await.unwrap(), "the id is taken");
+        assert_eq!(s.get("dom-a", "mem-a-1").await.unwrap(), Some(first));
+        assert!(s.history("dom-a", "mem-a-1").await.unwrap().is_empty());
+        // the same id in another domain is another entry
+        let other = entry("dom-b", "mem-a-1", "Second.\n");
+        assert!(s.create(&other).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn create_writes_an_entry_only_when_its_id_is_free() {
+        creates_once(&Store::in_memory().unwrap()).await;
+        let dir = tempfile::tempdir().unwrap();
+        creates_once(&Store::open_dir(dir.path()).unwrap()).await;
+    }
+
+    /// Many writers of one id at the same time: one writes, and its text stays.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn of_many_creates_at_the_same_time_one_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Store::open_dir(dir.path()).unwrap();
+        let mut writers = Vec::new();
+        for n in 0..16 {
+            let s = s.clone();
+            writers.push(tokio::spawn(async move {
+                let e = entry("dom-a", "mem-a-1", &format!("Writer {n}.\n"));
+                (n, s.create(&e).await.unwrap())
+            }));
+        }
+        let mut wrote = Vec::new();
+        for w in writers {
+            let (n, created) = w.await.unwrap();
+            if created {
+                wrote.push(n);
+            }
+        }
+        assert_eq!(wrote.len(), 1, "{wrote:?}");
+        let kept = s.get("dom-a", "mem-a-1").await.unwrap().unwrap();
+        assert_eq!(kept.body, format!("Writer {}.\n", wrote[0]));
     }
 
     /// A writer that read an entry before its erasure, and writes a version of what it

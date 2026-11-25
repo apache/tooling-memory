@@ -8,6 +8,7 @@ use crate::hooks::{self, Event};
 use crate::Session;
 use dm_client::{MemoryClient, Task};
 use dm_sandbox::Harness;
+use dm_server::arms::TRANSCRIPT_BUDGET_TOKENS;
 use dm_server::{mcp, prefetch, Memory};
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -37,6 +38,11 @@ pub struct Options {
     pub prefetch: bool,
     /// Claim this task rather than the next one, and stop after it.
     pub task: Option<String>,
+    /// Fill this position before the first claim.
+    pub position: Option<String>,
+    /// Before each claim, fill the first position that waits for this session, and
+    /// leave it when the task is settled.
+    pub wake: bool,
 }
 
 /// How to mine after a task.
@@ -175,12 +181,19 @@ pub async fn prompted(
             prompt: Some(prompt.to_string()),
             dirty: commit.as_ref().is_some_and(|(_, d)| *d),
             commit: commit.map(|(c, _)| c),
+            ..dm_server::tape::TapeStart::default()
         })
         .await
         .ok();
+    // the transcript-replay arm: earlier sessions' transcripts in front of the prompt.
+    // The tape keeps the caller's prompt; nothing is added under any other setting
+    let given = session
+        .memory()
+        .prompt_given(prompt, TRANSCRIPT_BUDGET_TOKENS)
+        .await?;
     // the harness's own arguments follow its headless form, where every harness takes
     // a flag after the prompt
-    let mut argv = session.harness().headless(prompt);
+    let mut argv = session.harness().headless(&given);
     argv.extend(args.iter().cloned());
     let (code, output) = session.run(&argv, true).await?;
     let output = output.map(|o| answer_of(session, o));
@@ -188,10 +201,11 @@ pub async fn prompted(
         crate::stops::answer(out);
     }
     let mut after = handoff_ids(&client, None).await?;
-    let wrote = after.difference(&before).next().is_some();
+    // a session whose settings leave its own handoff out of what it lists still wrote it
+    let wrote = after.difference(&before).next().is_some() || session.memory().written().1 > 0;
     after.extend(file_outbox(session, &client, wrote, None).await?);
     let new: Vec<&String> = after.difference(&before).collect();
-    if new.is_empty() && !no_handoff {
+    if new.is_empty() && !wrote && !no_handoff {
         eprintln!(
             "amem: the run left no handoff; the next session starts from nothing (pass --no-handoff if that is intended)"
         );
@@ -254,6 +268,10 @@ fn muse_answer(jsonl: &str) -> Option<String> {
 /// When the harness cannot be run or the memory server cannot be reached.
 pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
     let client = Arc::new(client(session.memory()).await?);
+    let memory = session.memory();
+    if let Some(name) = &options.position {
+        crate::positions::fill(&memory, name, options.domain.as_deref()).await?;
+    }
     let mut last = NOTHING_TO_DO;
     loop {
         // counted from before the claim until the task is settled: a launcher told to
@@ -262,17 +280,7 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
         let Ok(in_flight) = crate::stops::InFlight::enter() else {
             return Ok(last);
         };
-        let claimed = match &options.task {
-            Some(id) => client.claim(id, options.lease_seconds).await?,
-            // a worker only claims: rank is the ledger's, moved along dependency edges
-            // at admission and by triage's cycle, never by a worker on its way in
-            None => {
-                client
-                    .claim_next(options.domain.as_deref(), options.lease_seconds)
-                    .await?
-            }
-        };
-        let Some(task) = claimed else {
+        let Some(task) = next_task(&memory, &client, options).await? else {
             drop(in_flight);
             if !options.keep_going {
                 eprintln!("amem: nothing claimable");
@@ -290,28 +298,81 @@ pub async fn run(session: &Session, options: &Options) -> Fallible<i32> {
             client.release(&task.id, None).await.ok();
             return Ok(last);
         }
-        last = one(session, &client, &task, options).await?;
+        let ran = one(session, &client, &task, options).await;
+        if options.wake {
+            // the task is settled, or the run failed: the next claim wakes a position
+            // afresh, and this session is in none until then
+            memory.vacate();
+        }
+        last = ran?;
         drop(in_flight);
         if options.task.is_some() {
             return Ok(last);
         }
-        if let Some(plan) = options
-            .mine
-            .as_ref()
-            .filter(|_| !dm_sandbox::stop::stopping())
-        {
-            let via = if plan.via_harness {
-                crate::MineVia::Harness
-            } else {
-                crate::MineVia::Api
-            };
-            if let Err(e) = session.mine(plan.model.as_deref(), via).await {
-                eprintln!("amem: mining failed: {e}");
-            }
-        }
+        mine_after(session, options).await;
         if !options.keep_going {
             return Ok(last);
         }
+    }
+}
+
+/// The task to run next: the one named, or the next one the ledger gives this session.
+/// With `wake`, the session fills each position that waits for it, in turn, and claims
+/// in that position's domain, until one gives a task; when none does, it claims nothing
+/// and is in no position. A position that refuses the session is passed over.
+async fn next_task(
+    memory: &Memory,
+    client: &MemoryClient,
+    options: &Options,
+) -> Fallible<Option<Task>> {
+    if let Some(id) = &options.task {
+        return Ok(client.claim(id, options.lease_seconds).await?);
+    }
+    if !options.wake {
+        // a worker only claims: rank is the ledger's, moved along dependency edges at
+        // admission and by triage's cycle, never by a worker on its way in
+        return Ok(client
+            .claim_next(options.domain.as_deref(), options.lease_seconds)
+            .await?);
+    }
+    for woken in crate::positions::waiting(memory, options.domain.as_deref()).await? {
+        if !crate::positions::wake(memory, &woken).await? {
+            continue;
+        }
+        let claimed = client
+            .claim_next(Some(&woken.domain), options.lease_seconds)
+            .await;
+        if let Ok(Some(task)) = claimed {
+            return Ok(Some(task));
+        }
+        // nothing of this position is this session's to claim: it leaves the position,
+        // so one such position does not keep it from the next that waits
+        memory.vacate();
+        claimed?;
+        eprintln!(
+            "amem: nothing of {} is claimable by this session",
+            woken.position
+        );
+    }
+    Ok(None)
+}
+
+/// Mine the transcript after a task, when the options say so and no stop came.
+async fn mine_after(session: &Session, options: &Options) {
+    let Some(plan) = options
+        .mine
+        .as_ref()
+        .filter(|_| !dm_sandbox::stop::stopping())
+    else {
+        return;
+    };
+    let via = if plan.via_harness {
+        crate::MineVia::Harness
+    } else {
+        crate::MineVia::Api
+    };
+    if let Err(e) = session.mine(plan.model.as_deref(), via).await {
+        eprintln!("amem: mining failed: {e}");
     }
 }
 
@@ -430,7 +491,16 @@ async fn settle(
             );
             Ok(0)
         }
-        "claimed" if delegated_report(task, code, &output) => {
+        "blocked" if awaits_verdict(&now) => {
+            eprintln!(
+                "amem: {id} handed in with handoff {handoff}, and it waits for a verdict: \
+                 `amem task verdict {id} --accept` or `--reject`",
+                id = task.id,
+                handoff = now.handoff.as_deref().unwrap_or("-")
+            );
+            Ok(0)
+        }
+        "claimed" if completes_with_report(task, &now, code, &output) => {
             let handoff = client
                 .write_handoff(
                     &format!("Report: {}", task.title),
@@ -451,35 +521,55 @@ async fn settle(
             );
             Ok(0)
         }
-        "claimed" => {
-            let tail = tail_of(&output, 6000);
-            let body = format!(
-                "# {title}\n\n`{harness}` stopped without completing task {id} (exit {code}). \
-                 The task is back in the pool; what follows is what it printed, so the next \
-                 claimant can start from here.\n\n## Output\n\n{tail}\n",
-                title = task.title,
-                harness = harness.binary(),
-                id = task.id,
-            );
-            let handoff = client
-                .write_handoff(
-                    &format!("Task {} stopped: {}", task.id, task.title),
-                    &body,
-                    Some(&task.domain),
-                )
-                .await?;
-            client.release(&task.id, Some(&handoff)).await?;
-            eprintln!(
-                "amem: {} released; its output is filed as handoff {handoff}",
-                task.id
-            );
-            Ok(STOPPED)
-        }
+        "claimed" => give_back(harness, client, task, &now, code, &output).await,
         other => {
             eprintln!("amem: {} is now {other}", task.id);
             Ok(if code == 0 { STOPPED } else { code })
         }
     }
+}
+
+/// A task that its run still holds goes back to the pool, with what the harness
+/// printed filed as a handoff for the next claimant.
+async fn give_back(
+    harness: Harness,
+    client: &MemoryClient,
+    task: &Task,
+    now: &Task,
+    code: i32,
+    output: &str,
+) -> Fallible<i32> {
+    let tail = tail_of(output, 6000);
+    let held = unsettled(now)
+        .map(|action| {
+            format!(
+                " External action `{action}` of the task is not settled: nobody can \
+                 claim the task until a person or a tap settles it \
+                 (`amem task effect-settle`)."
+            )
+        })
+        .unwrap_or_default();
+    let body = format!(
+        "# {title}\n\n`{harness}` stopped without completing task {id} (exit {code}). \
+         The task is back in the pool; what follows is what it printed, so the next \
+         claimant can start from here.{held}\n\n## Output\n\n{tail}\n",
+        title = task.title,
+        harness = harness.binary(),
+        id = task.id,
+    );
+    let handoff = client
+        .write_handoff(
+            &format!("Task {} stopped: {}", task.id, task.title),
+            &body,
+            Some(&task.domain),
+        )
+        .await?;
+    client.release(&task.id, Some(&handoff)).await?;
+    eprintln!(
+        "amem: {} released; its output is filed as handoff {handoff}",
+        task.id
+    );
+    Ok(STOPPED)
 }
 
 /// Whether a run's output is a delegated task's report: a task the board filed for a
@@ -494,6 +584,30 @@ fn delegated_report(task: &Task, code: i32, output: &str) -> bool {
             .get("origin")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|o| o.starts_with("task:"))
+}
+
+/// Whether a run's report completes its task: the report of a delegated task, `task` as
+/// it was claimed, when `now`, the task as it is, has no external action that nobody
+/// has settled.
+fn completes_with_report(task: &Task, now: &Task, code: i32, output: &str) -> bool {
+    delegated_report(task, code, output) && unsettled(now).is_none()
+}
+
+/// Whether a task waits for the verdict on its own work, as the ledger tells it: the
+/// event that it waits on is `verdict:<its id>`.
+fn awaits_verdict(now: &Task) -> bool {
+    let event = dm_server::autonomy::verdict_event(&now.id);
+    now.raw
+        .get("waiting_on")
+        .and_then(serde_json::Value::as_str)
+        == Some(event.as_str())
+}
+
+/// The first external action of a task that nobody has settled, when there is one. The
+/// ledger refuses to complete such a task, whatever its run reported: the task goes
+/// back with a handoff, and waits for whoever settles the action.
+pub(crate) fn unsettled(task: &Task) -> Option<&str> {
+    task.raw.get("effects")?.as_array()?.first()?.as_str()
 }
 
 fn tail_of(s: &str, chars: usize) -> String {
@@ -809,6 +923,51 @@ mod tests {
         assert!(!delegated_report(&task(None), 0, "done"));
     }
 
+    /// The launcher reads what a task waits on from the task as the memory server
+    /// gives it. Only the task's own verdict counts.
+    #[test]
+    fn a_task_awaits_its_verdict_when_it_waits_on_the_verdict_event_of_its_own_id() {
+        let task = |waiting_on: serde_json::Value| Task {
+            id: "task-a-1".into(),
+            title: "t".into(),
+            body: "b".into(),
+            domain: "dom-a".into(),
+            status: "blocked".into(),
+            depends_on: Vec::new(),
+            requirements: Vec::new(),
+            handoff: Some("handoff-a-1".into()),
+            raw: serde_json::json!({ "waiting_on": waiting_on }),
+        };
+        assert!(awaits_verdict(&task("verdict:task-a-1".into())));
+        assert!(!awaits_verdict(&task("verdict:task-a-2".into())));
+        assert!(!awaits_verdict(&task("check:fixtures-42".into())));
+        assert!(!awaits_verdict(&task(serde_json::Value::Null)));
+    }
+
+    #[test]
+    fn a_report_does_not_complete_a_task_with_an_action_that_nobody_settled() {
+        let task = |effects: serde_json::Value| Task {
+            id: "task-a-1".into(),
+            title: "t".into(),
+            body: "b".into(),
+            domain: "dom-a".into(),
+            status: "claimed".into(),
+            depends_on: Vec::new(),
+            requirements: Vec::new(),
+            handoff: None,
+            raw: serde_json::json!({ "origin": "task:task-a-0", "effects": effects }),
+        };
+        let claimed = task(serde_json::Value::Null);
+        let report = "DR-19 is proposed.";
+        let settled = task(serde_json::json!([]));
+        assert!(completes_with_report(&claimed, &claimed, 0, report));
+        assert!(completes_with_report(&claimed, &settled, 0, report));
+        // the ledger would refuse the completion: the task goes back with a handoff
+        let begun = task(serde_json::json!(["push-1", "push-2"]));
+        assert_eq!(unsettled(&begun), Some("push-1"));
+        assert!(!completes_with_report(&claimed, &begun, 0, report));
+    }
+
     use super::*;
 
     #[test]
@@ -824,6 +983,7 @@ mod tests {
             summary: summary.into(),
             score: 0.0,
             review_due: false,
+            snippet: None,
             reach: dm_core::Reach::Fleet,
         };
         let found = prefetch::Prefetched {

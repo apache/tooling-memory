@@ -116,7 +116,8 @@ pub enum Change {
         ids: Vec<String>,
         /// Whether the read is a survey, and so no use of the entries. A survey served
         /// no body: the hits of a search or of a list, a brief, the rules of a policy
-        /// check, or the summaries in the prompt of a task. A check of the auditor that
+        /// check, or the summaries in the prompt of a task. A hit of a search has a
+        /// snippet of the body, and the search stays a survey. A check of the auditor that
         /// reads bodies to test them together is a survey too, and so is the read of an
         /// export, which carries each entry of its scope. A read that served a body to a
         /// reader leaves the field out.
@@ -427,7 +428,10 @@ impl Writer {
 
     /// Sync what was appended without a sync of its own.
     fn sync(&self) -> Result<(), Error> {
-        std::fs::File::open(&self.log)
+        // opened for writing: Windows refuses to flush a handle that can only read
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.log)
             .and_then(|f| f.sync_data())
             .map_err(crate::io(&self.log))
     }
@@ -498,6 +502,24 @@ pub fn append_with(
     let mut writer = Writer::open(root, domain)?;
     let change = make(writer.last + 1)?;
     writer.append(by, actor, label, sync, change)
+}
+
+/// The offset of `domain`'s log: the sequence number of its last event that names a
+/// version, a `put` or an `erased`, and 0 for a log with no such event. With an entry's
+/// id, an offset names the version the entry had then: the last version the log put at
+/// or before it. A read, a send, an offered or refused write and an event of the ledger
+/// change no version, so the offset stays where it is after each of them.
+///
+/// # Errors
+///
+/// A domain that is not a name, or the file system.
+pub fn offset(root: &Path, domain: &str) -> Result<u64, Error> {
+    let events = read(root, domain, 0)?;
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.change, Change::Put { .. } | Change::Erased { .. }));
+    Ok(last.map_or(0, |e| e.seq))
 }
 
 /// A domain's log from `from` on, in order. A line that does not parse is skipped: a
@@ -577,16 +599,6 @@ fn last_ledger_seq(root: &Path, domain: &str) -> Result<u64, Error> {
         })
         .max()
         .unwrap_or(0))
-}
-
-/// Whether a citation names an entry, in the shape of a name the record holds. A link
-/// or a path does not, and stays out of the log.
-fn names_entry(cite: &str) -> bool {
-    dm_core::id::is_entry_id(cite)
-        && cite.len() <= 128
-        && cite
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 impl Memory {
@@ -676,13 +688,9 @@ impl Memory {
             Ok(Change::Write {
                 id: entry.front.id.clone(),
                 digest: dm_core::digest(&text),
-                cites: entry
-                    .front
-                    .cites
-                    .iter()
-                    .filter(|c| names_entry(c))
-                    .cloned()
-                    .collect(),
+                // by the bare id: a citation of a section or of a version names its
+                // entry, and a link or a path names none and stays out of the log
+                cites: crate::address::entries_of(&entry.front.cites),
                 supersedes: entry.front.supersedes.clone(),
             })
         };
@@ -836,6 +844,27 @@ impl Memory {
             )?;
         }
         Ok(())
+    }
+
+    /// Write an entry that the record holds once, through its domain's log: the change
+    /// is appended first, then the record takes the entry only when it holds none with
+    /// this id. When this call wrote it, gives the sequence number of its `put` event:
+    /// where a feed of the index starts to take it ([`Memory::feed_from`]). The text of
+    /// such an entry follows from its id alone, so the version that the log names is the
+    /// version that the record holds, whichever call wrote it.
+    pub(crate) async fn create_logged(&self, entry: &Entry) -> Result<Option<u64>, Error> {
+        let put = append(
+            &self.root,
+            &entry.front.domain,
+            &self.author,
+            Change::Put {
+                id: entry.front.id.clone(),
+                digest: dm_core::digest(&entry.render()),
+                active: entry.is_active(),
+            },
+        )?
+        .seq;
+        Ok(self.store.create(entry).await?.then_some(put))
     }
 
     /// Copy the ledger's events of `domain` that its log does not hold yet into the log,
@@ -1222,8 +1251,9 @@ mod tests {
         m.store.put(&early).await.unwrap();
         assert!(m.search("steps", None, 10).await.unwrap().is_empty());
         let done = m.materialize(None).await.unwrap();
-        // three writes offered, the five events above, and no read: nothing was served
-        assert_eq!((done.events, done.live), (8, 2), "{done:?}");
+        // three writes offered, the five events above, and the copy of the approval that
+        // the owner's own erasure is; no read: nothing was served
+        assert_eq!((done.events, done.live), (9, 2), "{done:?}");
         assert!(done.behind.is_empty(), "{done:?}");
         let hits = m.search("steps", None, 10).await.unwrap();
         assert_eq!(
@@ -2248,7 +2278,11 @@ mod tests {
         for e in &events {
             assert_eq!(e.session.as_deref(), Some(owner.session_id()));
         }
-        assert_eq!(owner.label(), Label::Public, "an export shows it nothing");
+        assert_eq!(
+            owner.label(),
+            Label::Restricted,
+            "the label rises to the highest label that the bundle carries"
+        );
     }
 
     fn task(title: &str, label: Label) -> dm_ledger::TaskSpec {

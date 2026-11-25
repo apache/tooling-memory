@@ -14,6 +14,7 @@
 //! ledger.jsonl                  each event of the ledger, a line for each
 //! quarantine/...                the writes that a gate holds
 //! refused/...                   the refusal record of each personal domain
+//! drift/windows.jsonl           the drift windows: what an agent wrote in one is not promoted
 //! config/...                    the grants, the registry, the prices and the policy
 //! ```
 //!
@@ -65,6 +66,9 @@ const REFUSALS_FILE: &str = "refused.txt";
 
 const QUARANTINE_DIR: &str = "state/quarantine";
 const LEDGER_EVENTS: &str = "ledger.jsonl";
+/// The drift windows as a bundle holds them. Without them, a restored root promotes what
+/// an agent wrote inside a drift window.
+const DRIFT_WINDOWS: &str = "drift/windows.jsonl";
 
 /// The directory of the recovery bundle that a root makes at `stamp`, for a caller that
 /// names no path of its own.
@@ -262,8 +266,8 @@ impl Memory {
 
     /// Make a recovery bundle of this root in `dest`. For each granted domain the log
     /// and the record are copied while no event can be appended to that log; then the
-    /// events of the ledger, the writes in quarantine, the refusal records and the
-    /// configuration; then the manifest, with a digest for each file. The index, the
+    /// events of the ledger, the writes in quarantine, the refusal records, the drift
+    /// windows and the configuration; then the manifest, with a digest for each file. The index, the
     /// telemetry, the decision log, the read log and the claim epoch are not copied.
     /// Each domain's log gets a `send` event that names the bundle: an erasure made
     /// later names the bundle on its receipt as a copy it cannot reach.
@@ -346,10 +350,15 @@ impl Memory {
         })
     }
 
-    /// Copy the writes in quarantine, the refusal records and the configuration.
+    /// Copy the writes in quarantine, the refusal records, the drift windows and the
+    /// configuration.
     fn bundle_held_and_config(&self, dest: &Path) -> Result<(), Error> {
         let root = &self.root;
         copy_tree(&root.join(QUARANTINE_DIR), &dest.join("quarantine"))?;
+        copy_file(
+            &root.join(crate::drift_windows::FILE),
+            &dest.join(DRIFT_WINDOWS),
+        )?;
         copy_tree(
             &root.join(crate::registry::REFUSED_DIR),
             &dest.join("refused"),
@@ -464,10 +473,7 @@ impl Memory {
                 "cross-domain-dependency",
                 "coordination across domains is not built, so no bundle holds this case",
             ),
-            not_built(
-                "uncertain-external-action",
-                "the uncertain external effect is not built, so no bundle holds this case",
-            ),
+            uncertain_external_action(&m, &held).await,
         ];
         let passed = cases.iter().all(|c| c.outcome != Outcome::Failed);
         Ok(Drill {
@@ -689,8 +695,9 @@ pub struct Restored {
 ///
 /// 1. The manifest is read and checked, and the digest of every file is compared. A
 ///    bundle that fails writes nothing into `into`.
-/// 2. `into` gets the marker [`RESTORING`], then the record, the logs, the quarantine and
-///    the refusal records of the bundle, and the grants and the registry of `authority`.
+/// 2. `into` gets the marker [`RESTORING`], then the record, the logs, the quarantine,
+///    the refusal records and the drift windows of the bundle, and the grants and the
+///    registry of `authority`.
 ///    The configuration of the bundle goes to [`RESTORED_CONFIG`].
 /// 3. The ledger takes its events, each with its sequence number.
 /// 4. The claim epoch file gives the next epoch, and the ledger begins it.
@@ -745,6 +752,9 @@ pub async fn restore(
 /// Where a file of the bundle goes below the restored root. `None` for the events of the
 /// ledger, which the ledger takes.
 fn laid_out_at(path: &str) -> Result<Option<PathBuf>, Error> {
+    if path == DRIFT_WINDOWS {
+        return Ok(Some(PathBuf::from(crate::drift_windows::FILE)));
+    }
     let (top, rest) = path.split_once('/').unwrap_or((path, ""));
     let dir = match top {
         LEDGER_EVENTS if rest.is_empty() => return Ok(None),
@@ -1006,6 +1016,9 @@ struct Held {
     /// The tasks that were proposed, open, claimed or blocked.
     unfinished: Vec<String>,
     claimed: Vec<ClaimHeld>,
+    /// Each effect that nobody had settled, with its task: an external action that was
+    /// begun, and of which the ledger does not know whether it took place.
+    unsettled: Vec<(String, String)>,
     erased_later: Vec<ErasedLater>,
     /// The entries that a `put` of the log names above the cursor of the index, each
     /// with its domain: versions that the index did not hold.
@@ -1015,7 +1028,7 @@ struct Held {
 impl Held {
     async fn read(bundle: &Path, journal: &[Receipt]) -> Result<Held, Error> {
         let manifest = verified(bundle)?;
-        let (unfinished, claimed) = tasks_held(bundle, &manifest).await?;
+        let tasks = tasks_held(bundle, &manifest).await?;
         let mut erased_later = Vec::new();
         for receipt in journal {
             if let Some(words) = body_held(bundle, &manifest, receipt)? {
@@ -1030,39 +1043,48 @@ impl Held {
             awaiting.extend(versions_awaiting(bundle, &manifest, d)?);
         }
         Ok(Held {
-            unfinished,
-            claimed,
+            unfinished: tasks.unfinished,
+            claimed: tasks.claimed,
+            unsettled: tasks.unsettled,
             erased_later,
             awaiting,
         })
     }
 }
 
-/// The unfinished tasks of a bundle and those of them under a claim: its events are
-/// replayed into a ledger in memory.
-async fn tasks_held(
-    bundle: &Path,
-    manifest: &RecoveryManifest,
-) -> Result<(Vec<String>, Vec<ClaimHeld>), Error> {
+/// The unfinished tasks of a bundle.
+#[derive(Default)]
+struct TasksHeld {
+    unfinished: Vec<String>,
+    claimed: Vec<ClaimHeld>,
+    unsettled: Vec<(String, String)>,
+}
+
+/// The unfinished tasks of a bundle, those of them under a claim, and the effects on
+/// them that nobody had settled: its events are replayed into a ledger in memory.
+async fn tasks_held(bundle: &Path, manifest: &RecoveryManifest) -> Result<TasksHeld, Error> {
     use dm_ledger::Status as Task;
     let mut ledger = Ledger::in_memory()?;
     ledger.restore(&ledger_events(bundle, manifest)?).await?;
-    let (mut unfinished, mut claimed) = (Vec::new(), Vec::new());
+    let mut held = TasksHeld::default();
     for d in &manifest.domains {
         for status in [Task::Proposed, Task::Open, Task::Claimed, Task::Blocked] {
             for task in ledger.list(&d.domain, status).await? {
                 if let (Task::Claimed, Some(holder)) = (status, &task.holder) {
-                    claimed.push(ClaimHeld {
+                    held.claimed.push(ClaimHeld {
                         id: task.id.clone(),
                         holder: holder.clone(),
                         generation: task.generation,
                     });
                 }
-                unfinished.push(task.id);
+                for action in &task.effects {
+                    held.unsettled.push((task.id.clone(), action.clone()));
+                }
+                held.unfinished.push(task.id);
             }
         }
     }
-    Ok((unfinished, claimed))
+    Ok(held)
 }
 
 /// The file of the bundle at `path`, when the manifest names it.
@@ -1131,6 +1153,7 @@ fn versions_awaiting(
 const UNFINISHED_TASK: &str = "unfinished-task";
 const ERASURE_AFTER_BACKUP: &str = "erasure-after-backup";
 const AWAITING: &str = "write-awaiting-materialisation";
+const UNCERTAIN_ACTION: &str = "uncertain-external-action";
 
 /// The case of a task that was not finished when the bundle was made: each such task is
 /// in the restored ledger and none is under a claim, and the holder of a claim from
@@ -1185,6 +1208,37 @@ async fn unfinished_task(m: &Memory, held: &Held) -> Case {
             case(UNFINISHED_TASK, Outcome::Failed, why)
         }
     }
+}
+
+/// The case of an external action that nobody had settled when the bundle was made:
+/// the restored ledger still names the effect on its task, and holds the task back from
+/// every claim. Thus nobody does the action a second time before its holder or a person
+/// settles the effect.
+async fn uncertain_external_action(m: &Memory, held: &Held) -> Case {
+    if held.unsettled.is_empty() {
+        let why = "the bundle held no task with an effect that nobody had settled";
+        return case(UNCERTAIN_ACTION, Outcome::Absent, why);
+    }
+    let ledger = m.ledger.lock().await;
+    for (id, action) in &held.unsettled {
+        let why = match ledger.get(id).await {
+            Ok(t) if !t.effects.contains(action) => {
+                format!("the restored task {id} does not name the effect {action}")
+            }
+            Ok(t) if t.holder.is_some() || t.held_back().is_none() => {
+                format!("the restored ledger does not hold the task {id} back from a claim")
+            }
+            Ok(_) => continue,
+            Err(e) => format!("the task {id} is not in the restored ledger: {e}"),
+        };
+        return case(UNCERTAIN_ACTION, Outcome::Failed, why);
+    }
+    let why = format!(
+        "{} effects that nobody had settled are on their tasks in the restored ledger, \
+         and the ledger holds each task back from every claim",
+        held.unsettled.len()
+    );
+    case(UNCERTAIN_ACTION, Outcome::Recovered, why)
 }
 
 /// Why the restored root still has something of an entry that the journal says is
@@ -1463,6 +1517,35 @@ mod tests {
         live.heartbeat(&held, Some(generation), Duration::minutes(30))
             .await
             .unwrap();
+    }
+
+    /// An agent wrote an entry inside a drift window. The window is closed, and the
+    /// entry stays held from promotion in the restored root too.
+    #[tokio::test]
+    async fn a_restored_root_holds_the_drift_windows_of_the_bundle() {
+        let site = Site::new();
+        let worker = Memory::open(&site.root()).unwrap().with_author(WORKER);
+        let from = OffsetDateTime::now_utc() - Duration::minutes(1);
+        site.m
+            .open_drift_window("gateway", "model-1", from, &[], "the probes moved")
+            .unwrap();
+        let inside = worker.write(req("# Port\n\nIt listens on 8080.\n")).await;
+        let inside = inside.unwrap().id;
+        let until = OffsetDateTime::now_utc() + Duration::minutes(1);
+        site.m
+            .close_drift_window("gateway", "model-1", until, "a new baseline")
+            .unwrap();
+        let windows = site.m.drift_windows().unwrap();
+        assert_eq!(windows.len(), 1);
+        let held = |m: &Memory, e: &Entry| m.frozen_by(e).unwrap();
+        let entry = site.m.get(&inside).await.unwrap();
+        assert_eq!(held(&site.m, &entry).as_ref(), Some(&windows[0]));
+        site.bundle("bundle").await;
+        site.restore("bundle", "restored", &[]).await;
+        let m = Memory::open(&site.at("restored")).unwrap();
+        assert_eq!(m.drift_windows().unwrap(), windows);
+        let entry = m.get(&inside).await.unwrap();
+        assert_eq!(held(&m, &entry).as_ref(), Some(&windows[0]));
     }
 
     #[tokio::test]
@@ -1811,7 +1894,7 @@ mod tests {
                 ERASURE_AFTER_BACKUP,
                 AWAITING,
                 "cross-domain-dependency",
-                "uncertain-external-action"
+                UNCERTAIN_ACTION
             ]
         );
         for c in &drill.cases {
@@ -1864,6 +1947,50 @@ mod tests {
             .drill(&site.at("bundle"), &site.at("scratch-2"))
             .await;
         assert_eq!(next.unwrap().epoch, 2);
+    }
+
+    /// The holder of a task began an external action and did not settle it. After the
+    /// restore its claim is over, and the task is held back until the effect is settled.
+    #[tokio::test]
+    async fn a_drill_recovers_an_effect_that_nobody_had_settled() {
+        let site = Site::new();
+        let (_, _, (held, generation)) = with_work(&site).await;
+        let worker = Memory::open(&site.root()).unwrap().with_author(WORKER);
+        worker
+            .effect_begun(&held, Some(generation), "act-1")
+            .await
+            .unwrap();
+        site.bundle("bundle").await;
+        let drill = site.m.drill(&site.at("bundle"), &site.at("scratch")).await;
+        let drill = drill.unwrap();
+        assert_eq!(outcome(&drill, UNCERTAIN_ACTION), Outcome::Recovered);
+        assert_eq!(outcome(&drill, UNFINISHED_TASK), Outcome::Recovered);
+        assert!(drill.passed, "{drill:?}");
+        // in the restored root the task is nobody's, and nobody claims it
+        let restored = Memory::open(&site.at("scratch")).unwrap();
+        let task = restored.get_task(&held).await.unwrap();
+        assert_eq!(
+            (task.holder.as_deref(), &task.effects[..]),
+            (None, &["act-1".to_string()][..])
+        );
+        let other = Memory::open(&site.at("scratch"))
+            .unwrap()
+            .with_author("agent:b");
+        let refused = other.claim(&held, Duration::minutes(5)).await;
+        assert!(
+            matches!(
+                refused,
+                Err(Error::Ledger(dm_ledger::Error::WrongState { .. }))
+            ),
+            "{:?}",
+            refused.map(|c| c.generation)
+        );
+        // a person settles the effect, and the task is on offer again
+        restored
+            .effect_settled(&held, None, "act-1", dm_ledger::Outcome::NotApplied)
+            .await
+            .unwrap();
+        other.claim(&held, Duration::minutes(5)).await.unwrap();
     }
 
     #[tokio::test]

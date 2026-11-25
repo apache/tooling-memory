@@ -12,8 +12,48 @@ use crate::{Error, Memory};
 use dm_ledger::{Status, Task};
 use dm_policy::record::Rubric;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use time::OffsetDateTime;
+
+/// Where the tasks of a domain stand, and what holds them up.
+#[derive(Debug, Default)]
+pub(crate) struct Gaps {
+    /// By family, how many tasks are in each status.
+    pub(crate) by_family: BTreeMap<String, BTreeMap<String, usize>>,
+    /// Why tasks were invalidated: each reason, with its count.
+    pub(crate) reasons: BTreeMap<String, usize>,
+    /// The requirements of open and blocked tasks that no completed task carried.
+    pub(crate) unmatched: BTreeMap<String, usize>,
+}
+
+impl Gaps {
+    /// Count `tasks`.
+    pub(crate) fn of<'a>(tasks: impl Iterator<Item = &'a Task>) -> Gaps {
+        let mut gaps = Gaps::default();
+        let mut done_caps = BTreeSet::new();
+        let mut waiting = Vec::new();
+        for t in tasks {
+            let status = t.status.as_str().to_string();
+            let family = gaps.by_family.entry(family(t)).or_default();
+            *family.entry(status).or_default() += 1;
+            match t.status {
+                Status::Invalidated => {
+                    let reason = t.reason.clone().unwrap_or_default();
+                    *gaps.reasons.entry(reason).or_default() += 1;
+                }
+                Status::Done => done_caps.extend(t.spec.requirements.iter()),
+                Status::Open | Status::Blocked => waiting.push(t),
+                _ => {}
+            }
+        }
+        for r in waiting.iter().flat_map(|t| t.spec.requirements.iter()) {
+            if !done_caps.contains(r) {
+                *gaps.unmatched.entry(r.clone()).or_default() += 1;
+            }
+        }
+        gaps
+    }
+}
 
 /// One task moved in the queue.
 #[derive(Clone, Debug, Serialize)]
@@ -54,7 +94,7 @@ pub fn maintenance(t: &Task) -> bool {
 }
 
 /// A task's family for the statistics: the origin before its colon, or `filed`.
-fn family(t: &Task) -> String {
+pub(crate) fn family(t: &Task) -> String {
     t.spec
         .origin
         .as_deref()
@@ -217,6 +257,62 @@ pub fn inflated_by_creator(root: &std::path::Path) -> BTreeMap<String, usize> {
     out
 }
 
+/// The origin of the task that a probing alarm files. The task names the agent that it
+/// is about, so only a person in person sees a task of this origin.
+pub const PROBING_ORIGIN: &str = "telemetry:probing";
+
+/// How many refusals of one agent in one clock hour are reported as probing.
+pub const PROBING_DENIALS: usize = 5;
+
+/// One agent that the policy refused many times in one clock hour.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct Probing {
+    /// The principal that was refused.
+    pub who: String,
+    /// The clock hour, as the first 13 characters of a time in the log:
+    /// `2026-11-15T14`.
+    pub hour: String,
+    /// How many of its requests were refused in that hour.
+    pub denials: usize,
+    /// The actions that were refused, each one time, in the order of their names.
+    pub actions: Vec<String>,
+}
+
+/// The agents that probe, from the decision log: the paper's repeated denials from one
+/// agent. Each refused decision whose principal is an agent counts for that principal
+/// and the clock hour of the line. A principal with [`PROBING_DENIALS`] or more in one
+/// hour is in the result, in the order of principal and hour. The hour comes from the
+/// line, so no clock is read.
+#[must_use]
+pub fn probing(root: &std::path::Path) -> Vec<Probing> {
+    let text = std::fs::read_to_string(root.join("state/decisions.jsonl")).unwrap_or_default();
+    let mut per_hour: BTreeMap<(String, String), (usize, BTreeSet<String>)> = BTreeMap::new();
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let refused = v["allow"] == false && v["class"] == "agent";
+        let hour = v["at"].as_str().and_then(|at| at.get(..13));
+        if let (true, Some(who), Some(hour)) = (refused, v["principal"].as_str(), hour) {
+            let slot = per_hour
+                .entry((who.to_string(), hour.to_string()))
+                .or_default();
+            slot.0 += 1;
+            slot.1.extend(v["action"].as_str().map(str::to_string));
+        }
+    }
+    per_hour
+        .into_iter()
+        .filter(|(_, (denials, _))| *denials >= PROBING_DENIALS)
+        .map(|((who, hour), (denials, actions))| Probing {
+            who,
+            hour,
+            denials,
+            actions: actions.into_iter().collect(),
+        })
+        .collect()
+}
+
 impl Memory {
     /// The rubric in force: the last verified L1 policy that carries one, by id, or the
     /// default.
@@ -325,6 +421,26 @@ impl Memory {
         })
     }
 
+    /// The tasks of a domain in every status that the session may see, each read.
+    pub(crate) async fn domain_tasks(
+        &self,
+        l: &dm_ledger::Ledger,
+        domain: &str,
+    ) -> Result<Vec<Task>, Error> {
+        let mut tasks = Vec::new();
+        for status in [
+            Status::Proposed,
+            Status::Open,
+            Status::Blocked,
+            Status::Claimed,
+            Status::Done,
+            Status::Invalidated,
+        ] {
+            tasks.extend(self.read_tasks(l.list(domain, status).await?)?);
+        }
+        Ok(tasks)
+    }
+
     /// How tasks flow in a domain, the paper's fabric telemetry: by family, how many
     /// are in each status; why tasks were invalidated; and the requirements of waiting
     /// tasks that no completed task ever carried, a fleet capability gap. Only tasks
@@ -336,48 +452,184 @@ impl Memory {
     pub async fn task_stats(&self, domain: Option<&str>) -> Result<serde_json::Value, Error> {
         let domain = self.resolve_domain(domain)?;
         let l = self.ledger.lock().await;
-        let mut by_family: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-        let mut reasons: BTreeMap<String, usize> = BTreeMap::new();
-        let mut done_caps = std::collections::BTreeSet::new();
-        let mut waiting = Vec::new();
-        for status in [
-            Status::Proposed,
-            Status::Open,
-            Status::Blocked,
-            Status::Claimed,
-            Status::Done,
-            Status::Invalidated,
-        ] {
-            for t in self.read_tasks(l.list(&domain, status).await?)? {
-                *by_family
-                    .entry(family(&t))
-                    .or_default()
-                    .entry(status.as_str().to_string())
-                    .or_default() += 1;
-                match status {
-                    Status::Invalidated => {
-                        *reasons
-                            .entry(t.reason.clone().unwrap_or_default())
-                            .or_default() += 1;
-                    }
-                    Status::Done => done_caps.extend(t.spec.requirements.clone()),
-                    Status::Open | Status::Blocked => waiting.push(t),
-                    _ => {}
-                }
-            }
-        }
-        let unmatched: BTreeMap<String, usize> = waiting
-            .iter()
-            .flat_map(|t| t.spec.requirements.iter())
-            .filter(|r| !done_caps.contains(*r))
-            .fold(BTreeMap::new(), |mut m, r| {
-                *m.entry(r.clone()).or_default() += 1;
-                m
-            });
+        let tasks = self.domain_tasks(&l, &domain).await?;
+        let Gaps {
+            by_family,
+            reasons,
+            unmatched,
+        } = Gaps::of(tasks.iter());
         Ok(serde_json::json!({
             "domain": domain, "by_family": by_family, "invalidated_because": reasons,
             "unmatched_requirements": unmatched,
             "inflated_by_creator": inflated_by_creator(&self.root),
+            "probing": probing(&self.root),
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// One line of the decision log, as [`Memory::log_decision`] writes it.
+    fn decision(at: &str, principal: &str, class: &str, action: &str, allow: bool) -> String {
+        serde_json::json!({
+            "at": at, "session": "s-1", "action": action, "principal": principal,
+            "class": class, "domain": "dom-me", "allow": allow, "admit": false,
+            "review": "none", "reason": "a reason",
+        })
+        .to_string()
+    }
+
+    /// `count` refusals of `principal` in the clock hour `hour`, one for each minute.
+    fn refusals(hour: &str, principal: &str, class: &str, count: usize) -> Vec<String> {
+        (0..count)
+            .map(|minute| {
+                let at = format!("{hour}:{minute:02}:07.5Z");
+                decision(&at, principal, class, "write", false)
+            })
+            .collect()
+    }
+
+    /// A root whose decision log holds `lines`.
+    fn logged(dir: &Path, lines: &[String]) {
+        std::fs::create_dir_all(dir.join("state")).unwrap();
+        std::fs::write(dir.join("state/decisions.jsonl"), lines.join("\n") + "\n").unwrap();
+    }
+
+    fn found(lines: &[String]) -> Vec<Probing> {
+        let dir = tempfile::tempdir().unwrap();
+        logged(dir.path(), lines);
+        probing(dir.path())
+    }
+
+    /// Rule 10: where the count starts, and what is in a report.
+    #[test]
+    fn five_refusals_of_one_agent_in_one_clock_hour_are_probing() {
+        let hour = "2026-11-15T14";
+        let mut lines = refusals(hour, "agent:a", "agent", PROBING_DENIALS - 1);
+        assert_eq!(found(&lines), []);
+        lines.push(decision(
+            "2026-11-15T14:59:59Z",
+            "agent:a",
+            "agent",
+            "promote",
+            false,
+        ));
+        lines.push("not a line of the log".into());
+        let report = found(&lines);
+        assert_eq!(
+            report,
+            [Probing {
+                who: "agent:a".into(),
+                hour: hour.into(),
+                denials: PROBING_DENIALS,
+                actions: vec!["promote".into(), "write".into()],
+            }]
+        );
+        assert_eq!(PROBING_DENIALS, 5);
+    }
+
+    /// Rule 10: what does not count.
+    #[test]
+    fn refusals_in_other_hours_of_other_principals_and_of_persons_are_not_added_up() {
+        // five across two clock hours
+        let mut lines = refusals("2026-11-15T14", "agent:a", "agent", 3);
+        lines.extend(refusals("2026-11-15T15", "agent:a", "agent", 2));
+        assert_eq!(found(&lines), []);
+        // three each of two agents
+        let mut lines = refusals("2026-11-15T14", "agent:a", "agent", 3);
+        lines.extend(refusals("2026-11-15T14", "agent:b", "agent", 3));
+        assert_eq!(found(&lines), []);
+        // the owner, another person, a tap and the system
+        for (who, class) in [
+            ("human:test:me", "owner"),
+            ("human:test:reviewer", "human"),
+            ("tap:checks", "tap"),
+            ("curation", "system"),
+        ] {
+            assert_eq!(
+                found(&refusals("2026-11-15T14", who, class, 9)),
+                [],
+                "{who}"
+            );
+        }
+        // decisions that allowed the request
+        let allowed: Vec<String> = (0..9)
+            .map(|_| decision("2026-11-15T14:00:00Z", "agent:a", "agent", "write", true))
+            .collect();
+        assert_eq!(found(&allowed), []);
+        // each agent and each hour is a report of its own
+        let mut lines = refusals("2026-11-15T15", "agent:b", "agent", 6);
+        lines.extend(refusals("2026-11-15T14", "agent:a", "agent", 5));
+        lines.extend(refusals("2026-11-15T16", "agent:a", "agent", 4));
+        let report = found(&lines);
+        let who: Vec<_> = report
+            .iter()
+            .map(|p| (p.who.as_str(), p.hour.as_str(), p.denials))
+            .collect();
+        assert_eq!(
+            who,
+            [
+                ("agent:a", "2026-11-15T14", 5),
+                ("agent:b", "2026-11-15T15", 6)
+            ]
+        );
+    }
+
+    /// The task of a probing alarm names the agent that it is about. That agent does not
+    /// see the task, or the task would show the agent where the count starts.
+    #[tokio::test]
+    async fn the_task_of_a_probing_alarm_is_seen_only_by_a_person_in_person() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::testing::root(dir.path());
+        let spec = |origin: &str| dm_ledger::TaskSpec {
+            domain: "dom-me".into(),
+            title: "Curation alarm, probing: agent:a".into(),
+            body: "the policy refused agent:a at least 5 times".into(),
+            requirements: vec!["human".into()],
+            origin: Some(origin.into()),
+            ..dm_ledger::TaskSpec::default()
+        };
+        let alarm = owner.file_own(spec(PROBING_ORIGIN)).await.unwrap().task;
+        let other = owner.file_own(spec("telemetry:inflation")).await.unwrap();
+        let other = other.task;
+        let agent = crate::testing::as_author(dir.path(), "agent:a");
+        let served = Memory::open(dir.path()).unwrap();
+        served.mark_served();
+        for session in [&agent, &served] {
+            let asked = session.get_task(&alarm.id).await;
+            assert!(matches!(asked, Err(Error::Ledger(_))), "{asked:?}");
+            let open = session.tasks(Some("dom-me"), dm_ledger::Status::Open);
+            let open: Vec<String> = open.await.unwrap().into_iter().map(|t| t.id).collect();
+            assert_eq!(open, [other.id.as_str()], "{}", session.author());
+        }
+        assert_eq!(owner.get_task(&alarm.id).await.unwrap().id, alarm.id);
+        let open = owner.tasks(Some("dom-me"), dm_ledger::Status::Open);
+        assert_eq!(open.await.unwrap().len(), 2);
+    }
+
+    /// Rule 11.
+    #[tokio::test]
+    async fn the_statistics_of_the_tasks_carry_the_probing_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::testing::root(dir.path());
+        let quiet = owner.task_stats(Some("dom-me")).await.unwrap();
+        assert_eq!(quiet["probing"], serde_json::json!([]));
+        let path = dir.path().join("state/decisions.jsonl");
+        let mut log = std::fs::read_to_string(&path).unwrap_or_default();
+        for line in refusals("2026-11-15T14", "agent:a", "agent", 5) {
+            log.push_str(&line);
+            log.push('\n');
+        }
+        std::fs::write(&path, log).unwrap();
+        let stats = owner.task_stats(Some("dom-me")).await.unwrap();
+        assert_eq!(
+            stats["probing"],
+            serde_json::json!([{
+                "who": "agent:a", "hour": "2026-11-15T14", "denials": 5, "actions": ["write"],
+            }])
+        );
     }
 }
