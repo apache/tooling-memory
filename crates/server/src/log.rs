@@ -554,16 +554,6 @@ fn last_ledger_seq(root: &Path, domain: &str) -> Result<u64, Error> {
         .unwrap_or(0))
 }
 
-/// Whether a citation names an entry, in the shape of a name the record holds. A link
-/// or a path does not, and stays out of the log.
-fn names_entry(cite: &str) -> bool {
-    dm_core::id::is_entry_id(cite)
-        && cite.len() <= 128
-        && cite
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-}
-
 impl Memory {
     /// Write a version of an entry through its domain's log: the change is appended
     /// first, then the record takes it. Every record write of an entry comes here. A
@@ -636,13 +626,9 @@ impl Memory {
             Ok(Change::Write {
                 id: entry.front.id.clone(),
                 digest: dm_core::digest(&text),
-                cites: entry
-                    .front
-                    .cites
-                    .iter()
-                    .filter(|c| names_entry(c))
-                    .cloned()
-                    .collect(),
+                // by the bare id: a citation of a section or of a version names its
+                // entry, and a link or a path names none and stays out of the log
+                cites: crate::address::entries_of(&entry.front.cites),
                 supersedes: entry.front.supersedes.clone(),
             })
         };

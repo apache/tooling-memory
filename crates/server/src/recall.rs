@@ -424,14 +424,6 @@ fn cited_in(brief: &str) -> Vec<String> {
     out
 }
 
-fn mem_ids(sources: &[String]) -> Vec<String> {
-    sources
-        .iter()
-        .filter(|s| dm_core::id::is_entry_id(s))
-        .cloned()
-        .collect()
-}
-
 /// Round-robin over the per-query hit lists, each id once, best first within a query.
 fn interleave(lists: Vec<Vec<Hit>>, limit: usize) -> Vec<Hit> {
     let mut seen = HashSet::new();
@@ -582,7 +574,7 @@ impl Memory {
                 continue;
             }
             spent += cost;
-            p.links = mem_ids(&entry.front.cites);
+            p.links = crate::address::entries_of(&entry.front.cites);
             p.body = Some(entry.body.clone());
             lock(&self.cache).insert(&p.id, dm_core::digest(&entry.render()));
         }
@@ -936,7 +928,12 @@ mod tests {
             &m,
             "Retry policy",
             "Operation R retries with exponential backoff, per the table.\n",
-            vec![cited.clone(), "https://example.invalid/rfc".into()],
+            // by section and by version: each names the entry, and the link is one
+            vec![
+                format!("{cited}#delays"),
+                "https://example.invalid/rfc".into(),
+                format!("{cited}@{}", "0".repeat(64)),
+            ],
         )
         .await;
         let big_body = "Retry retry retry. ".repeat(300);

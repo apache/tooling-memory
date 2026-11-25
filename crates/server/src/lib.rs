@@ -36,6 +36,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError, Weak};
 use time::{Date, Duration, OffsetDateTime};
 use tokio::sync::Mutex as AsyncMutex;
 
+pub mod address;
 pub mod approvals;
 pub mod arms;
 pub mod autonomy;
@@ -44,6 +45,7 @@ pub mod contexts;
 pub mod drift_windows;
 pub mod evaluation;
 pub mod fabric;
+pub mod fetch;
 pub mod gates;
 pub mod held_out;
 mod holds;
@@ -1371,15 +1373,25 @@ impl Memory {
 
     /// [`Memory::get`] under `f`.
     async fn get_under(&self, id: &str, f: &ReadFilter) -> Result<Entry, Error> {
+        let (entry, _) = self.admitted(id, f).await?;
+        self.log_opened(&entry, &entry.body);
+        Ok(entry)
+    }
+
+    /// The first part of [`Memory::get`] under `f`: the index admits the entry, the
+    /// record gives its current version, and the session observes it. Returns the entry
+    /// with the digest of its stored text, which is its version. The read log gets no
+    /// line here: the caller writes it for what it serves ([`Memory::log_opened`]).
+    async fn admitted(&self, id: &str, f: &ReadFilter) -> Result<(Entry, String), Error> {
         let meta = self.index.lock().await.meta(id, f)?;
         let Some(meta) = meta else {
             self.forget_pushed(id);
             return Err(self.not_served(id, None, f).await);
         };
         self.note_get();
-        let entry = self
+        let (entry, text) = self
             .store
-            .get(&meta.hit.domain, id)
+            .get_with_text(&meta.hit.domain, id)
             .await?
             .ok_or_else(|| Error::NotFound(id.to_string()))?;
         // the index can lag the record: a list or search a moment ago may have offered
@@ -1393,9 +1405,15 @@ impl Memory {
             self.forget_pushed(id);
             return Err(Error::NotFound(id.to_string()));
         }
-        let pushed = self.was_pushed(&entry);
-        self.reads.opened(id, &entry.body, pushed);
-        Ok(entry)
+        Ok((entry, dm_core::digest(&text)))
+    }
+
+    /// The read-log line of a get: `served` is the text that the caller serves of
+    /// `entry`, its whole body or one section, and the line counts the tokens of that
+    /// text. The line says whether a pack had pushed this version of the entry.
+    fn log_opened(&self, entry: &Entry, served: &str) {
+        let pushed = self.was_pushed(entry);
+        self.reads.opened(&entry.front.id, served, pushed);
     }
 
     /// Why an entry is not served, for an entry this session could read under `f`:
@@ -1446,11 +1464,21 @@ impl Memory {
     ///
     /// As [`Memory::get`], or [`Error::Gone`] past the redirect limit or on a cycle.
     pub async fn get_following(&self, id: &str) -> Result<(Entry, Vec<String>), Error> {
+        let (entry, _, from) = self.admitted_following(id).await?;
+        self.log_opened(&entry, &entry.body);
+        Ok((entry, from))
+    }
+
+    /// [`Memory::admitted`] under the filter of the session, following the redirect of
+    /// a replaced entry as [`Memory::get_following`] says. Returns the entry, its
+    /// version and the ids it was redirected from. The read log gets no line here.
+    async fn admitted_following(&self, id: &str) -> Result<(Entry, String, Vec<String>), Error> {
         let mut from = Vec::new();
         let mut at = id.to_string();
         loop {
-            match self.get(&at).await {
-                Ok(e) => return Ok((e, from)),
+            let f = self.session_filter()?;
+            match self.admitted(&at, &f).await {
+                Ok((e, version)) => return Ok((e, version, from)),
                 Err(Error::Moved { to, .. })
                     if from.len() < MAX_REDIRECTS && to != id && !from.contains(&to) =>
                 {

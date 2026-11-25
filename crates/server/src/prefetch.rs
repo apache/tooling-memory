@@ -50,6 +50,20 @@ pub struct Prefetched {
     pub tokens: usize,
 }
 
+/// The lowest weight at which an entry is related to another: under it, the two came
+/// back together from too small a share of the searches for the first.
+pub const RELATED_MIN_P: f64 = 0.25;
+
+/// An entry related to another, as a fetch of that other entry serves it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Related {
+    /// The summary of the related entry.
+    pub hit: Hit,
+    /// Its weight: the share of the searches that returned the fetched entry among
+    /// their first five hits that returned this entry there too.
+    pub p: f64,
+}
+
 /// The query a task is searched for by: its title and the first words of its body,
 /// enough to rank on without turning a long body into a query of everything.
 #[must_use]
@@ -113,39 +127,84 @@ impl Prefetched {
     }
 }
 
+/// The entries related to `id`, each with its weight: the partners that came back with
+/// `id` from at least `min` searches and from at least the share [`RELATED_MIN_P`] of
+/// the `searches` that returned `id`. Highest weight first, then by id.
+fn weighted(
+    pairs: &BTreeMap<(String, String), usize>,
+    searches: usize,
+    id: &str,
+    min: usize,
+) -> Vec<(String, f64)> {
+    if searches == 0 {
+        return Vec::new();
+    }
+    let share = |n: usize| {
+        let n = u32::try_from(n).unwrap_or(u32::MAX);
+        let of = u32::try_from(searches).unwrap_or(u32::MAX);
+        f64::from(n) / f64::from(of)
+    };
+    let mut out: Vec<(String, f64)> = partners(pairs, id, min)
+        .into_iter()
+        .map(|(partner, n)| (partner, share(n)))
+        .filter(|(_, p)| *p >= RELATED_MIN_P)
+        .collect();
+    out.sort_by(|x, y| y.1.total_cmp(&x.1).then_with(|| x.0.cmp(&y.0)));
+    out
+}
+
 impl Memory {
-    /// The summaries to append to a fetch of `id`: entries the read log shows searched
-    /// up with it at least `plan.together` times, strongest first, at most `max`, looked
-    /// up under this session's filter, so an association mined from other sessions'
-    /// reads never widens what this one sees. The paper's rule: when B usually follows
-    /// A, B's summary rides on A's fetch, a few tokens in place of a search round.
+    /// The entries related to `id`, each with its weight `p`: the entries that the read
+    /// log shows searched up with it at least `Plan::default().together` times, and in
+    /// at least the share [`RELATED_MIN_P`] of the searches that returned `id`. `p` is
+    /// that share: the searches whose first five hits hold both entries, over the
+    /// searches whose first five hits hold `id`. Highest `p` first, at most `max`. Each
+    /// one is looked up under this session's filter, so an association mined from other
+    /// sessions' reads never widens what this one sees. The paper's rule: when B usually
+    /// follows A, B's summary rides on A's fetch, a few tokens in place of a search
+    /// round. The session's label rises as for a search, and the read log names the
+    /// summaries as one `read_with`.
+    ///
+    /// # Errors
+    ///
+    /// An index error.
+    pub async fn related(&self, id: &str, max: usize) -> Result<Vec<Related>, Error> {
+        if !self.settings().prefetches() {
+            return Ok(Vec::new());
+        }
+        let f = self.session_filter()?;
+        let log = reads::all(&self.root).unwrap_or_default();
+        let pairs = reads::co_retrieved(&log, |_| true);
+        let searches = reads::searches_with(&log).get(id).copied().unwrap_or(0);
+        let mut out = Vec::new();
+        {
+            let index = self.index.lock().await;
+            for (partner, p) in weighted(&pairs, searches, id, Plan::default().together) {
+                if out.len() >= max {
+                    break;
+                }
+                if let Some(meta) = index.meta(&partner, &f)? {
+                    out.push(Related { hit: meta.hit, p });
+                }
+            }
+        }
+        if !out.is_empty() {
+            let hits: Vec<Hit> = out.iter().map(|r| r.hit.clone()).collect();
+            self.observe(&hits)?;
+            self.reads.hits("read_with", Some(id), &hits);
+        }
+        Ok(out)
+    }
+
+    /// The summaries to append to a fetch of `id`: [`Memory::related`], without the
+    /// weights.
     ///
     /// # Errors
     ///
     /// An index error.
     pub async fn read_with(&self, id: &str, max: usize) -> Result<Vec<Hit>, Error> {
-        if !self.settings().prefetches() {
-            return Ok(Vec::new());
-        }
-        let f = self.session_filter()?;
-        let pairs = reads::co_retrieved(&reads::all(&self.root).unwrap_or_default(), |_| true);
-        let mut out = Vec::new();
-        {
-            let index = self.index.lock().await;
-            for (partner, _) in partners(&pairs, id, Plan::default().together) {
-                if out.len() >= max {
-                    break;
-                }
-                if let Some(meta) = index.meta(&partner, &f)? {
-                    out.push(meta.hit);
-                }
-            }
-        }
-        if !out.is_empty() {
-            self.observe(&out)?;
-            self.reads.hits("read_with", Some(id), &out);
-        }
-        Ok(out)
+        let related = self.related(id, max).await?;
+        Ok(related.into_iter().map(|r| r.hit).collect())
     }
 
     /// Summaries likely needed for a task: the top hits of a search on `query`, then
@@ -230,6 +289,121 @@ mod tests {
         for _ in 0..times {
             log.served_ids("search", Some("q"), ids.len(), 10, false, None, &ids);
         }
+    }
+
+    /// One earlier search that returned `ids`, in that order.
+    fn searched(root: &std::path::Path, ids: &[&String]) {
+        searched_together(root, ids, 1);
+    }
+
+    #[tokio::test]
+    async fn a_related_entry_has_the_share_of_the_searches_that_returned_both_as_its_weight() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let a = write(
+            &m,
+            "# Retry backoff\n\nOperation R retries.\n",
+            Label::Public,
+        )
+        .await;
+        let often = write(&m, "# Jitter\n\nTwenty percent.\n", Label::Public).await;
+        let twice = write(&m, "# Burst\n\nThe June burst.\n", Label::Public).await;
+        // four searches returned `a`: three of them with `often`, two with `twice`
+        searched_together(dir.path(), &[&a, &often, &twice], 2);
+        searched(dir.path(), &[&often, &a]);
+        searched(dir.path(), &[&a]);
+        // a search that returned neither, and a list, change nothing
+        searched(dir.path(), &[&twice]);
+        let log = reads::ReadLog::new(dir.path(), "sess-earlier");
+        log.served_ids(
+            "list",
+            None,
+            2,
+            10,
+            false,
+            None,
+            &[a.clone(), twice.clone()],
+        );
+        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
+        let related = reader.related(&a, 5).await.unwrap();
+        assert_eq!(related.len(), 1, "{related:?}");
+        assert_eq!(related[0].hit.id, often);
+        assert!((related[0].p - 0.75).abs() < 1e-9, "{}", related[0].p);
+        // the summaries are one read, by the name that the read log has for them
+        let logged: Vec<_> = reads::all(dir.path())
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.tool == "read_with")
+            .collect();
+        assert_eq!(logged.len(), 1);
+        assert_eq!(logged[0].ids, [often.as_str()]);
+        assert_eq!(
+            reader.read_with(&a, 5).await.unwrap(),
+            [related[0].hit.clone()]
+        );
+        // seen from the other entry: three of its three searches returned `a`
+        let back = reader.related(&often, 5).await.unwrap();
+        assert_eq!(back.len(), 1, "{back:?}");
+        assert!((back[0].p - 1.0).abs() < 1e-9, "{}", back[0].p);
+        assert!(reader.related(&a, 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_entry_under_the_lowest_weight_is_not_related_and_the_order_is_by_weight() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let a = write(
+            &m,
+            "# Retry backoff\n\nOperation R retries.\n",
+            Label::Public,
+        )
+        .await;
+        let seldom = write(&m, "# Burst\n\nThe June burst.\n", Label::Public).await;
+        let often = write(&m, "# Jitter\n\nTwenty percent.\n", Label::Public).await;
+        let half = write(&m, "# Header\n\nX-Retry-Ctx.\n", Label::Public).await;
+        // thirteen searches returned `a`: three with `seldom`, which is under a quarter
+        searched_together(dir.path(), &[&a, &seldom, &half], 3);
+        searched_together(dir.path(), &[&a, &often, &half], 4);
+        searched_together(dir.path(), &[&a, &often], 6);
+        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
+        let related = reader.related(&a, 5).await.unwrap();
+        let ids: Vec<&str> = related.iter().map(|r| r.hit.id.as_str()).collect();
+        assert_eq!(ids, [often.as_str(), half.as_str()], "{related:?}");
+        assert!((related[0].p - 10.0 / 13.0).abs() < 1e-9);
+        assert!((related[1].p - 7.0 / 13.0).abs() < 1e-9);
+        // at the lowest weight an entry is related: three of twelve searches
+        let b = write(&m, "# Queue\n\nThe queue is bounded.\n", Label::Public).await;
+        let edge = write(&m, "# Depth\n\nThe depth is 64.\n", Label::Public).await;
+        searched_together(dir.path(), &[&b, &edge], 3);
+        searched_together(dir.path(), &[&b], 9);
+        let related = reader.related(&b, 5).await.unwrap();
+        assert_eq!(related.len(), 1, "{related:?}");
+        assert!((related[0].p - RELATED_MIN_P).abs() < 1e-9);
+    }
+
+    #[tokio::test]
+    async fn an_entry_that_the_filter_of_the_session_does_not_admit_is_not_related() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let a = write(
+            &m,
+            "# Retry backoff\n\nOperation R retries.\n",
+            Label::Public,
+        )
+        .await;
+        let internal = write(&m, "# Jitter\n\nTwenty percent.\n", Label::Internal).await;
+        searched_together(dir.path(), &[&a, &internal], 3);
+        let capped = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:low")
+            .with_handling_cap(Label::Public);
+        assert!(capped.related(&a, 5).await.unwrap().is_empty());
+        assert_eq!(capped.label(), Label::Public);
+        let reader = Memory::open(dir.path()).unwrap().with_author("agent:r");
+        let related = reader.related(&a, 5).await.unwrap();
+        assert_eq!(related.len(), 1, "{related:?}");
+        assert_eq!(related[0].hit.id, internal);
+        assert_eq!(reader.label(), Label::Internal);
     }
 
     #[test]

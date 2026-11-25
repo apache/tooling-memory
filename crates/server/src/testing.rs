@@ -103,3 +103,17 @@ pub(crate) fn read_in_log(m: &Memory, domain: &str) -> Vec<String> {
     .flatten()
     .collect()
 }
+
+/// Give the agents of the root `root` one more key in their read filter, by a policy
+/// of the root: the built-in policy with that key laid over the filter of an agent.
+pub(crate) fn agents_read(root: &Path, pair: &str) {
+    let text = dm_policy::decide::BUILTIN.replace(
+        "read_filter := base_filter\n",
+        &format!(
+            "read_filter := object.union(base_filter, {{{pair}}}) if class == \"agent\"\n\nread_filter := base_filter if class != \"agent\"\n"
+        ),
+    );
+    assert_ne!(text, dm_policy::decide::BUILTIN);
+    std::fs::create_dir_all(root.join("policy")).unwrap();
+    std::fs::write(root.join("policy/local.rego"), text).unwrap();
+}

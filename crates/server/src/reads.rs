@@ -427,9 +427,42 @@ pub fn co_retrieved(
     together
 }
 
+/// How many searches returned each entry, over a read log: the first five hits of every
+/// search, the same rule as [`co_retrieved`]. A pair count over this count is the share
+/// of the searches for one entry that returned the other with it.
+#[must_use]
+pub fn searches_with(reads: &[Read]) -> BTreeMap<String, usize> {
+    let mut searches: BTreeMap<String, usize> = BTreeMap::new();
+    for r in reads.iter().filter(|r| r.tool == "search") {
+        for id in r.ids.iter().take(5) {
+            *searches.entry(id.clone()).or_default() += 1;
+        }
+    }
+    searches
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn searches_with_counts_the_first_five_hits_of_each_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReadLog::new(dir.path(), "sess-1");
+        let ids = |names: &[&str]| -> Vec<String> { names.iter().map(|n| (*n).into()).collect() };
+        let six = ids(&["a", "b", "c", "d", "e", "f"]);
+        log.served_ids("search", Some("q"), 6, 10, false, None, &six);
+        log.served_ids("search", Some("q"), 2, 10, false, None, &ids(&["a", "f"]));
+        log.served_ids("list", None, 1, 10, false, None, &ids(&["a"]));
+        let n = searches_with(&all(dir.path()).unwrap());
+        assert_eq!(n.get("a"), Some(&2), "a list is no search");
+        assert_eq!(n.get("e"), Some(&1));
+        assert_eq!(
+            n.get("f"),
+            Some(&1),
+            "the sixth hit of a search does not count"
+        );
+    }
 
     #[test]
     fn reads_append_and_read_back() {
