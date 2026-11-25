@@ -535,17 +535,20 @@ impl Memory {
     }
 
     /// Whether the session's filter admits an entry, whatever its status. A raw entry is
-    /// judged by its reach and its task, as each read judges it.
+    /// judged by its reach and its task, as each read judges it. The record is read
+    /// here, not the index, so the snapshot of the session is asked too.
     fn may_read(&self, domain: &str, entry: &Entry) -> Result<bool, Error> {
         let front = &entry.front;
-        Ok(self.session_filter()?.admits_entry(
+        let f = self.session_filter()?;
+        let admitted = f.admits_entry(
             domain,
             front.classification,
             front.trust_tier,
             true,
             front.reach,
             front.task.as_deref(),
-        ))
+        );
+        Ok(admitted && f.admits_at(front.created))
     }
 
     /// With a collector, a span that names the approval an action ran under.
@@ -608,7 +611,7 @@ impl Memory {
         }
         let filter = self.session_filter()?;
         if self.index.lock().await.meta(id, &filter)?.is_none() {
-            return Err(self.not_served(id, None).await);
+            return Err(self.not_served(id, None, &filter).await);
         }
         let (domain, entry) = self.find(id).await?;
         // the index can lag the record: the record says whether the entry is live

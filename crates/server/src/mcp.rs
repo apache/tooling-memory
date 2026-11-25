@@ -480,6 +480,39 @@ pub struct RetirePositionParams {
     pub domain: Option<String>,
 }
 
+/// Parameters of `scorecards`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ScorecardsParams {
+    /// The most scorecards to return, newest first. Ten when omitted.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One outcome of `score_evaluation`: what the runner says of one run.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct OutcomeParams {
+    /// The session of the run. Its tape gives the task, the seed and the arm.
+    pub session: String,
+    /// Whether the judge accepted the answer.
+    pub success: bool,
+    /// What the run cost, in tokens.
+    pub cost: u64,
+    /// The name of the judge that decided the success.
+    pub judge: String,
+}
+
+/// Parameters of `score_evaluation`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ScoreEvaluationParams {
+    /// The plan: the TOML text of the evaluation set file, with its `[plan]` table.
+    pub plan: String,
+    /// One outcome for each run.
+    pub outcomes: Vec<OutcomeParams>,
+    /// Also keep the scorecard as an entry in the platform's domain.
+    #[serde(default)]
+    pub keep: bool,
+}
+
 /// Parameters that name a task.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct TaskIdParams {
@@ -735,6 +768,8 @@ const READS: &[&str] = &[
     "list_tasks",
     "position",
     "positions",
+    "settings",
+    "scorecards",
     "lineage",
     "log",
     "outside_readers",
@@ -1450,6 +1485,55 @@ impl McpServer {
     }
 
     #[tool(
+        description = "The settings of this session, which narrow what it reads: memory access, the disclosure depth, prefetch, the T0 contents, the highest trust tier, the snapshot, and transcript replay. `arm` names the evaluation arm with these settings, or is null. A launcher sets them once; no tool changes them."
+    )]
+    async fn settings(&self) -> Result<CallToolResult, McpError> {
+        let settings = self.memory.settings();
+        ok(json!({ "arm": crate::arms::Arm::of(&settings), "settings": settings }))
+    }
+
+    #[tool(
+        description = "The scorecards of evaluations that the record keeps, newest first. A scorecard compares the evaluation arms with a baseline arm: for each arm the paired differences in success and in cost, the verdict, the replay traps, and the drift window that the runs spanned. Served under this session's read filter."
+    )]
+    async fn scorecards(
+        &self,
+        p: Parameters<ScorecardsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = p.0.limit.unwrap_or(10).clamp(1, MAX_LIMIT);
+        let kept = self.memory.scorecards(limit).await.map_err(mcp_err)?;
+        ok(json!({ "scorecards": kept }))
+    }
+
+    #[tool(
+        description = "Score an evaluation, as the owner of the record. `plan` is the TOML text of the plan that the runs started under. Each outcome names the session of one run and says whether the run succeeded, what it cost in tokens, and which judge decided. The task, the seed, the arm, the harness and the model come from the tape of the session. With `keep`, the scorecard is also written as a decision entry in the platform's domain."
+    )]
+    async fn score_evaluation(
+        &self,
+        p: Parameters<ScoreEvaluationParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let plan = crate::evaluation::Plan::parse(&p.plan).map_err(mcp_err)?;
+        let outcomes: Vec<crate::evaluation::Outcome> = p
+            .outcomes
+            .into_iter()
+            .map(|o| crate::evaluation::Outcome {
+                session: o.session,
+                success: o.success,
+                cost: o.cost,
+                judge: o.judge,
+            })
+            .collect();
+        let scorecard = self.memory.score(&plan, &outcomes).await.map_err(mcp_err)?;
+        let entry = if p.keep {
+            let kept = self.memory.keep_scorecard(&scorecard).await;
+            Some(kept.map_err(mcp_err)?.id)
+        } else {
+            None
+        };
+        ok(json!({ "scorecard": scorecard, "entry": entry }))
+    }
+
+    #[tool(
         description = "Retire a position, as the owner of the record: its tasks lose their pin and return to matching, and its history stays under its name. `why` is words on one line."
     )]
     async fn retire_position(
@@ -1476,7 +1560,9 @@ fn t0_uri(domain: &str) -> String {
 
 impl McpServer {
     /// One call through the router; a harness's call is kept on the session's tape, and in
-    /// a re-run answered from the tape first.
+    /// a re-run answered from the tape first. A harness's call is asked of the session's
+    /// settings before it is served; the launcher's own calls are not, and get the empty
+    /// answers the read filter gives.
     async fn routed(
         &self,
         request: CallToolRequestParams,
@@ -1514,11 +1600,9 @@ impl McpServer {
                 }
                 tape::Answer::Refused(why) => return Err(McpError::invalid_params(why, None)),
             }
-            let tcc = ToolCallContext::new(self, request, context);
-            return self.tool_router.call(tcc).await;
+            return self.admitted(&tool, request, context).await;
         }
-        let tcc = ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tcc).await;
+        let result = self.admitted(&tool, request, context).await;
         let (value, is_error) = to_tape(&result);
         if let Err(e) = self
             .memory
@@ -1528,6 +1612,21 @@ impl McpServer {
             eprintln!("amem: {tool} was not kept on the tape: {e}");
         }
         result
+    }
+}
+
+impl McpServer {
+    /// A harness's call, served when the session's settings admit the tool. A refusal
+    /// names the setting, and is the call's result like any other error.
+    async fn admitted(
+        &self,
+        tool: &str,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.memory.admits_tool(tool).map_err(mcp_err)?;
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 }
 
@@ -1680,6 +1779,9 @@ mod tests {
             "position",
             "positions",
             "retire_position",
+            "settings",
+            "scorecards",
+            "score_evaluation",
             "lineage",
             "log",
             "outside_readers",
@@ -2730,6 +2832,128 @@ mod tests {
         );
         assert_eq!(claimed["task"]["id"], id, "{claimed}");
         assert!(claimed["task"].get("position").is_none(), "{claimed}");
+    }
+
+    const PLAN: &str = "preamble = \"Read the record. \"\n[plan]\nname = \"demo\"\ndomain = \"dom-me\"\nbaseline = \"no-memory\"\narms = [\"no-memory\", \"full\"]\nseeds = 2\nmargin = 0.1\njudge = \"regex\"\n[[task]]\nid = \"a\"\nprompt = \"What is A?\"\nexpect = \"A\"\n";
+
+    /// One run of the plan that keeps the head of its tape, as an outcome.
+    async fn evaluation_run(
+        dir: &std::path::Path,
+        seed: u32,
+        arm: crate::arms::Arm,
+    ) -> OutcomeParams {
+        let plan = crate::evaluation::Plan::parse(PLAN).unwrap();
+        let m = Memory::open(dir).unwrap().with_author("agent:claude");
+        let launched = crate::evaluation::Launched {
+            harness: "claude",
+            model: None,
+        };
+        let as_of = time::macros::datetime!(2020-01-01 00:00:00 UTC);
+        m.start_evaluation(&plan, ("a", seed, arm), as_of, launched)
+            .unwrap();
+        m.tape_start(tape::TapeStart {
+            harness: "claude".into(),
+            prompt: plan.prompt_of("a"),
+            ..tape::TapeStart::default()
+        })
+        .await
+        .unwrap();
+        OutcomeParams {
+            session: m.session_id().to_string(),
+            success: true,
+            cost: if arm == crate::arms::Arm::Full {
+                600
+            } else {
+                1000
+            },
+            judge: "regex".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn score_evaluation_scores_and_keeps_and_scorecards_reads_it_back() {
+        let (dir, _) = server().await;
+        let path = dir.path().join(crate::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        g.platform = Some("dom-me".into());
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        let s = McpServer::new(Arc::new(Memory::open(dir.path()).unwrap()));
+        let none = payload(
+            &s.scorecards(Parameters(ScorecardsParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(none, json!({ "scorecards": [] }));
+        let mut outcomes = Vec::new();
+        for seed in [0, 1] {
+            outcomes.push(evaluation_run(dir.path(), seed, crate::arms::Arm::NoMemory).await);
+            outcomes.push(evaluation_run(dir.path(), seed, crate::arms::Arm::Full).await);
+        }
+        let params = |plan: &str, outcomes: Vec<OutcomeParams>, keep: bool| {
+            Parameters(ScoreEvaluationParams {
+                plan: plan.into(),
+                outcomes,
+                keep,
+            })
+        };
+        // a plan that is refused, and an evaluation that is refused, say why
+        let no_plan = refusal(
+            s.score_evaluation(params("preamble = \"x\"", Vec::new(), false))
+                .await,
+        );
+        assert!(
+            no_plan.message.contains("[plan] table"),
+            "{}",
+            no_plan.message
+        );
+        let no_outcome = refusal(s.score_evaluation(params(PLAN, Vec::new(), false)).await);
+        assert!(
+            no_outcome.message.contains("one outcome or more"),
+            "{}",
+            no_outcome.message
+        );
+        let scored = payload(
+            &s.score_evaluation(params(PLAN, outcomes, true))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(scored["scorecard"]["plan"], "demo", "{scored}");
+        assert_eq!(scored["scorecard"]["arms"][1]["pairs"], 2, "{scored}");
+        assert_eq!(
+            scored["scorecard"]["arms"][1]["finding"], "pays",
+            "{scored}"
+        );
+        // one task, with no task that failed and no frozen task: two traps are open
+        assert_eq!(
+            scored["scorecard"]["arms"][1]["verdict"]["inconclusive"]["traps"],
+            json!(["survivorship", "distribution-shift"]),
+            "{scored}"
+        );
+        let entry = scored["entry"].as_str().expect("kept").to_string();
+        let kept = payload(
+            &s.scorecards(Parameters(ScorecardsParams { limit: Some(5) }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(kept["scorecards"][0]["entry"], entry, "{kept}");
+        assert_eq!(kept["scorecards"][0]["scorecard"], scored["scorecard"]);
+        // scoring is the owner's; a re-run that diverged still reads the scorecards
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:claude");
+        let agent = McpServer::new(Arc::new(agent));
+        let refused = refusal(
+            agent
+                .score_evaluation(params(PLAN, Vec::new(), false))
+                .await,
+        );
+        assert!(
+            refused.message.contains("the owner's"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(kind_of("scorecards"), tape::Kind::Read);
+        assert_eq!(kind_of("score_evaluation"), tape::Kind::Mutation);
     }
 
     /// A server over the record at `dir`, for a session of `author`.

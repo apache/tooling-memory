@@ -6,6 +6,7 @@
 
 use crate::{Label, Reach, TrustTier};
 use serde::{Deserialize, Serialize};
+use time::OffsetDateTime;
 
 /// Which raw entries a session reads. Ordered from the narrowest: chain < fleet < all.
 /// It decides nothing about a curated or a verified entry.
@@ -32,6 +33,10 @@ pub struct ReadFilter {
     pub min_tier: TrustTier,
     /// Whether demoted, superseded, and erased entries are returned too.
     pub include_inactive: bool,
+    /// The highest trust tier returned. Verified by default, which leaves nothing out.
+    pub max_tier: TrustTier,
+    /// The snapshot: an entry created later is not returned. None by default.
+    pub not_after: Option<OffsetDateTime>,
     /// Which raw entries the session reads.
     pub raw_reach: RawReach,
     /// The ids of the tasks in the session's chain. A raw entry that names one of them
@@ -52,6 +57,8 @@ impl ReadFilter {
             handling,
             min_tier: TrustTier::Raw,
             include_inactive: false,
+            max_tier: TrustTier::Verified,
+            not_after: None,
             raw_reach: RawReach::All,
             chain: Vec::new(),
         }
@@ -92,6 +99,7 @@ impl ReadFilter {
         (self.domains.is_empty() || self.domains.iter().any(|d| d == domain))
             && classification <= self.handling
             && tier >= self.min_tier
+            && tier <= self.max_tier
             && (active || self.include_inactive)
             && (tier > TrustTier::Raw || self.admits_raw(reach, task))
     }
@@ -105,6 +113,30 @@ impl ReadFilter {
             RawReach::Chain => false,
         }
     }
+
+    /// Whether an entry created at `created` is inside the snapshot. The instant of the
+    /// snapshot itself is inside. [`ReadFilter::admits`] takes no time, so a caller that
+    /// filters outside the index asks both.
+    #[must_use]
+    pub fn admits_at(&self, created: OffsetDateTime) -> bool {
+        self.not_after.is_none_or(|at| created <= at)
+    }
+
+    /// This filter, closed: the lowest tier is above the highest, so it admits no entry.
+    /// The domains stay, so a request that names one of them gets an empty answer where
+    /// a filter without the domain would refuse it.
+    #[must_use]
+    pub fn closed(mut self) -> Self {
+        self.min_tier = TrustTier::Verified;
+        self.max_tier = TrustTier::Raw;
+        self
+    }
+
+    /// Whether no tier passes this filter.
+    #[must_use]
+    pub fn is_closed(&self) -> bool {
+        self.min_tier > self.max_tier
+    }
 }
 
 impl Default for ReadFilter {
@@ -117,6 +149,8 @@ impl Default for ReadFilter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use time::macros::datetime;
+    use time::Duration;
 
     #[test]
     fn admits_on_every_axis() {
@@ -285,5 +319,81 @@ mod tests {
         assert_eq!(f.handling, Label::Public);
         assert!(f.admits("anything", Label::Public, TrustTier::Raw, true));
         assert!(!f.admits("anything", Label::Internal, TrustTier::Raw, true));
+    }
+
+    const TIERS: [TrustTier; 3] = [TrustTier::Raw, TrustTier::Curated, TrustTier::Verified];
+    const LABELS: [Label; 3] = [Label::Public, Label::Internal, Label::Restricted];
+
+    #[test]
+    fn a_new_filter_has_no_tier_ceiling_and_no_snapshot() {
+        for f in [
+            ReadFilter::for_domains(["dom-a"], Label::Restricted),
+            ReadFilter::any_domain(Label::Restricted),
+        ] {
+            assert_eq!(f.max_tier, TrustTier::Verified);
+            assert_eq!(f.not_after, None);
+            assert!(!f.is_closed());
+            for tier in TIERS {
+                for label in LABELS {
+                    assert!(f.admits("dom-a", label, tier, true), "{tier} {label}");
+                }
+            }
+            assert!(f.admits_at(datetime!(9999-12-31 23:59:59 UTC)));
+        }
+        let narrowest = ReadFilter::default();
+        assert_eq!(narrowest.max_tier, TrustTier::Verified);
+        assert_eq!(narrowest.not_after, None);
+        for tier in TIERS {
+            assert!(narrowest.admits("anything", Label::Public, tier, true));
+        }
+    }
+
+    #[test]
+    fn an_entry_above_the_highest_tier_is_not_admitted() {
+        let mut f = ReadFilter::for_domains(["dom-a"], Label::Restricted);
+        f.max_tier = TrustTier::Raw;
+        assert!(f.admits("dom-a", Label::Public, TrustTier::Raw, true));
+        assert!(!f.admits("dom-a", Label::Public, TrustTier::Curated, true));
+        assert!(!f.admits("dom-a", Label::Public, TrustTier::Verified, true));
+        f.max_tier = TrustTier::Curated;
+        assert!(f.admits("dom-a", Label::Public, TrustTier::Curated, true));
+        assert!(!f.admits("dom-a", Label::Public, TrustTier::Verified, true));
+    }
+
+    #[test]
+    fn a_closed_filter_admits_no_entry_and_keeps_its_domains() {
+        let mut open = ReadFilter::for_domains(["dom-a", "dom-b"], Label::Restricted);
+        open.include_inactive = true;
+        let closed = open.clone().closed();
+        assert!(closed.is_closed());
+        assert_eq!(closed.domains, open.domains);
+        assert_eq!(closed.handling, open.handling);
+        for domain in ["dom-a", "dom-b", "dom-c"] {
+            for label in LABELS {
+                for tier in TIERS {
+                    for active in [true, false] {
+                        assert!(
+                            !closed.admits(domain, label, tier, active),
+                            "{domain} {label} {tier} {active}"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(ReadFilter::any_domain(Label::Restricted)
+            .closed()
+            .is_closed());
+    }
+
+    #[test]
+    fn the_snapshot_admits_its_own_instant_and_nothing_later() {
+        let at = datetime!(2026-10-01 10:00:00.5 UTC);
+        let mut f = ReadFilter::for_domains(["dom-a"], Label::Internal);
+        f.not_after = Some(at);
+        assert!(f.admits_at(at), "the instant itself");
+        assert!(f.admits_at(at - Duration::nanoseconds(1)));
+        assert!(!f.admits_at(at + Duration::nanoseconds(1)));
+        // the same instant at another offset is the same instant
+        assert!(f.admits_at(at.to_offset(time::macros::offset!(+2))));
     }
 }

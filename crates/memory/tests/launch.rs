@@ -1094,6 +1094,36 @@ fn work_refuses_a_position_on_the_wslc_backend_in_words() {
     }
 }
 
+/// `--arm` and `--as-of` give the settings to the memory server on this host, and the
+/// `wslc` backend starts its memory server in a container, so `amem launch` refuses
+/// them there before anything runs.
+#[test]
+fn launch_refuses_an_arm_and_a_snapshot_on_the_wslc_backend_in_words() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let snapshot = ["--as-of", "2026-10-01T10:00:00Z"];
+    for flags in [&["--arm", "no-memory"][..], &snapshot[..]] {
+        let out = memory()
+            .args(["--root", root.to_str().unwrap(), "launch"])
+            .args(["--harness", "claude", "--auth", "key", "--backend", "wslc"])
+            .args(["--workdir", dir.path().to_str().unwrap()])
+            .args(["--prompt", "hello"])
+            .args(flags)
+            .env("ANTHROPIC_API_KEY", "sk-ant-placeholder")
+            // a path with no `wslc` on it: a launcher that did not refuse starts nothing
+            .env("PATH", dir.path())
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(!out.status.success(), "{stderr}");
+        assert!(
+            stderr.contains("--arm and --as-of do not reach the `wslc` backend"),
+            "{stderr}"
+        );
+    }
+}
+
 #[test]
 fn a_prompted_launch_runs_headless_and_insists_on_a_handoff() {
     let dir = tempfile::tempdir().unwrap();
@@ -1144,6 +1174,125 @@ fn a_prompted_launch_runs_headless_and_insists_on_a_handoff() {
         Some(0),
         "{}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A live transcript of an earlier session, written into the record as the memory
+/// server keeps one.
+fn kept_transcript(root: &Path, session: &str, kept_at: &str, answer: &str) {
+    let dir = root.join("record/dom-me/.transcripts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let t = serde_json::json!({
+        "session": session, "domain": "dom-me", "harness": "claude",
+        "origin": format!("{session}.jsonl"), "classification": "internal",
+        "kept_at": kept_at, "retain_until": "2099-01-01T00:00:00Z", "state": "live",
+        "turn_count": 2,
+        "turns": [{"turn": 1, "role": "user", "text": "How many steps has the import?"},
+                  {"turn": 2, "role": "assistant", "text": answer}],
+    });
+    std::fs::write(dir.join(format!("{session}.json")), t.to_string()).unwrap();
+}
+
+/// The transcript-replay arm gives the harness the transcripts of earlier sessions in
+/// front of its prompt. No other launch does, and a snapshot leaves out a later one.
+#[test]
+fn the_transcript_replay_arm_puts_earlier_transcripts_in_front_of_the_prompt() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), "echo \"args=$*\"; exit 0");
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    kept_transcript(
+        &root,
+        "sess-earlier",
+        "2026-10-01T10:00:00Z",
+        "It has five steps.",
+    );
+    let run = |extra: &[&str]| {
+        let mut cmd = memory();
+        cmd.args(["--root", root.to_str().unwrap(), "launch"]);
+        cmd.args(["--harness", "claude", "--auth", "key", "--unconfined"]);
+        cmd.args(["--workdir", work_dir.to_str().unwrap()]);
+        cmd.args(["--prompt", "say the answer", "--no-handoff"]);
+        cmd.args(extra);
+        cmd.env("PATH", path_with(&bins));
+        cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
+        cmd.stdin(Stdio::null());
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{stderr}");
+        (String::from_utf8_lossy(&out.stdout).into_owned(), stderr)
+    };
+    let heading = "## Transcripts of earlier sessions";
+    let (plain, _) = run(&[]);
+    assert!(plain.contains("-p say the answer"), "{plain}");
+    assert!(!plain.contains(heading), "{plain}");
+
+    let (replayed, stderr) = run(&["--arm", "transcript-replay"]);
+    assert!(stderr.contains("amem: arm transcript-replay"), "{stderr}");
+    for held in [heading, "Transcript sess-earlier", "It has five steps."] {
+        assert!(replayed.contains(held), "{held} in: {replayed}");
+    }
+    let (first, last) = (replayed.find(heading), replayed.find("say the answer"));
+    assert!(first.is_some() && first < last, "in front of the prompt");
+
+    // no other arm replays, and a snapshot before the transcript was kept leaves it out
+    let (off, stderr) = run(&["--arm", "no-memory"]);
+    assert!(
+        stderr.contains("amem: arm no-memory (the floor)"),
+        "{stderr}"
+    );
+    assert!(!off.contains(heading) && off.contains("-p say the answer"));
+    let before = [
+        "--arm",
+        "transcript-replay",
+        "--as-of",
+        "2026-09-01T00:00:00Z",
+    ];
+    let (early, stderr) = run(&before);
+    assert!(stderr.contains("the record as of 2026-09-01"), "{stderr}");
+    assert!(!early.contains(heading), "{early}");
+}
+
+/// A prompted run whose settings leave its own handoff out of what it lists still
+/// counts the handoff: it is not told that it left none, and no second one is filed.
+#[test]
+fn a_prompted_run_that_does_not_read_its_handoff_back_still_counts_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = init_root(dir.path());
+    let bins = fake_harness(dir.path(), COMPLETES_ITS_TASK);
+    let work_dir = dir.path().join("work");
+    std::fs::create_dir_all(&work_dir).unwrap();
+    let run = |extra: &[&str]| {
+        let mut cmd = memory();
+        cmd.args(["--root", root.to_str().unwrap(), "launch"]);
+        cmd.args(["--harness", "claude", "--auth", "key", "--unconfined"]);
+        cmd.args(["--workdir", work_dir.to_str().unwrap()]);
+        cmd.args(["--prompt", "finish the import"]);
+        cmd.args(extra);
+        cmd.env("PATH", path_with(&bins));
+        cmd.env("ANTHROPIC_API_KEY", "sk-ant-placeholder");
+        cmd.stdin(Stdio::null());
+        let out = cmd.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(0), "{extra:?}: {stderr}");
+        assert!(!stderr.contains("left no handoff"), "{extra:?}: {stderr}");
+    };
+    let handoffs = || {
+        let listed = cli(&root, &["list", "--kind", "handoff", "--limit", "50"]);
+        listed.as_array().map_or(0, Vec::len)
+    };
+    run(&[]);
+    assert_eq!(handoffs(), 1, "the harness's own handoff");
+    // memory access off: the launcher's list is empty before the run and after it
+    run(&["--arm", "no-memory"]);
+    assert_eq!(handoffs(), 2);
+    // a snapshot before the run: the handoff is created after it
+    run(&["--as-of", "2026-01-01T00:00:00Z"]);
+    assert_eq!(
+        handoffs(),
+        3,
+        "one for each run, and no handoff of last resort"
     );
 }
 

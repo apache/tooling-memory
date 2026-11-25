@@ -6,7 +6,7 @@
 use dm_core::approx_tokens;
 use dm_index::Hit;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -58,6 +58,27 @@ pub struct ReadLog {
     author: Mutex<String>,
     lock: Mutex<()>,
     enabled: AtomicBool,
+    /// The entries served since the last decision context was kept. In memory only.
+    returned: Mutex<Returned>,
+    /// The digest of the T0 last served. In memory only.
+    t0: Mutex<Option<String>>,
+}
+
+/// Entry ids, each once, in the order they were first served.
+#[derive(Default)]
+struct Returned {
+    order: Vec<String>,
+    seen: HashSet<String>,
+}
+
+impl Returned {
+    fn add(&mut self, ids: &[String]) {
+        for id in ids {
+            if self.seen.insert(id.clone()) {
+                self.order.push(id.clone());
+            }
+        }
+    }
 }
 
 /// A line appended to a JSONL file under the state directory; a failure is dropped,
@@ -142,7 +163,29 @@ impl ReadLog {
             author: Mutex::new(String::new()),
             lock: Mutex::new(()),
             enabled: AtomicBool::new(true),
+            returned: Mutex::new(Returned::default()),
+            t0: Mutex::new(None),
         }
+    }
+
+    /// The entries served since this was last asked, each once, in the order they were
+    /// first served. The answer is taken: the next call starts from nothing. A decision
+    /// context keeps it, so a context names what its session was served since the
+    /// context before it.
+    pub fn take_returned(&self) -> Vec<String> {
+        let mut r = self
+            .returned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *r).order
+    }
+
+    /// The digest of the T0 last served to this session; none when none was.
+    pub fn last_t0(&self) -> Option<String> {
+        self.t0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// Record reads as this author's from now on.
@@ -203,6 +246,10 @@ impl ReadLog {
         if !self.enabled.load(Ordering::Relaxed) {
             return;
         }
+        self.returned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add(ids);
         let read = Read {
             at: time::OffsetDateTime::now_utc()
                 .format(&time::format_description::well_known::Rfc3339)
@@ -256,6 +303,12 @@ impl ReadLog {
 
     /// Text served whole: a T0, or an entry's body.
     pub fn text(&self, tool: &str, text: &str) {
+        if tool == "t0" && self.enabled.load(Ordering::Relaxed) {
+            *self
+                .t0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dm_core::digest(text));
+        }
         self.append(tool, None, 1, approx_tokens(text));
     }
 
@@ -361,6 +414,37 @@ mod tests {
         assert_eq!(reads[0].tokens, 6 + 2);
         assert_eq!(reads[1].query.as_deref(), Some("import"));
         assert_eq!(reads[1].session, "sess-1");
+    }
+
+    #[test]
+    fn replay_state_a_read_log_keeps_the_ids_served_and_the_digest_of_t0() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = ReadLog::new(dir.path(), "sess-1");
+        let ids = |xs: &[&str]| xs.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert!(log.take_returned().is_empty() && log.last_t0().is_none());
+        log.served_ids("search", None, 2, 9, false, None, &ids(&["mem-b", "mem-a"]));
+        log.opened("mem-a", "The body.", false);
+        log.opened("mem-c", "Another body.", false);
+        assert_eq!(
+            log.take_returned(),
+            ids(&["mem-b", "mem-a", "mem-c"]),
+            "each id once, in the order first served"
+        );
+        assert!(log.take_returned().is_empty(), "taken");
+        log.opened("mem-a", "The body.", false);
+        assert_eq!(log.take_returned(), ids(&["mem-a"]), "served again");
+        // only a T0 is the T0
+        log.text("transcripts", "A transcript.");
+        assert_eq!(log.last_t0(), None);
+        log.text("t0", "The first T0.");
+        log.text("t0", "The second T0.");
+        assert_eq!(log.last_t0(), Some(dm_core::digest("The second T0.")));
+        // a disabled log keeps nothing
+        log.disable();
+        log.opened("mem-d", "A body.", false);
+        log.text("t0", "A third T0.");
+        assert!(log.take_returned().is_empty());
+        assert_eq!(log.last_t0(), Some(dm_core::digest("The second T0.")));
     }
 
     #[test]

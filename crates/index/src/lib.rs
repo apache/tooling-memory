@@ -274,22 +274,39 @@ fn fts_query(text: &str, any_word: bool) -> Option<String> {
 }
 
 /// The WHERE fragment and parameters a filter compiles to. Positional parameters start at
-/// `first`, so the caller can put its own before them. The answer for a row is that of
-/// [`ReadFilter::admits_entry`] for the entry; a test holds the two together.
+/// `first`, so the caller can put its own before them. Every read of the index goes
+/// through here, so the tier ceiling, the snapshot and the raw reach hold for a search, a
+/// list, a count and one entry's metadata alike. A row without its sort key is outside
+/// every snapshot. The answer for a row is that of [`ReadFilter::admits_entry`] and
+/// [`ReadFilter::admits_at`] for the entry; a test holds the first together with this.
 fn compile_filter(f: &ReadFilter, first: usize) -> (String, Vec<rusqlite::types::Value>) {
     let mut sql = format!(
-        " AND e.label_rank <= ?{} AND e.tier_rank >= ?{}",
+        " AND e.label_rank <= ?{} AND e.tier_rank >= ?{} AND e.tier_rank <= ?{}",
         first,
-        first + 1
+        first + 1,
+        first + 2
     );
-    let mut values: Vec<rusqlite::types::Value> =
-        vec![(f.handling as i64).into(), (f.min_tier as i64).into()];
+    let mut values: Vec<rusqlite::types::Value> = vec![
+        (f.handling as i64).into(),
+        (f.min_tier as i64).into(),
+        (f.max_tier as i64).into(),
+    ];
     if !f.include_inactive {
         sql.push_str(" AND e.status IS NULL");
     }
+    if let Some(at) = f.not_after {
+        let (unix, nanos) = sort_key(at);
+        let n = first + values.len();
+        sql.push_str(&format!(
+            " AND (e.created_unix < ?{n} OR (e.created_unix = ?{n} AND e.created_nanos <= ?{}))",
+            n + 1
+        ));
+        values.extend([unix.into(), nanos.into()]);
+    }
     if !f.domains.is_empty() {
+        let next = first + values.len();
         let marks: Vec<String> = (0..f.domains.len())
-            .map(|i| format!("?{}", first + 2 + i))
+            .map(|i| format!("?{}", next + i))
             .collect();
         sql.push_str(&format!(" AND e.domain IN ({})", marks.join(", ")));
         values.extend(f.domains.iter().map(|d| d.clone().into()));
@@ -1070,6 +1087,167 @@ mod tests {
         curated.min_tier = TrustTier::Curated;
         assert_eq!(ix.count(&curated).unwrap(), 0, "tier floor");
         assert_eq!(ix.count(&any()).unwrap(), 4);
+    }
+
+    /// What each read of the index returns under `f`, by name: every read that takes a
+    /// filter, asked about the same entries.
+    fn every_read(ix: &Index, f: &ReadFilter, all: &[&str]) -> Vec<(&'static str, Vec<String>)> {
+        let sorted = |hits: Vec<Hit>| {
+            let mut got: Vec<String> = hits.into_iter().map(|h| h.id).collect();
+            got.sort_unstable();
+            got
+        };
+        let by_meta: Vec<String> = all
+            .iter()
+            .filter(|id| ix.meta(id, f).unwrap().is_some())
+            .map(ToString::to_string)
+            .collect();
+        let listed = sorted(ix.list(f, None, 100).unwrap());
+        assert_eq!(
+            ix.count(f).unwrap(),
+            listed.len() as u64,
+            "the count sees what the list sees"
+        );
+        vec![
+            ("search", sorted(ix.search("ledger", f, 100).unwrap())),
+            ("list", listed),
+            ("list_every", sorted(ix.list_every(f, None).unwrap())),
+            (
+                "due_for_review",
+                sorted(ix.due_for_review(f, date!(2027 - 01 - 01), 100).unwrap()),
+            ),
+            ("meta", by_meta),
+        ]
+    }
+
+    fn assert_every_read(ix: &Index, f: &ReadFilter, all: &[&str], want: &[&str]) {
+        for (read, got) in every_read(ix, f, all) {
+            assert_eq!(got, want, "{read}");
+        }
+    }
+
+    /// An entry every read of [`every_read`] can return: it holds the word searched for
+    /// and a review date.
+    fn tiered(id: &str, tier: TrustTier, created: OffsetDateTime) -> Entry {
+        let mut e = entry("dom-a", id, "Ledger note", "The ledger holds tasks.\n");
+        e.front.trust_tier = tier;
+        e.front.created = created;
+        e.front.review_by = Some(date!(2026 - 12 - 01));
+        e
+    }
+
+    #[test]
+    fn an_entry_above_the_highest_tier_is_returned_by_no_read() {
+        let mut ix = Index::in_memory().unwrap();
+        let at = datetime!(2026-10-01 10:00 UTC);
+        let all = ["mem-a-curated", "mem-a-raw", "mem-a-verified"];
+        ix.upsert(&tiered("mem-a-raw", TrustTier::Raw, at)).unwrap();
+        ix.upsert(&tiered("mem-a-curated", TrustTier::Curated, at))
+            .unwrap();
+        ix.upsert(&tiered("mem-a-verified", TrustTier::Verified, at))
+            .unwrap();
+        assert_every_read(&ix, &any(), &all, &all);
+        let mut f = any();
+        f.max_tier = TrustTier::Raw;
+        assert_every_read(&ix, &f, &all, &["mem-a-raw"]);
+        f.max_tier = TrustTier::Curated;
+        assert_every_read(&ix, &f, &all, &["mem-a-curated", "mem-a-raw"]);
+        // with domains named, the parameters after the ceiling keep their places
+        let mut named = ReadFilter::for_domains(["dom-a", "dom-b"], Label::Restricted);
+        named.max_tier = TrustTier::Raw;
+        assert_every_read(&ix, &named, &all, &["mem-a-raw"]);
+    }
+
+    #[test]
+    fn an_entry_created_after_the_snapshot_is_returned_by_no_read() {
+        let mut ix = Index::in_memory().unwrap();
+        let at = datetime!(2026-10-01 10:00:00.5 UTC);
+        let all = [
+            "mem-a-0-earlier",
+            "mem-a-1-before",
+            "mem-a-2-at",
+            "mem-a-3-after",
+            "mem-a-4-next",
+        ];
+        // an earlier second with more nanoseconds than the snapshot's: the seconds
+        // decide first
+        ix.upsert(&tiered(
+            "mem-a-0-earlier",
+            TrustTier::Raw,
+            datetime!(2026-10-01 09:59:59.9 UTC),
+        ))
+        .unwrap();
+        ix.upsert(&tiered(
+            "mem-a-1-before",
+            TrustTier::Raw,
+            at - time::Duration::seconds(1),
+        ))
+        .unwrap();
+        ix.upsert(&tiered("mem-a-2-at", TrustTier::Raw, at))
+            .unwrap();
+        ix.upsert(&tiered(
+            "mem-a-3-after",
+            TrustTier::Raw,
+            at + time::Duration::nanoseconds(1),
+        ))
+        .unwrap();
+        // a later second with fewer nanoseconds
+        ix.upsert(&tiered(
+            "mem-a-4-next",
+            TrustTier::Raw,
+            datetime!(2026-10-01 10:00:01 UTC),
+        ))
+        .unwrap();
+        assert_every_read(&ix, &any(), &all, &all);
+        let inside = ["mem-a-0-earlier", "mem-a-1-before", "mem-a-2-at"];
+        let mut f = any();
+        f.not_after = Some(at);
+        assert_every_read(&ix, &f, &all, &inside);
+        // the same instant at another offset is the same snapshot
+        f.not_after = Some(at.to_offset(time::macros::offset!(-7)));
+        assert_every_read(&ix, &f, &all, &inside);
+        let mut named = ReadFilter::for_domains(["dom-a"], Label::Restricted);
+        named.not_after = Some(at);
+        named.max_tier = TrustTier::Curated;
+        assert_every_read(&ix, &named, &all, &inside);
+        named.domains = vec!["dom-b".into()];
+        assert_every_read(&ix, &named, &all, &[]);
+    }
+
+    #[test]
+    fn a_successor_outside_the_snapshot_is_not_where_a_reader_is_sent() {
+        let mut ix = Index::in_memory().unwrap();
+        let at = datetime!(2026-10-01 10:00 UTC);
+        let mut old = tiered("mem-a-old", TrustTier::Raw, at - time::Duration::hours(1));
+        old.front.status = Some(Status::Superseded);
+        let mut new = tiered("mem-a-new", TrustTier::Raw, at + time::Duration::hours(1));
+        new.front.supersedes = Some("mem-a-old".into());
+        ix.upsert(&old).unwrap();
+        ix.upsert(&new).unwrap();
+        let mut f = any();
+        f.include_inactive = true;
+        assert_eq!(
+            ix.replaced_by("mem-a-old", &f).unwrap().as_deref(),
+            Some("mem-a-new")
+        );
+        f.not_after = Some(at);
+        assert_eq!(ix.replaced_by("mem-a-old", &f).unwrap(), None);
+    }
+
+    #[test]
+    fn a_closed_filter_returns_nothing_from_any_read() {
+        let mut ix = Index::in_memory().unwrap();
+        let at = datetime!(2026-10-01 10:00 UTC);
+        let all = ["mem-a-curated", "mem-a-raw", "mem-a-verified"];
+        ix.upsert(&tiered("mem-a-raw", TrustTier::Raw, at)).unwrap();
+        ix.upsert(&tiered("mem-a-curated", TrustTier::Curated, at))
+            .unwrap();
+        ix.upsert(&tiered("mem-a-verified", TrustTier::Verified, at))
+            .unwrap();
+        assert_every_read(&ix, &any().closed(), &all, &[]);
+        let mut wide = ReadFilter::for_domains(["dom-a"], Label::Restricted);
+        wide.include_inactive = true;
+        assert_every_read(&ix, &wide.closed(), &all, &[]);
     }
 
     #[test]

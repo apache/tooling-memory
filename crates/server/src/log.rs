@@ -459,6 +459,24 @@ pub fn append_with(
     writer.append(by, actor, label, sync, change)
 }
 
+/// The offset of `domain`'s log: the sequence number of its last event that names a
+/// version, a `put` or an `erased`, and 0 for a log with no such event. With an entry's
+/// id, an offset names the version the entry had then: the last version the log put at
+/// or before it. A read, a send, an offered or refused write and an event of the ledger
+/// change no version, so the offset stays where it is after each of them.
+///
+/// # Errors
+///
+/// A domain that is not a name, or the file system.
+pub fn offset(root: &Path, domain: &str) -> Result<u64, Error> {
+    let events = read(root, domain, 0)?;
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.change, Change::Put { .. } | Change::Erased { .. }));
+    Ok(last.map_or(0, |e| e.seq))
+}
+
 /// A domain's log from `from` on, in order. A line that does not parse is skipped: a
 /// write cut short by a crash leaves at most the last line torn.
 ///

@@ -56,8 +56,15 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Replay, in part.** Frozen-context replay is built: `amem replay` runs on the decision
   contexts that the egress records. Live re-execution is also built: `amem reenact` runs a
   prompted session again on its prompt, at its commit. A tape of what its memory tool
-  calls returned answers those calls, until the run diverges. These limits
-  apply:
+  calls returned answers those calls, until the run diverges. Each decision context and
+  each tape holds a replay manifest: the log offset of each domain, the policy version,
+  the grants and the session settings that the session began with. `amem reenact state`
+  compares the manifest with the record as it is now. A run that left its tape is marked
+  incomplete when that state moved. These limits apply:
+  - The manifest holds ids and log offsets. `amem` does not serve the record as it was
+    at an offset, so an incomplete run stays incomplete.
+  - The index checkpoint of the manifest is a count of entries for each domain. It holds
+    no screening state and no registry.
   - An interactive session has no prompt to run again.
   - The tape of a session that works a task does not yet carry the prompt of that task.
   - A session on a login that runs through a tunnel has no decision contexts, because the
@@ -103,7 +110,11 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Drift over many runs.** The detectors read answers and also metadata: fingerprint
   digests, flip rate, formats and refusals. Logprob divergence and change-point detection
   over many runs are missing. The probes run in each curation cycle with `--drift`,
-  against fixed thresholds.
+  against fixed thresholds. Confirmed drift opens a drift window for the destination and
+  the model, and the owner can open one by hand (`amem drift window`). The freeze is
+  built: nothing that an agent wrote inside a window is promoted. The freeze holds every
+  entry that an agent wrote inside a window, on any model. An entry records its session
+  and not its model, and the freeze does not read the session.
 - **Costing, in part.** `amem` measures and prices these (`amem cost`, `amem usage`, the
   evaluation):
   - tokens and calls
@@ -244,9 +255,36 @@ two weeks. It is also the reason that none of it is the production shape.
 - **Measurement, in part.** `amem` computes four read metrics, cost and usage. The paper
   names 21 metrics. Upkeep share, induced work and the landing queue are not built. The
   only limit is a spend limit in tokens.
-- **The evaluation arms.** Act 6 compares memory with an empty record. The paper's five
-  arms, the paired seeds and the margin are not built. No scorecard is kept in the
-  platform domain.
+- **Evaluation, in part.** The five arms are built as session settings that only the
+  launcher gives (`amem launch --arm`). A plan fixes the arms, the seeds and the margin
+  before the runs. The scorer pairs each arm with the baseline across tasks and seeds,
+  checks the five replay traps, and keeps a scorecard in the platform domain
+  (`amem eval`, demo act 6). These parts are open:
+  - A run reads the record through a snapshot bound on the read filter. It does not get
+    a copy of the record as it was. An entry that was replaced or demoted after the
+    snapshot stays hidden, and a write of a run goes to the record.
+  - The raw-only arm leaves out each entry above raw. It does not serve the raw version
+    of a promoted entry.
+  - The disclosure depth has two values, T0 and full. A depth of summaries only is not
+    built.
+  - A seed is the number of a repeated run. Nothing passes it to the model.
+  - The only judge is the regular expression of each task. A judging model that is held
+    fixed is not built.
+  - The scorer takes success and cost from the caller. It does not read the cost from
+    the egress, and it does not charge the cost of writes and curation to an arm.
+  - An evaluation run is a launch. It is not a task in the platform domain with a budget
+    of its own, and `amem cost` counts it with production.
+  - The plan is a file with a digest. Nothing makes a person review a change to the
+    frozen task set.
+  - The demo's task set has no task with a recorded failure, so the survivorship trap
+    stays open and each verdict of the demo is inconclusive.
+  - The snapshot bounds entries and transcripts only. A run reads the tasks of the
+    ledger as they are now, so text that one run files as a task can reach a later run
+    in any arm. The leakage trap does not see this.
+  - The tape of a transcript-replay run does not hold the replayed text or its digest.
+  - The standing holdout is not built. A scorecard compares arms only, not a change of
+    model or of harness.
+  - The arm flags do not reach the `wslc` sandbox backend or `amem work`.
 - **Long timescales.** There is no ownership registry, no personal domain, no recovery
   bundle and no restore drill.
 - **Smaller pieces.** The search tool ran only against a fake of Brave's API. It never
@@ -327,14 +365,16 @@ These parts do what the paper says, on one laptop. Each item names what replaces
   process tree only as far as each level reaps its children. Peak memory is that of the
   largest process, not the sum of the tree. Production: the per-key spend of the gateway,
   with each call tagged with its task and trace.
-- **The evaluation** is four questions, graded by regular expression, under four
-  conditions:
+- **The evaluation** is four questions, graded by regular expression. It runs them under
+  the five arms of a plan with two seeds, or under four older conditions:
   - with this memory
   - with an empty one
   - the bare harness
   - the bare harness with its own tools off
 
-  It runs on any number of harnesses, but on one model per run.
+  It runs on any number of harnesses, but on one model per run. A scorecard is JSON of
+  this project's own shape. Production: runs in a copy of the record at a snapshot, on a
+  budget of their own, with spans in the OpenTelemetry conventions for generative AI.
 - **The web launcher** listens on loopback for the one owner.
 
 The code hides none of this:
@@ -479,7 +519,8 @@ claude mcp add memory -- /path/to/amem --root ~/memory serve --author "agent:cla
 ```
 
 The agent gets `t0`, `search`, `get`, `write`, `list`, `recall`, `promote`, the ledger's
-memory tools and `transcript_turn`. Its writes go in at raw trust, under the author that
+memory tools, `transcript_turn`, `settings` and `scorecards`. The owner also gets
+`score_evaluation`. Its writes go in at raw trust, under the author that
 you give. Such a harness has no sandbox, and its model calls do not go through an egress.
 The policy still decides what it reads and writes over MCP. But the harness keeps its own
 network and credentials. Nothing meters its model calls. No model's ceiling applies to
@@ -505,11 +546,12 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 | The perimeter | Rego over `grants.toml` and policy entries in the record (L0 to L3, enforced after they are verified, with scoped exceptions). Admission, the read filter, the write scan and quarantine, and blast-radius gates. A log of every decision | `policy show, eval, list, lint`, `quarantine` |
 | The curator | A survey of what needs curation, an independent auditor, a search for contradictions, canaries, its own telemetry and alarms, and a cycle on a budget | `curator`, `curate`, `audit`, `canary` |
 | The egress | It forwards, meters and times model calls, holds spend limits per destination, and records decision contexts. It keeps the wall clock, CPU and peak memory of each session beside the session's tokens | `launch`, `usage`, `cost` |
-| Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned | `transcript`, `replay`, `reenact run, report, tapes, show, pin, unpin` |
+| Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned. A replay manifest on each decision context and tape, and the replay state of a tape | `transcript`, `replay`, `reenact run, report, state, tapes, show, pin, unpin` |
 | The event log | Each write, read and send goes into the append-only log of its domain, with a label, and with ids and digests only. The log feeds the index, against a bound of 60 seconds. A materializer builds the index again from the log and replays the ledger's events. Lineage reads the log back and forward. An erasure withholds the entries that are one step forward. The log marks each event of a session that read outside content | `log show, feed, freshness, materialize, outside`, `lineage`, `withheld list, release`; MCP `log`, `lineage`, `outside_readers` |
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain. They load only after a person verifies them | `platform list, show`, `golden --platform` |
-| Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector | `drift probe`, `drift check` |
+| Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector. Confirmed drift opens a drift window, and nothing that an agent wrote inside a window is promoted | `drift probe`, `drift check`, `drift window open, close, list` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory | `savings`, `golden`, `scripts/eval.py` |
+| Evaluation | The five arms as session settings that the launcher gives. A plan with a margin and seeds, runs paired with a baseline arm, the replay traps, and a scorecard kept in the platform domain | `eval arms, plan, score, scorecards`, `launch --arm --as-of --eval-plan --eval-task --eval-seed`, `serve --arm --as-of`, `scripts/eval.py`; MCP `settings`, `scorecards`, `score_evaluation` |
 | Interchange | Bundles at or below a label, erasure with a stub and a receipt, and taps as WASI components | `export`, `import`, `erase`, `tap` |
 | Tools | Fetch and search as taps that an agent calls in a turn. The policy decides every request at the session label. The answers are scanned and kept as sources. Or hosted: a tool server serves the same components, and another launcher calls it through its egress. This path reaches only the hosts that the calling session may reach, and says where it went. The source keeps that | `tool`, `source`, `tool-server`; MCP `fetch`, `web_search` |
 | Gofannon | Its deployed agents as a tool tap on the same terms: listed, run and read back. Also a worker that runs one of them on the ledger's tasks and files its result as the handoff | `gofannon agents`, `gofannon work`; MCP `gofannon` |
@@ -582,10 +624,11 @@ It says what is missing and how to fix it. At the end, it shows the command to r
    the board. A follow-up task brings back their reports, and its completion closes the
    task that delegated.
 5. **Watching it.** Traces in a collector, the read metrics, drift probes, transcripts by
-   citation, and replay.
-6. **Memory against no memory.** The same questions go to a harness with memory and with
-   an empty one. The demo grades and times the answers, and counts them in tokens, CPU and
-   memory.
+   citation, and replay. Then the freeze: a drift window, and a promotion that it stops.
+6. **The evaluation.** The five arms, and one question under each arm. A plan that fixes
+   the margin and the seeds. Then the same questions go to a harness under each arm. The
+   demo grades the answers, counts their tokens, and keeps a scorecard with the replay
+   traps.
 7. **The platform.** An agent definition, an eval suite and a default model as entries in
    a platform domain. They load only after a person verifies them. A harness works a task
    under the definition. The demo scores the suite and gives the cost of the run in every

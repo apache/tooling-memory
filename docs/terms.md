@@ -108,6 +108,10 @@ term here in the same commit as the first document that needs it.
 | feed | The step that brings the index up to the event log of a domain: it takes each version that the log names above a cursor from the record, and moves the cursor. A writer does it before its write returns | sync (for the feed) |
 | freshness bound | The longest time that a version in the event log of a domain can wait for the feed: 60 seconds. `freshness` measures a domain against it | index lag |
 | projection | The read-only copy of the record's entries at `/memory` in the sandbox | |
+| session settings | The values that a launcher gives a session one time, before the session reads. They make what the session reads smaller, and the session cannot change them | session config, switches, flags (for session settings) |
+| arm | One fixed value of the session settings, for an evaluation: `no-memory`, `transcript-replay`, `t0-only`, `raw-only` or `full` | variant, condition, mode (for an arm) |
+| snapshot | The time that a session reads the record at, `--as-of`. The session does not read an entry that was created after it | cutoff, checkpoint (for a snapshot) |
+| disclosure depth | How far below T0 a session reads: `t0` (T0 and nothing below it) or `full` | depth (alone, for the session setting) |
 
 ## Calls and tools
 
@@ -125,6 +129,16 @@ term here in the same commit as the first document that needs it.
 | replay | Send a recorded decision context to a model again | |
 | tape | The memory tool calls of one session, with their results | |
 | re-enactment | Run a session again on its prompt, and answer its memory tools from its tape | |
+| replay manifest | The part of a decision context and of a tape header that names what the session could read at that time: for each domain the offset of its event log (the number of the last event that names a version of an entry) and the number of entries in the index, the policy version, the digest of the grants, the session settings, the ranker and the digest of T0. On a decision context, it also names the entries that the session got after the decision context before | starting state (for a replay manifest), checkpoint (for a replay manifest) |
+| replay state | What `amem reenact state` gives for a tape: its replay manifest, each part that is different now, the calls that an erasure removed, and `complete` or `incomplete` | |
+| drift window | A time span for one destination and one model. It starts at the time that detected drift gives, and it ends when the owner closes it. An entry that an agent wrote in the span is not promoted, also after the owner closed the drift window | freeze (as a noun), quarantine (for a drift window) |
+| freeze | The rule of a drift window: nothing that an agent wrote inside the window is promoted, also after the window closes | hold (for the freeze), lock (for the freeze) |
+| plan | For an evaluation: the evaluation set file with a `[plan]` table. It fixes the tasks, the arms, the baseline arm, the number of seeds, the margin and the judge before the first run. The plan has a digest, and the tape of each run names that digest | protocol, design (for a plan) |
+| seed | For an evaluation: the number of a repeated run of one task in one arm, from 0. Nothing gives the seed to the model | repetition, trial (for a seed) |
+| pair | For an evaluation: one task and one seed with a run in an arm and a run in the baseline arm. The scorer compares the two runs of a pair | match (for a pair) |
+| margin | The fraction that the success rate of an arm can be below the baseline, and the arm is still no worse. The plan fixes it | tolerance, threshold (for the margin) |
+| replay trap | One of five conditions that make the result of an evaluation unsafe: `survivorship`, `leakage`, `noise`, `judge-drift`, `distribution-shift`. An open replay trap makes each verdict `inconclusive` | pitfall, bias (for a replay trap) |
+| scorecard | The result of one evaluation: for each arm the paired differences from the baseline arm in success and in cost, the verdict, the five replay traps, and the drift window that the runs were in. The record keeps it as a decision entry in the platform's domain | report, result card |
 | recall | The memory tool that answers a question with a cited brief, or with a pack of entries when no model is behind it | |
 | deputy | The small model that the memory server calls through the egress for recall | |
 | tap | A component that connects an outside system to `amem`. A tap with `tool = true` is a tool. Any other tap runs on a schedule, such as `github-issues` | connector, plugin (for a tap) |

@@ -8,11 +8,7 @@
 act 7 "The platform" "The fleet's own configuration held as memory, under the same trust tiers as what it knows: agent definitions, eval suites and harness defaults in a platform domain, loaded only once a person verifies them. A task worked under a verified definition, the suite scored, and the run's cost in tokens, time, CPU and memory." "agent:architect, played by the demo script, proposing a definition, a suite and a default model; you, who verify them; $WORKER_HARNESS on the model the platform names, working a task under the definition; and the launcher and the egress, measuring the run."
 
 say "A platform domain" "The grants name one domain the platform's. Its entries carry artifacts, fenced blocks the launcher reads by kind and name."
-if ! grep -q '^platform = ' "$root/grants.toml"; then
-  # a top-level key, before the first table
-  sed -i 's/^handling = \(.*\)$/handling = \1\nplatform = "dom-platform"/' "$root/grants.toml"
-  printf '\n[domains.dom-platform]\ndefault_classification = "internal"\nadmit_own = true\n' >> "$root/grants.toml"
-fi
+platform_domain
 echo "  grants.toml: platform = \"dom-platform\", and [domains.dom-platform]"
 
 say "An agent proposes a definition" "agent:architect writes an agent definition for $WORKER_HARNESS, a recall suite, and the model $WORKER_HARNESS should run on. Written by an agent, they are raw, and raw does not load."

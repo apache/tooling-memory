@@ -1218,6 +1218,225 @@ fn a_position_is_written_verified_pinned_to_and_retired_through_the_commands() {
     step_position_retire(&d.root, &entry, &id);
 }
 
+fn search_call() -> (&'static str, serde_json::Value) {
+    ("search", serde_json::json!({"query": "digests"}))
+}
+
+fn settings_call() -> (&'static str, serde_json::Value) {
+    ("settings", serde_json::json!({}))
+}
+
+/// A session of `amem serve` under the arm a launcher's variable names: what it is
+/// refused, what it still does, and what it reads.
+#[test]
+fn serve_gives_the_session_the_arm_a_launcher_names() {
+    let mut d = step_init();
+    step_write(&mut d);
+    let body = "# Stopped\n\nThe digests are next.\n";
+    let write = serde_json::json!({"body": body, "entry_type": "handoff"});
+
+    // no launcher named an arm: production's settings, and the search finds the handoff
+    let calls = [search_call(), settings_call()];
+    let open = serve(&d.root, "agent:codex", &[], &[], &calls);
+    let found = &open.result(0)["hits"][0]["id"];
+    assert_eq!(*found, d.handoff, "{:?}", open.calls);
+    assert_eq!(open.result(1)["arm"], "full", "{:?}", open.calls);
+    assert_eq!(open.result(1)["settings"]["memory"], true);
+
+    // the variable a launcher sets
+    let env = [("MEMORY_ARM", "no-memory")];
+    let t0 = ("t0", serde_json::json!({}));
+    let calls = [search_call(), settings_call(), ("write", write), t0];
+    let off = serve(&d.root, "agent:codex", &[], &env, &calls);
+    let (allowed, why) = &off.calls[0];
+    assert!(!allowed, "the search is refused: {why}");
+    assert!(why.contains("memory access is off"), "{why}");
+    assert_eq!(off.result(1)["arm"], "no-memory", "{:?}", off.calls);
+    assert_eq!(off.result(1)["settings"]["memory"], false);
+    assert!(off.result(2)["id"].is_string(), "the write is not governed");
+    let (_, t0) = &off.calls[3];
+    assert!(t0.contains("T0 is off"), "{t0}");
+    assert!(!t0.contains(&d.handoff), "{t0}");
+    let said = "amem: arm no-memory (the floor)";
+    assert!(off.stderr.contains(said), "{}", off.stderr);
+}
+
+/// The flags of `amem serve`, and what ends the command before it serves.
+#[test]
+fn serve_takes_an_arm_and_a_snapshot_as_flags_and_refuses_what_is_neither() {
+    let mut d = step_init();
+    step_write(&mut d);
+    // the raw-only arm at a snapshot before the record was written
+    let flags = ["--arm", "raw-only", "--as-of", "2026-01-01T00:00:00Z"];
+    let calls = [search_call(), settings_call()];
+    let early = serve(&d.root, "agent:codex", &flags, &[], &calls);
+    let none = serde_json::json!([]);
+    assert_eq!(early.result(0)["hits"], none, "{:?}", early.calls);
+    let told = early.result(1);
+    assert_eq!(told["arm"], "raw-only", "{told}");
+    assert_eq!(told["settings"]["not_after"], "2026-01-01T00:00:00Z");
+
+    // an empty variable is unset, and a name that is no arm ends the command
+    let unset = [("MEMORY_ARM", ""), ("MEMORY_AS_OF", "")];
+    let same = serve(&d.root, "agent:codex", &[], &unset, &[settings_call()]);
+    assert_eq!(same.result(0)["arm"], "full", "{:?}", same.calls);
+    for (flags, why) in [
+        (["--arm", "everything"], "is not an arm"),
+        (["--as-of", "yesterday"], "RFC 3339"),
+        (["--arm", "transcript-replay"], "in front of a prompt"),
+    ] {
+        let refused = fails(&d.root, &[&["serve"][..], &flags[..]].concat());
+        assert!(refused.contains(why), "{refused}");
+    }
+}
+
+const EVAL_PLAN: &str = "preamble = \"Read the record. \"\n[plan]\nname = \"cli\"\ndomain = \"dom-me\"\nbaseline = \"no-memory\"\narms = [\"no-memory\", \"full\"]\nseeds = 2\nmargin = 0.1\njudge = \"regex\"\n[[task]]\nid = \"a\"\nprompt = \"What is A?\"\nexpect = \"A\"\n";
+
+#[test]
+fn eval_plan_prints_the_plan_with_its_digest_or_the_refusal() {
+    let d = step_init();
+    let file = d.root.join("plan.toml");
+    std::fs::write(&file, EVAL_PLAN).unwrap();
+    let file = file.to_str().unwrap();
+    let read = json(&ok(&d.root, &["eval", "plan", file], None));
+    assert_eq!(read["digest"].as_str().map(str::len), Some(64), "{read}");
+    assert_eq!(read["plan"]["name"], "cli");
+    assert_eq!(
+        read["plan"]["arms"],
+        serde_json::json!(["no-memory", "full"])
+    );
+    assert_eq!(read["plan"]["accepted_cost"], 1.0);
+    // a comment does not move the digest, and the margin does
+    std::fs::write(file, format!("# a comment\n{EVAL_PLAN}")).unwrap();
+    let same = json(&ok(&d.root, &["eval", "plan", file], None));
+    assert_eq!(same["digest"], read["digest"]);
+    std::fs::write(file, EVAL_PLAN.replace("margin = 0.1", "margin = 0.2")).unwrap();
+    let moved = json(&ok(&d.root, &["eval", "plan", file], None));
+    assert_ne!(moved["digest"], read["digest"]);
+    std::fs::write(file, EVAL_PLAN.replace("seeds = 2", "seeds = 1")).unwrap();
+    let refused = fails(&d.root, &["eval", "plan", file]);
+    assert!(refused.contains("two seeds or more"), "{refused}");
+}
+
+#[test]
+fn eval_score_and_scorecards_reach_the_library() {
+    let d = step_init();
+    let plan = d.root.join("plan.toml");
+    std::fs::write(&plan, EVAL_PLAN).unwrap();
+    let outcomes = d.root.join("outcomes.json");
+    std::fs::write(&outcomes, "[]").unwrap();
+    let (plan, outcomes) = (plan.to_str().unwrap(), outcomes.to_str().unwrap());
+    let refused = fails(&d.root, &["eval", "score", plan, outcomes]);
+    assert!(refused.contains("one outcome or more"), "{refused}");
+    std::fs::write(
+        outcomes,
+        r#"[{"session": "sess-none", "success": true, "cost": 1, "judge": "regex"}]"#,
+    )
+    .unwrap();
+    let refused = fails(&d.root, &["eval", "score", plan, outcomes, "--keep"]);
+    assert!(refused.contains("sess-none"), "{refused}");
+    // a root with no platform domain keeps no scorecard
+    let kept = json(&ok(&d.root, &["eval", "scorecards", "--limit", "3"], None));
+    assert_eq!(kept, serde_json::json!([]));
+}
+
+#[test]
+fn launch_takes_the_evaluation_flags_together_and_without_a_prompt() {
+    let d = step_init();
+    let plan = d.root.join("plan.toml");
+    std::fs::write(&plan, EVAL_PLAN).unwrap();
+    let plan = plan.to_str().unwrap();
+    let launch = ["launch", "--harness", "claude", "--unconfined"];
+    let run = ["--eval-plan", plan, "--eval-task", "a", "--eval-seed", "0"];
+    let arm = ["--arm", "full", "--as-of", "2026-11-01T10:00:00Z"];
+    let with = |more: &[&str]| fails(&d.root, &[&launch[..], more].concat());
+    // the argument parser refuses these before anything starts
+    let no_arm = with(&[&run[..], &arm[2..]].concat());
+    assert!(no_arm.contains("--arm <ARM>"), "{no_arm}");
+    let no_as_of = with(&[&run[..], &arm[..2]].concat());
+    assert!(no_as_of.contains("--as-of <AS_OF>"), "{no_as_of}");
+    let no_task = with(&[&run[..2], &run[4..], &arm[..]].concat());
+    assert!(no_task.contains("--eval-task <EVAL_TASK>"), "{no_task}");
+    let no_seed = with(&[&run[..4], &arm[..]].concat());
+    assert!(no_seed.contains("--eval-seed <EVAL_SEED>"), "{no_seed}");
+    for alone in [&run[2..4], &run[4..]] {
+        let no_plan = with(&[alone, &arm[..]].concat());
+        assert!(no_plan.contains("--eval-plan <EVAL_PLAN>"), "{no_plan}");
+    }
+    for flag in [
+        &["--prompt", "x"][..],
+        &["--prompt-file", "x"],
+        &["--empty-memory"],
+    ] {
+        let both = with(&[&run[..], &arm[..], flag].concat());
+        assert!(both.contains("cannot be used with"), "{both}");
+    }
+    // the plan decides the rest before the harness starts
+    let no_such = [
+        &run[..2],
+        &["--eval-task", "c", "--eval-seed", "0"],
+        &arm[..],
+    ]
+    .concat();
+    let refused = with(&no_such);
+    assert!(refused.contains("has no task c"), "{refused}");
+    let other_arm = [&run[..], &["--arm", "raw-only"], &arm[2..]].concat();
+    let refused = with(&other_arm);
+    assert!(
+        refused.contains("does not name the arm raw-only"),
+        "{refused}"
+    );
+    let late_seed = [&run[..4], &["--eval-seed", "2"], &arm[..]].concat();
+    let refused = with(&late_seed);
+    assert!(refused.contains("2 is not one"), "{refused}");
+}
+
+#[test]
+fn eval_arms_lists_the_five_arms_in_the_paper_s_order() {
+    let d = step_init();
+    let arms = json(&ok(&d.root, &["eval", "arms"], None));
+    let names: Vec<&str> = arms
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["arm"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        [
+            "no-memory",
+            "transcript-replay",
+            "t0-only",
+            "raw-only",
+            "full"
+        ]
+    );
+    assert_eq!(arms[0]["stands_for"], "the floor");
+    assert_eq!(arms[0]["settings"]["memory"], false);
+    assert_eq!(arms[1]["settings"]["transcripts"], true);
+    assert_eq!(arms[2]["settings"]["depth"], "t0");
+    assert_eq!(arms[3]["settings"]["max_tier"], "raw");
+    assert_eq!(arms[3]["settings"]["t0"], "digest");
+    assert_eq!(arms[4]["stands_for"], "the system as built");
+    assert_eq!(arms[4]["settings"]["t0"], "full");
+}
+
+#[test]
+fn launch_refuses_an_arm_over_an_empty_record_and_a_name_that_is_no_arm() {
+    let d = step_init();
+    let launch = ["launch", "--harness", "claude", "--unconfined"];
+    let both = [&launch[..], &["--arm", "full", "--empty-memory"][..]].concat();
+    let refused = fails(&d.root, &both);
+    assert!(refused.contains("--empty-memory"), "{refused}");
+    assert!(refused.contains("cannot be used with"), "{refused}");
+    let unknown = [&launch[..], &["--arm", "everything", "--prompt", "hi"][..]].concat();
+    let refused = fails(&d.root, &unknown);
+    assert!(refused.contains("is not an arm"), "{refused}");
+    let replay = [&launch[..], &["--arm", "transcript-replay"][..]].concat();
+    let refused = fails(&d.root, &replay);
+    assert!(refused.contains("in front of a prompt"), "{refused}");
+}
+
 #[test]
 fn serve_fills_the_position_a_launcher_names_before_it_serves() {
     let d = step_init();
@@ -1273,4 +1492,155 @@ fn serve_fills_the_position_a_launcher_names_before_it_serves() {
         refused.contains("no position pos-none is in force"),
         "{refused}"
     );
+}
+
+/// One line of a drift file: a run of one probe, answered three times with
+/// `input_tokens` input tokens.
+fn drift_run(at: &str, input_tokens: u64) -> String {
+    let sample = serde_json::json!({
+        "digest": "x", "len": 8, "input_tokens": input_tokens, "output_tokens": 3,
+        "latency_ms": 100, "model": "m", "system_fingerprint": "fp-1"
+    });
+    serde_json::json!({
+        "at": at, "destination": "llmao", "model": "m", "repeat": 3,
+        "probe_set": "probes/drift.toml",
+        "pinned": {
+            "amem_version": "0.1.0", "probe_set_digest": "abc",
+            "request": {"path": "v1/chat/completions", "temperature": 0.0, "max_tokens": {"a": 64}}
+        },
+        "probes": [{
+            "id": "a", "kind": "fingerprint", "prompt_digest": "p-a",
+            "samples": [sample.clone(), sample.clone(), sample]
+        }]
+    })
+    .to_string()
+}
+
+fn promote_call(id: &str) -> (&'static str, serde_json::Value) {
+    let why = "read it against the notes";
+    (
+        "promote",
+        serde_json::json!({"id": id, "to": "curated", "why": why}),
+    )
+}
+
+/// Three runs of `llmao/m` under the root: two that agree, and one whose input tokens
+/// changed. A check that files opens a drift window from the run before the one that
+/// fired; a check that does not file opens none.
+fn step_drift_opens_a_window(root: &Path) {
+    let runs = root.join("state/drift/llmao");
+    std::fs::create_dir_all(&runs).unwrap();
+    let lines = [
+        drift_run("2026-01-01T09:00:00Z", 20),
+        drift_run("2026-01-02T09:00:00Z", 20),
+        drift_run("2026-01-03T09:00:00Z", 21),
+    ];
+    std::fs::write(runs.join("m.jsonl"), lines.join("\n") + "\n").unwrap();
+    let check = ["drift", "check", "--provider", "llmao", "--model", "m"];
+    let list = ["drift", "window", "list"];
+    let seen = json(&ok(root, &check, None));
+    assert_eq!(seen["verdict"], "vendor drift", "{seen}");
+    assert_eq!(seen["window"], serde_json::Value::Null, "{seen}");
+    assert_eq!(json(&ok(root, &list, None)), serde_json::json!([]));
+
+    let filing = [&check[..], &["--file"][..]].concat();
+    let filed = json(&ok(root, &filing, None));
+    assert!(filed["filed"].is_string(), "{filed}");
+    let window = &filed["window"];
+    assert_eq!(window["from"], "2026-01-02T09:00:00Z", "{filed}");
+    assert_eq!(window["detectors"], serde_json::json!(["input_tokens"]));
+    assert_eq!(window["until"], serde_json::Value::Null);
+    // the same drift, found again: the same window
+    let again = json(&ok(root, &filing, None));
+    assert_eq!(again["window"], *window, "{again}");
+    assert_eq!(json(&ok(root, &list, None)).as_array().unwrap().len(), 1);
+}
+
+/// An agent writes in the open window. The memory server and the command line refuse
+/// to promote that entry, and a person's entry is promoted as before.
+fn step_window_refuses_promotion(d: &Demo) {
+    let body = "The import has five steps.\n";
+    let write = ("write", serde_json::json!({ "body": body }));
+    let wrote = serve(&d.root, "agent:codex", &[], &[], &[write]);
+    let id = wrote.result(0)["id"].as_str().unwrap().to_string();
+    let curator = serve(&d.root, "agent:curator", &[], &[], &[promote_call(&id)]);
+    let (allowed, why) = &curator.calls[0];
+    assert!(!allowed, "the promotion is refused: {why}");
+    assert!(why.contains("drift window of llmao/m"), "{why}");
+    let promote = ["promote", &id, "--to", "curated", "--why", "read"];
+    let refused = fails(&d.root, &promote);
+    assert!(refused.contains("drift window of llmao/m"), "{refused}");
+    let mine = ["promote", &d.decision, "--to", "curated", "--why", "read"];
+    assert_eq!(json(&ok(&d.root, &mine, None))["tier"], "curated");
+}
+
+/// The owner closes the window, and opens one by hand.
+fn step_window_by_hand(root: &Path) {
+    let close = ["drift", "window", "close", "--provider", "llmao"];
+    let close = [&close[..], &["--model", "m", "--why", "pinned"][..]].concat();
+    let closed = json(&ok(root, &close, None));
+    assert!(closed["until"].is_string(), "{closed}");
+    assert_eq!(closed["closed_why"], "pinned");
+    assert!(fails(root, &close).contains("no drift window is open"));
+
+    let open = ["drift", "window", "open", "--provider", "llmao", "--model"];
+    let bad = [
+        &open[..],
+        &["m-2", "--why", "by hand", "--from", "then"][..],
+    ]
+    .concat();
+    assert!(fails(root, &bad).contains("RFC 3339"));
+    let from = "2026-02-01T00:00:00Z";
+    let good = [&open[..], &["m-2", "--why", "by hand", "--from", from][..]].concat();
+    let opened = json(&ok(root, &good, None));
+    assert_eq!(opened["from"], from, "{opened}");
+    assert_eq!(opened["detectors"], serde_json::json!([]));
+}
+
+/// Drift that a check confirms and files opens a drift window. The command line and
+/// the memory server refuse to promote what an agent wrote in it. The owner closes it.
+#[test]
+fn a_drift_check_that_files_opens_a_window_that_freezes_promotion() {
+    let mut d = step_init();
+    step_write(&mut d);
+    step_drift_opens_a_window(&d.root);
+    step_window_refuses_promotion(&d);
+    step_window_by_hand(&d.root);
+}
+
+/// `amem reenact state` gives the replay state of a tape: complete while nothing moved,
+/// incomplete when the record moved. The session that asks takes the settings of the
+/// tape, so the settings of a tape under an arm are not named as moved.
+#[test]
+fn reenact_state_gives_the_replay_state_of_a_tape() {
+    let mut d = step_init();
+    step_write(&mut d);
+    let flags = ["--arm", "raw-only"];
+    let calls = [("t0", serde_json::json!({})), search_call()];
+    serve(&d.root, "agent:codex", &flags, &[], &calls);
+    let tapes = json(&ok(&d.root, &["reenact", "tapes"], None));
+    let tapes = tapes.as_array().unwrap();
+    assert_eq!(tapes.len(), 1, "{tapes:?}");
+    let session = tapes[0]["session"].as_str().unwrap().to_string();
+    assert_eq!(tapes[0]["settings"]["max_tier"], "raw", "{tapes:?}");
+    // two writes, each an offer and a version: the last version is event 4
+    assert_eq!(tapes[0]["manifest"]["log"]["dom-me"], 4, "{tapes:?}");
+
+    let state = json(&ok(&d.root, &["reenact", "state", &session], None));
+    assert_eq!(state["availability"], "complete", "{state}");
+    assert_eq!(state["moved"], serde_json::json!([]), "{state}");
+    assert_eq!(state["manifest"]["settings"]["max_tier"], "raw", "{state}");
+    assert_eq!(state["manifest"]["log"]["dom-me"], 4, "{state}");
+
+    // the record moves: after the read of the search, event 5, the offer and the version
+    ok(&d.root, &["write"], Some("The export has two steps.\n"));
+    let state = json(&ok(&d.root, &["reenact", "state", &session], None));
+    assert_eq!(state["availability"], "incomplete", "{state}");
+    let moved = serde_json::json!([{"what": "log dom-me", "then": "4", "now": "7"}]);
+    assert_eq!(state["moved"], moved, "{state}");
+    assert_eq!(
+        state["why"],
+        serde_json::json!(["The log dom-me moved: it was 4 and it is 7 now."])
+    );
+    assert!(fails(&d.root, &["reenact", "state", "sess-none"]).contains("no tape"));
 }

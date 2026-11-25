@@ -665,6 +665,9 @@ impl Memory {
         depth: Option<Depth>,
         budget: Budget,
     ) -> Result<Recall, Error> {
+        if !self.settings().retrieves() {
+            return self.recall_of_nothing(question, domain, depth);
+        }
         let Some(deputy) = self.deputy() else {
             return self.recall_owed(question, domain, depth, budget).await;
         };
@@ -740,6 +743,28 @@ impl Memory {
         };
         self.project_recall(&mut r).await;
         Ok(r)
+    }
+
+    /// The recall of a session whose settings leave retrieval out: an empty pack, with
+    /// no search, no deputy call, no line in the read log and no page in the
+    /// projection. A domain the session may not name is still refused.
+    fn recall_of_nothing(
+        &self,
+        question: &str,
+        domain: Option<&str>,
+        depth: Option<Depth>,
+    ) -> Result<Recall, Error> {
+        self.filter_for(domain)?;
+        let depth = depth.unwrap_or_else(|| self.default_depth());
+        Ok(Recall {
+            question: question.to_string(),
+            synthesis: Synthesis::Owed,
+            brief: None,
+            citations: Vec::new(),
+            pack: Pack::empty(&[question.to_string()], depth),
+            hops: 0,
+            projected: None,
+        })
     }
 
     /// The caller-executed tier: the pack at the depth asked for, or the session's
