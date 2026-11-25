@@ -605,7 +605,8 @@ curated in two ways:
 - A write that supersedes an entry lands curated when the session holds a curator's task
   or the auditor's task.
 - Anyone except the entry's author can mark the entry curated, with the `promote` memory
-  tool or with `amem promote <id> --to curated --why "<what you checked>"`.
+  tool or with `amem promote <id> --to curated --why "<what you checked>"`. An entry with
+  tap reach is the exception: see "Raw reach" below.
 
 Verified is the review gate. Nobody sets it directly. It has two steps:
 
@@ -656,6 +657,124 @@ paper's defence against an exploit that becomes practice across the fleet. An ag
 cannot promote its own finding, whatever it finds. The gate for the verified trust tier
 refuses an agent's rewrite of a verified entry.
 
+## Raw reach: who reads a raw entry
+
+A raw entry is not checked. The raw reach says who reads an entry while it is raw. It
+does not apply to an entry that is curated or verified.
+
+Each entry has two optional fields in its frontmatter:
+
+- `reach`: `chain`, `fleet` or `tap`. An entry without the field has fleet reach.
+- `task`: the held task of the session that wrote the entry.
+
+The memory server sets both fields at the write:
+
+| The write | `reach` | Who reads the entry while it is raw |
+| --------- | ------- | ----------------------------------- |
+| A handoff or a decision, from a session that holds a task | `chain` | A session whose task chain has the task; each session with raw reach `fleet` or `all` |
+| Any other entry | `fleet` | Each session that reads the domain |
+| Any entry, after the session read outside content | `tap` | A session whose task chain has the task; each session with raw reach `all` |
+
+Outside content is content from an author outside the fleet. A session has read outside
+content after one of these:
+
+- A tool gave it an answer or a failure: `fetch`, `web_search` or `gofannon`.
+- It read a raw entry with tap reach.
+- It read a task that a tap filed, or a task that a session filed after that session
+  read outside content. A launcher that puts such a task in the prompt of a harness
+  counts as a read.
+
+The session keeps this record until it ends. Each event that the session appends to the
+event log after the read has `"outside": true`. A tool answer also gets a `read` event
+that names `source:<id>`. A task that such a session files is outside content too. So
+are the tasks of a fan-out, a continuation and a retry of such a task.
+
+The held task is the task that a session works. The launcher sets it: `amem work` sets
+it for each task that it runs, and `amem serve` reads it from `MEMORY_TASK`. The task chain is one step around the held task:
+
+- the held task
+- the task that it was filed from
+- the tasks that were filed from it
+- the tasks that it depends on.
+
+A session reads each raw entry that names a task of its task chain, whatever the reach
+of the entry is. The memory server computes the task chain from the ledger when the
+session holds the task. Thus a task that was filed after a note was written still reads
+the note. The answers of `write`, `search` and `get` give `reach` when it is not `fleet`.
+The answers of `write` and `get` give `task` when the entry names one.
+
+The read filter of a session has a raw reach: `chain`, `fleet` or `all`. The default
+comes from the class of the principal:
+
+- An agent has `fleet`: it reads the raw entries of its task chain, and each raw entry
+  whose reach is not `tap`.
+- The owner, each other person, the system and a tap have `all`. A tap must read the
+  handoff that it posts back.
+- A session whose held task is a task of a curator or of the auditor has `all`.
+
+A root policy can set the key `raw_reach` in its `read_filter`, to `chain`, `fleet` or
+`all`. A `read_filter` without the key gives the default of the class, so a root policy
+from before this change continues to work. The lowest trust tier of the read filter is a
+hard limit: a principal that reads only curated entries reads no raw entry, and that
+includes the raw entries of its own task chain. The logged `read` decision ends with
+`raw entries: <chain|fleet|all>`.
+
+Only a session with raw reach `all` can make an entry with tap reach curated: a person,
+or a session on a task of a curator or of the auditor. A member of the task chain reads
+the entry and cannot curate it. After the entry is curated, the fleet reads it.
+
+A write with `supersedes` replaces an entry only when the read filter of the session
+admits that entry. If the read filter does not admit it, the write gets the answer for an
+entry that does not exist. A raw write with tap reach replaces only a raw entry with tap
+reach that names the same task. Each reader of the old entry then reads the new entry.
+The memory server refuses each other raw write with tap reach that has `supersedes`. The
+session then writes the entry without `supersedes` and cites the old entry. A curator or
+a person replaces the old entry. The record of a session blocks no other action.
+
+The summaries page of the projection is `README.md` in the directory of a domain. It has
+no line for a raw entry with tap reach, because a harness reads that page without a
+`get`. The file of the entry is in the directory. A read of that file is a `get`, and the
+`get` records that the session read outside content.
+
+An import of another owner's bundle lands each entry raw with tap reach and no task. An
+import of the same owner's bundle keeps the fields.
+
+`amem log outside [--domain <domain>]` and the `outside_readers` memory tool give the
+sessions that the event log of a domain shows as readers of outside content. They are
+for the owner and the security role. Each session comes with these fields:
+
+- `by`: its author
+- `since`: the sequence number of its first event after the read
+- `writes`: the entries that it offered after the read
+- `sends`: the send events that it made after the read.
+
+An auditor checks those sends first.
+
+Limits:
+
+- By default, an agent also reads a raw entry with chain reach that names a task outside
+  its task chain. Set `raw_reach` to `chain` in a root policy to stop this.
+- The policy sets the raw reach of a principal for all its domains, and not for one
+  domain.
+- A session that only claims a task with the `claim` memory tool has no task chain.
+- A task that another process files from the held task joins the task chain only when
+  the session holds the task again.
+- A read of a task from outside adds no event to the log. The record is on the next
+  event of the session.
+- The session that admits a task from a tap reads the task. The entries that it writes
+  after that have tap reach.
+- A turn of the transcript of a session that read outside content is served by citation.
+  The reader of the turn gets no record.
+- A session of the web launcher keeps the record for one request.
+- A re-run from a tape does not restore the record.
+- A session that read outside content can name the event that its task waits on, and the
+  id of an external action. Each is one token. The task does not become outside content.
+- The memory server does not keep a refused write with tap reach and `supersedes` as a
+  proposal for a curator. The session writes it again without `supersedes`.
+- A person who read outside content cannot replace an entry of the fleet in the same
+  session. The person replaces it in a new session.
+- `amem` does not check that the ledger names the session as the holder of its held
+  task.
 ## Approvals: `amem approve`, `amem approvals` and `amem declassify`
 
 Some actions cannot be taken back. Such an action runs only under an approval. An
@@ -746,9 +865,12 @@ the type, the title, the summary and the text of the entry. It cites the version
 was made from, as `<id>@<digest>`. It does not cite what the entry cites, because those
 citations can be above the label of the copy. Its `origin` names the label, the version
 and the guard:
-`declassify:<label>:<id>@<digest>:<guard>`. The entry itself does not change. The same
-call again gives the id of the copy that is there, and writes nothing. Each version and
-each label gets its own copy.
+`declassify:<label>:<id>@<digest>:<guard>`. The copy of a raw entry keeps the `reach` and
+the `task` of the entry, so the same sessions read the copy while it is raw. The copy of
+a curated or verified entry has fleet reach and names no task. A request for a copy of a
+raw entry with tap reach is a read of outside content. The entry itself does not change.
+The same call again gives the id of the copy that is there, and writes nothing. Each
+version and each label gets its own copy.
 
 `amem` makes the id of the copy from its `origin`, and the record takes an entry with
 that id only one time. Thus two calls at the same time land one copy, and two requesters

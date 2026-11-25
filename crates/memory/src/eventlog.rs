@@ -46,6 +46,15 @@ pub enum LogOp {
         #[arg(long)]
         domain: Option<String>,
     },
+    /// The sessions that read content from authors outside the fleet, from the domain's
+    /// log: each with its author, its first event after that read, the entries it
+    /// wrote after it and the sends it made after it. An auditor checks those sends
+    /// first. For the owner and the security role.
+    Outside {
+        /// The domain; the only granted one when omitted.
+        #[arg(long)]
+        domain: Option<String>,
+    },
 }
 
 /// What `amem withheld` does.
@@ -70,7 +79,8 @@ pub enum WithheldOp {
 ///
 /// # Errors
 ///
-/// An author outside the security role for the log, the feed and the freshness, anyone
+/// An author outside the security role for the log, the feed, the freshness and the
+/// readers of outside content, anyone
 /// but the owner for the materializer, an ungranted domain, or a store, index or ledger
 /// error.
 pub async fn cmd(m: &Memory, op: LogOp) -> Fallible {
@@ -94,6 +104,7 @@ pub async fn cmd(m: &Memory, op: LogOp) -> Fallible {
             }
             crate::json(&done)
         }
+        LogOp::Outside { domain } => crate::json(&m.outside_readers(domain.as_deref()).await?),
     }
 }
 

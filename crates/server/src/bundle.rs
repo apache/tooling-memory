@@ -562,7 +562,11 @@ pub async fn import(
             entry.front.id = dm_core::id::new_entry_id(into_domain);
         }
         if !same_owner {
+            // what another owner wrote is content from authors outside the fleet, and
+            // the task that it names is a task of that owner's ledger
             entry.front.trust_tier = TrustTier::Raw;
+            entry.front.reach = dm_core::Reach::Tap;
+            entry.front.task = None;
         }
         entry.front.classification = entry.front.classification.max(default_classification);
         // through the domain's log, as every write of an entry goes
@@ -616,6 +620,7 @@ mod tests {
             summary: "Held.".into(),
             score: 0.0,
             review_due: false,
+            reach: dm_core::Reach::Fleet,
         };
         let dest = tempfile::tempdir().unwrap();
         let ex = export(
@@ -659,6 +664,7 @@ mod tests {
             summary: "Held.".into(),
             score: 0.0,
             review_due: false,
+            reach: dm_core::Reach::Fleet,
         };
         let record = |id: &str| PromotionRecord {
             spec: dm_ledger::PromotionSpec {

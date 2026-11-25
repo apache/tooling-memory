@@ -769,7 +769,16 @@ impl Memory {
     ///
     /// The event could not be appended.
     fn read_position(&self, position: &Position) -> Result<(), Error> {
-        self.observe_entry(&position.domain, &position.entry, position.classification)?;
+        // the entry is not content from outside the fleet: it is verified, or it is a
+        // retiring version that replaced a verified one, and a raw write with tap
+        // reach replaces no such entry
+        let outside = false;
+        self.observe_entry(
+            &position.domain,
+            &position.entry,
+            position.classification,
+            outside,
+        )?;
         Ok(())
     }
 

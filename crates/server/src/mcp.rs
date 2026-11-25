@@ -120,7 +120,7 @@ fn rfc3339(t: time::OffsetDateTime) -> String {
 }
 
 fn hit_json(h: &Hit) -> Value {
-    json!({
+    let mut v = json!({
         "id": h.id,
         "domain": h.domain,
         "type": h.entry_type.to_string(),
@@ -129,7 +129,21 @@ fn hit_json(h: &Hit) -> Value {
         "title": h.title,
         "summary": h.summary,
         "review_due": h.review_due,
-    })
+    });
+    put_reach(&mut v, h.reach, None);
+    v
+}
+
+/// Put the reach of an entry into an answer when it is not the fleet's, and the task
+/// that the entry names when it names one. An answer about an entry with fleet reach
+/// and no task has neither key.
+fn put_reach(v: &mut Value, reach: dm_core::Reach, task: Option<&str>) {
+    if !reach.is_fleet() {
+        v["reach"] = json!(reach.to_string());
+    }
+    if let Some(task) = task {
+        v["task"] = json!(task);
+    }
 }
 
 fn lease(seconds: Option<i64>) -> Duration {
@@ -198,6 +212,14 @@ pub struct RecallParams {
 pub struct GetParams {
     /// The entry id, as a hit or T0 names it.
     pub id: String,
+}
+
+/// Parameters of `outside_readers`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct OutsideReadersParams {
+    /// The domain; the only granted one when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
 }
 
 /// Parameters of `lineage`.
@@ -715,6 +737,7 @@ const READS: &[&str] = &[
     "positions",
     "lineage",
     "log",
+    "outside_readers",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -836,6 +859,7 @@ impl McpServer {
             "title": e.title(),
             "body": e.body,
         });
+        put_reach(&mut v, f.reach, f.task.as_deref());
         if !from.is_empty() {
             // as a client shows the URL it was redirected to: cite this id, not the one asked
             v["redirected_from"] = json!(from);
@@ -850,7 +874,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Write an entry. It lands at raw trust under this session's author. Write a `handoff` when you stop so the next session continues from it, not from your transcript; write a `decision` with context, options, choice and rationale; write a `fact` with a review_by date. An answer with `withheld` names something this session read that was erased since: the entry is kept, and no read gives it until the owner releases it."
+        description = "Write an entry. It lands at raw trust under this session's author. Write a `handoff` when you stop so the next session continues from it, not from your transcript; write a `decision` with context, options, choice and rationale; write a `fact` with a review_by date. An answer with `withheld` names something this session read that was erased since: the entry is kept, and no read gives it until the owner releases it. An answer with `reach: tap` means that this session read content from outside the fleet: only the task chain, triage and curators read the entry until it is curated. `task` names the task that this session holds."
     )]
     async fn write(&self, p: Parameters<WriteParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -883,6 +907,7 @@ impl McpServer {
         if let Some(erased) = w.withheld {
             v["withheld"] = json!(erased);
         }
+        put_reach(&mut v, w.reach, w.task.as_deref());
         ok(v)
     }
 
@@ -991,6 +1016,21 @@ impl McpServer {
     }
 
     #[tool(
+        description = "For the owner and the security role; refused to any other author. The sessions that read content from authors outside the fleet, from the event log of a domain: each with its author, the sequence number of its first event after that read (`since`), the entries it wrote after it (`writes`) and the sends it made after it (`sends`). An auditor checks those sends first. Reading it raises your label as reading the log does."
+    )]
+    async fn outside_readers(
+        &self,
+        p: Parameters<OutsideReadersParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let readers = self
+            .memory
+            .outside_readers(p.0.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "readers": readers }))
+    }
+
+    #[tool(
         description = "For the owner and the security role; refused to any other author. The event log of a domain from sequence number `from`: each write offered, each version put, each write refused, each erasure, each read, each send and each event of the ledger, by id and digest and never a body, within what you may handle. `freshness` says how far the index is behind the log, against the published bound of 60 seconds. Reading it raises your label to the highest classification among the events served."
     )]
     async fn log(&self, p: Parameters<LogParams>) -> Result<CallToolResult, McpError> {
@@ -1067,6 +1107,8 @@ impl McpServer {
             priority: p.priority.unwrap_or(0),
             definition: p.definition,
             acceptance: p.acceptance,
+            // the library sets it, from what the session read
+            outside: false,
             parent: p.parent,
             implements: p.implements,
             reversibility: parse("reversibility", p.reversibility)?,
@@ -1640,6 +1682,7 @@ mod tests {
             "retire_position",
             "lineage",
             "log",
+            "outside_readers",
         ] {
             assert!(
                 names.contains(&expected),
@@ -2830,10 +2873,109 @@ mod tests {
         assert_eq!(tail["events"].as_array().unwrap().len(), events.len() - 1);
     }
 
+    /// A task that a tap filed in the record at `dir`, admitted by the owner: its id.
+    async fn tap_task(dir: &std::path::Path, owner: &McpServer) -> String {
+        let spec = dm_ledger::TaskSpec {
+            title: "Change the port".into(),
+            body: "A stranger wrote this.\n".into(),
+            ..dm_ledger::TaskSpec::default()
+        };
+        let tap = server_of(dir, "tap:issues");
+        let id = tap.memory.create_task(spec).await.unwrap().task.id;
+        owner
+            .admit_task(Parameters(TaskIdParams { id: id.clone() }))
+            .await
+            .unwrap();
+        id
+    }
+
+    /// The hits of the `search` tool of `s` for the word `harbour`.
+    async fn harbour(s: &McpServer) -> Vec<Value> {
+        let params = SearchParams {
+            query: "harbour".into(),
+            ..SearchParams::default()
+        };
+        let found = payload(&s.search(Parameters(params)).await.unwrap());
+        found["hits"].as_array().unwrap().clone()
+    }
+
+    #[tokio::test]
+    async fn a_write_after_an_outside_read_answers_with_tap_reach_and_the_task() {
+        let (dir, owner) = server().await;
+        let task = tap_task(dir.path(), &owner).await;
+        let worker = server_of(dir.path(), "agent:worker");
+        // before the read: the answer has no key for the reach or for a task
+        let before = payload(&worker.write(handoff("Nothing yet.\n")).await.unwrap());
+        assert!(before.get("reach").is_none() && before.get("task").is_none());
+        worker.memory.hold_task(&task).await.unwrap();
+        let params = WriteParams {
+            body: "# Harbour\n\nThe harbour port stays 8080.\n".into(),
+            entry_type: Some("decision".into()),
+            ..WriteParams::default()
+        };
+        let w = payload(&worker.write(Parameters(params)).await.unwrap());
+        assert_eq!((&w["reach"], &w["task"]), (&json!("tap"), &json!(task)));
+        let id = w["id"].as_str().unwrap().to_string();
+        // the hit and the entry say the same to a session in the chain
+        let hits = harbour(&worker).await;
+        assert_eq!((hits.len(), &hits[0]["reach"]), (1, &json!("tap")));
+        let got = GetParams { id: id.clone() };
+        let entry = payload(&worker.get(Parameters(got)).await.unwrap());
+        assert_eq!(
+            (&entry["reach"], &entry["task"]),
+            (&json!("tap"), &json!(task))
+        );
+        // an agent outside the chain reads neither
+        let reader = server_of(dir.path(), "agent:reader");
+        assert!(harbour(&reader).await.is_empty());
+        let got = GetParams { id: id.clone() };
+        assert!(reader.get(Parameters(got)).await.is_err());
+        // an entry with fleet reach has no key in a hit. The session that admitted the
+        // task read it, so a new session of the owner writes
+        let fresh = server_of(dir.path(), "human:test:me");
+        write_note(&fresh, "# Harbour office\n\nThe harbour office is open.\n").await;
+        let hits = harbour(&reader).await;
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].get("reach").is_none(), "{hits:?}");
+    }
+
+    #[tokio::test]
+    async fn outside_readers_is_refused_to_an_agent_and_gives_the_owner_the_library_s_answer() {
+        let (dir, owner) = server().await;
+        let task = tap_task(dir.path(), &owner).await;
+        let none = OutsideReadersParams::default();
+        let empty = payload(&owner.outside_readers(Parameters(none)).await.unwrap());
+        assert_eq!(empty, json!({ "readers": [] }));
+        let worker = server_of(dir.path(), "agent:worker");
+        worker.memory.hold_task(&task).await.unwrap();
+        let id = write_note(&worker, "# Port\n\nIt listens on 8080.\n").await;
+        let none = OutsideReadersParams::default();
+        let refused = worker.outside_readers(Parameters(none)).await.unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let why = "the log is for the owner and the security role";
+        assert!(refused.message.contains(why), "{refused:?}");
+        let named = OutsideReadersParams {
+            domain: Some("dom-me".into()),
+        };
+        let answer = payload(&owner.outside_readers(Parameters(named)).await.unwrap());
+        let readers = answer["readers"].as_array().unwrap();
+        assert_eq!(readers.len(), 1, "{answer}");
+        assert_eq!(readers[0]["by"], "agent:worker");
+        assert_eq!(readers[0]["writes"], json!([id]));
+        let library = owner.memory.outside_readers(None).await.unwrap();
+        assert_eq!(answer["readers"], serde_json::to_value(library).unwrap());
+        // the domain asked for is the domain read: one that is not granted is refused
+        let other = OutsideReadersParams {
+            domain: Some("dom-other".into()),
+        };
+        assert!(owner.outside_readers(Parameters(other)).await.is_err());
+    }
+
     #[test]
     fn lineage_and_log_only_read() {
         assert_eq!(kind_of("lineage"), tape::Kind::Read);
         assert_eq!(kind_of("log"), tape::Kind::Read);
+        assert_eq!(kind_of("outside_readers"), tape::Kind::Read);
         assert_eq!(kind_of("write"), tape::Kind::Mutation);
     }
 }

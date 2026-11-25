@@ -1392,12 +1392,17 @@ fn json<T: serde::Serialize>(v: &T) -> Fallible {
 fn hits_json(hits: &[dm_index::Hit]) -> Vec<serde_json::Value> {
     hits.iter()
         .map(|h| {
-            serde_json::json!({
+            let mut v = serde_json::json!({
                 "id": h.id, "domain": h.domain, "type": h.entry_type.to_string(),
                 "trust_tier": h.trust_tier.to_string(),
                 "classification": h.classification.to_string(),
                 "title": h.title, "summary": h.summary,
-            })
+            });
+            // an entry with fleet reach has no key
+            if !h.reach.is_fleet() {
+                v["reach"] = serde_json::json!(h.reach.to_string());
+            }
+            v
         })
         .collect()
 }
@@ -1592,7 +1597,7 @@ async fn serve_stdio_cmd(
     // a harness working a task has it in MEMORY_TASK, as the launcher sets it;
     // what this session files or writes is judged against that task
     if let Some(t) = std::env::var("MEMORY_TASK").ok().filter(|t| !t.is_empty()) {
-        m.set_held_task(&t);
+        m.hold_task(&t).await?;
     }
     m.set_tools(taps::TapTools::for_root(root));
     mcp::serve_stdio(Arc::new(m)).await?;
@@ -3990,7 +3995,7 @@ impl Session {
         let mut env = self.p.harness_env.clone();
         if let Some(t) = task {
             env.push(("MEMORY_TASK".to_string(), t.to_string()));
-            self.p.memory.set_held_task(t);
+            self.p.memory.hold_task(t).await?;
         }
         let mut full: Vec<String> = [self.program.as_slice(), args].concat();
         if let Some(m) = &self.model {
@@ -5196,6 +5201,8 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
                     priority,
                     definition,
                     acceptance,
+                    // the library sets it, from what the session read
+                    outside: false,
                     parent,
                     scores,
                     implements,

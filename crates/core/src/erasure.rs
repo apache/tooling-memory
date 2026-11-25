@@ -6,7 +6,7 @@
 //! what could not be reached. The last two are this file, kept beside the record as
 //! `.erasures/<id>.yaml` in the entry's domain.
 
-use crate::{Entry, Status, TrustTier};
+use crate::{Entry, Reach, Status, TrustTier};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
@@ -59,7 +59,9 @@ impl std::fmt::Display for Reason {
 /// summary, the citations, the origin, the confidence, the review date, the policy
 /// context and the body go, for every reason class: a title says what the body said, a
 /// citation or an origin can be a link that carries a credential, and an author is
-/// about a person. The reason stays on the receipt.
+/// about a person. The reach becomes the fleet's and the held task goes: a stub has
+/// nothing to keep from a reader, and its domain, its label and its status still decide
+/// who reads it. The reason stays on the receipt.
 #[must_use]
 pub fn stub(entry: &Entry, _reason: Reason) -> Entry {
     let mut front = entry.front.clone();
@@ -73,6 +75,8 @@ pub fn stub(entry: &Entry, _reason: Reason) -> Entry {
     front.confidence = None;
     front.review_by = None;
     front.policy_context.clear();
+    front.reach = Reach::Fleet;
+    front.task = None;
     Entry {
         front,
         body: String::new(),
@@ -262,7 +266,7 @@ mod tests {
     }
 
     /// An entry with every field set: what a stub must not repeat is each findable.
-    const FULL: &str = "---\nid: mem-me-1\ntype: decision\ndomain: dom-me\nauthor: human:test:alice\ncreated: 2026-10-01T10:00:00Z\ncites:\n- https://example.test/x?token=s3cret\n- mem-me-0\nsession: sess-abc@7\nconfidence: high\ntrust_tier: verified\nreview_by: 2027-04-01\nsupersedes: mem-me-0\npolicy_context:\n- pol-L2-031\nclassification: restricted\norigin: github:example/repo#12\nsummary: the secret summary\ntitle: Alice's diagnosis\n---\nThe secret body.\n";
+    const FULL: &str = "---\nid: mem-me-1\ntype: decision\ndomain: dom-me\nauthor: human:test:alice\ncreated: 2026-10-01T10:00:00Z\ncites:\n- https://example.test/x?token=s3cret\n- mem-me-0\nsession: sess-abc@7\nreach: tap\ntask: task-me-9\nconfidence: high\ntrust_tier: verified\nreview_by: 2027-04-01\nsupersedes: mem-me-0\npolicy_context:\n- pol-L2-031\nclassification: restricted\norigin: github:example/repo#12\nsummary: the secret summary\ntitle: Alice's diagnosis\n---\nThe secret body.\n";
 
     /// What a stub holds of `e`: the id, the marker and the label, and the audit
     /// metadata, which repeats nothing of the entry.
@@ -289,11 +293,17 @@ mod tests {
         assert_eq!(s.front.confidence, None, "{reason}");
         assert_eq!(s.front.review_by, None, "{reason}");
         assert!(s.front.policy_context.is_empty(), "{reason}");
+        assert_eq!(s.front.reach, Reach::Fleet, "{reason}: a reach");
+        assert_eq!(s.front.task, None, "{reason}: a held task");
     }
 
     #[test]
     fn a_stub_holds_the_id_the_marker_and_the_label_and_nothing_else_of_the_entry() {
         let e = Entry::parse(FULL).unwrap();
+        assert_eq!(
+            (e.front.reach, e.front.task.as_deref()),
+            (Reach::Tap, Some("task-me-9"))
+        );
         for reason in [
             Reason::Requested,
             Reason::Mistaken,
@@ -306,6 +316,7 @@ mod tests {
             let rendered = s.render();
             for gone in [
                 "secret", "Alice", "alice", "example", "token", "github", "pol-L2", "2027",
+                "reach", "task",
             ] {
                 assert!(!rendered.contains(gone), "{reason}: {gone} in {rendered}");
             }

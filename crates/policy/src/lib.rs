@@ -486,6 +486,7 @@ impl Grants {
         Session {
             handling: self.handling,
             label: Label::Public,
+            outside: false,
         }
     }
 }
@@ -497,6 +498,10 @@ pub struct Session {
     pub handling: Label,
     /// The highest classification it has read. Rises, never falls.
     pub label: Label,
+    /// Whether it has read content from authors outside the fleet: an answer of a tool,
+    /// a raw entry with tap reach, or a task that came from outside. Once true, it
+    /// stays true.
+    pub outside: bool,
 }
 
 impl Session {
@@ -511,6 +516,12 @@ impl Session {
         }
         self.label = self.label.max(classification);
         true
+    }
+
+    /// Record that the session read content from authors outside the fleet. Nothing
+    /// sets the record back.
+    pub fn read_outside(&mut self) {
+        self.outside = true;
     }
 
     /// Whether this session may send to a destination with the given ceiling. `None`

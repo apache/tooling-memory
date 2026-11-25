@@ -384,7 +384,12 @@ impl Memory {
             return Err(unreadable(name));
         };
         // binding reads the entry that holds the definition
-        self.observe_entry(&entry.front.domain, &entry.front.id, def.classification)?;
+        self.observe_entry(
+            &entry.front.domain,
+            &entry.front.id,
+            def.classification,
+            crate::reach::outside_content(&entry),
+        )?;
         spec.definition = Some(def.reference());
         spec.classification = spec.classification.max(def.classification);
         if spec.acceptance.is_empty() {

@@ -13,7 +13,7 @@
 //! This backend is SQLite with FTS5, one file, nothing to operate. A second backend
 //! (Solr, Tantivy) would implement the same methods; the surface is what matters.
 
-use dm_core::{Entry, EntryType, Label, ReadFilter, Status, TrustTier};
+use dm_core::{Entry, EntryType, Label, RawReach, Reach, ReadFilter, Status, TrustTier};
 use rusqlite::{params, params_from_iter, Connection, OptionalExtension, Row, TransactionBehavior};
 use std::path::Path;
 use time::{format_description::well_known::Rfc3339, Date, OffsetDateTime};
@@ -62,6 +62,8 @@ pub struct Hit {
     /// Whether the entry's `review_by` has passed: the decay clock the paper gives facts,
     /// shown with the hit so a reader sees it before leaning on it.
     pub review_due: bool,
+    /// Who reads the entry while it is raw.
+    pub reach: Reach,
 }
 
 /// An entry's indexed metadata, without its body.
@@ -108,7 +110,9 @@ CREATE TABLE IF NOT EXISTS entries (
     origin         TEXT,
     title          TEXT NOT NULL,
     summary        TEXT NOT NULL,
-    digest         TEXT NOT NULL
+    digest         TEXT NOT NULL,
+    reach          TEXT,
+    task           TEXT
 );
 CREATE INDEX IF NOT EXISTS entries_domain ON entries (domain);
 CREATE INDEX IF NOT EXISTS entries_review ON entries (review_by);
@@ -146,8 +150,33 @@ fn sort_key(at: OffsetDateTime) -> (i64, i64) {
     (at.unix_timestamp(), i64::from(at.nanosecond()))
 }
 
-const HIT_COLUMNS: &str =
-    "e.id, e.domain, e.entry_type, e.tier_rank, e.label_rank, e.title, e.summary, e.review_by";
+/// The columns of a hit. [`hit_from_row`] reads them by position, and a query that
+/// selects more puts its own after them, from [`HIT_WIDTH`] on.
+const HIT_COLUMNS: &str = "e.id, e.domain, e.entry_type, e.tier_rank, e.label_rank, e.title, \
+                           e.summary, e.review_by, e.reach";
+
+/// How many columns [`HIT_COLUMNS`] names.
+const HIT_WIDTH: usize = 9;
+
+/// The reach as the `reach` column holds it: NULL for the fleet's, so a row written
+/// without the column, by a binary from before or in a file from before, is the fleet's.
+fn reach_to_text(reach: Reach) -> Option<&'static str> {
+    match reach {
+        Reach::Fleet => None,
+        Reach::Chain => Some("chain"),
+        Reach::Tap => Some("tap"),
+    }
+}
+
+fn reach_from_text(id: &str, s: Option<String>) -> Result<Reach, Error> {
+    match s {
+        None => Ok(Reach::Fleet),
+        Some(s) => s.parse().map_err(|_| Error::BadRow {
+            id: id.to_string(),
+            what: format!("reach {s:?}"),
+        }),
+    }
+}
 
 fn tier_from_rank(id: &str, rank: i64) -> Result<TrustTier, Error> {
     match rank {
@@ -212,6 +241,7 @@ fn hit_from_row(row: &Row<'_>, score: f64) -> Result<Hit, Error> {
         .and_then(|d| Date::parse(d, &time::format_description::well_known::Iso8601::DATE).ok())
         .is_some_and(|d| d <= today);
     Ok(Hit {
+        reach: reach_from_text(&id, row.get(8)?)?,
         trust_tier: tier_from_rank(&id, row.get(3)?)?,
         classification: label_from_rank(&id, row.get(4)?)?,
         id,
@@ -244,7 +274,8 @@ fn fts_query(text: &str, any_word: bool) -> Option<String> {
 }
 
 /// The WHERE fragment and parameters a filter compiles to. Positional parameters start at
-/// `first`, so the caller can put its own before them.
+/// `first`, so the caller can put its own before them. The answer for a row is that of
+/// [`ReadFilter::admits_entry`] for the entry; a test holds the two together.
 fn compile_filter(f: &ReadFilter, first: usize) -> (String, Vec<rusqlite::types::Value>) {
     let mut sql = format!(
         " AND e.label_rank <= ?{} AND e.tier_rank >= ?{}",
@@ -263,7 +294,33 @@ fn compile_filter(f: &ReadFilter, first: usize) -> (String, Vec<rusqlite::types:
         sql.push_str(&format!(" AND e.domain IN ({})", marks.join(", ")));
         values.extend(f.domains.iter().map(|d| d.clone().into()));
     }
+    compile_raw_reach(f, first + values.len(), &mut sql, &mut values);
     (sql, values)
+}
+
+/// The part of the filter that only a raw row must pass: its reach, or a task of the
+/// session's chain. Positional parameters start at `next`. A NULL reach is the fleet's
+/// and a NULL task is in no chain.
+fn compile_raw_reach(
+    f: &ReadFilter,
+    next: usize,
+    sql: &mut String,
+    values: &mut Vec<rusqlite::types::Value>,
+) {
+    let reach = match f.raw_reach {
+        RawReach::All => return,
+        RawReach::Fleet => " OR e.reach IS NOT 'tap'",
+        RawReach::Chain => "",
+    };
+    let mut chain = String::new();
+    if !f.chain.is_empty() {
+        let marks: Vec<String> = (0..f.chain.len())
+            .map(|i| format!("?{}", next + i))
+            .collect();
+        chain = format!(" OR e.task IN ({})", marks.join(", "));
+        values.extend(f.chain.iter().map(|t| t.clone().into()));
+    }
+    sql.push_str(&format!(" AND (e.tier_rank > 0{reach}{chain})"));
 }
 
 /// The longest chain of replacements [`Index::replaced_by`] walks, against a cycle.
@@ -313,8 +370,44 @@ impl Index {
         )?;
         conn.execute_batch(SCHEMA)?;
         let mut ix = Index { conn };
+        ix.reach_columns()?;
         ix.sort_keys()?;
         Ok(ix)
+    }
+
+    /// Add the `reach` and `task` columns to an index made before they existed. The
+    /// rows stay as they are: a NULL reach is the fleet's, which is what each of them
+    /// had. Looks first without a lock, so an open with nothing to do writes nothing;
+    /// the work holds the write lock from its first read, so two processes opening at
+    /// once add each column once.
+    fn reach_columns(&mut self) -> Result<(), Error> {
+        if Index::reach_columns_missing(&self.conn)?.is_empty() {
+            return Ok(());
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        for column in Index::reach_columns_missing(&tx)? {
+            tx.execute_batch(&format!("ALTER TABLE entries ADD COLUMN {column} TEXT;"))?;
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Which of `reach` and `task` the table `entries` does not have.
+    fn reach_columns_missing(conn: &Connection) -> Result<Vec<&'static str>, Error> {
+        let mut missing = Vec::new();
+        for column in ["reach", "task"] {
+            let has: i64 = conn.query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('entries') WHERE name = ?1",
+                params![column],
+                |r| r.get(0),
+            )?;
+            if has == 0 {
+                missing.push(column);
+            }
+        }
+        Ok(missing)
     }
 
     /// Give every row its sort key: add the columns to an index made before they existed,
@@ -415,8 +508,10 @@ impl Index {
         tx.execute(
             "INSERT OR REPLACE INTO entries
              (id, domain, entry_type, author, created, review_by, tier_rank, label_rank,
-              status, supersedes, origin, title, summary, digest, created_unix, created_nanos)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              status, supersedes, origin, title, summary, digest, created_unix, created_nanos,
+              reach, task)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                     ?17, ?18)",
             params![
                 f.id,
                 f.domain,
@@ -434,6 +529,8 @@ impl Index {
                 dm_core::digest(&entry.render()),
                 created_unix,
                 created_nanos,
+                reach_to_text(f.reach),
+                f.task,
             ],
         )?;
         tx.execute("DELETE FROM entries_fts WHERE id = ?1", params![f.id])?;
@@ -589,7 +686,7 @@ impl Index {
         values.insert(0, q.to_string().into());
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map(params_from_iter(values), |row| {
-            let score: f64 = row.get(8)?;
+            let score: f64 = row.get(HIT_WIDTH)?;
             Ok(hit_from_row(row, score))
         })?;
         rows.map(|r| r?).collect()
@@ -733,20 +830,20 @@ impl Index {
         let mut stmt = self.conn.prepare(&sql)?;
         let row = stmt
             .query_row(params_from_iter(values), |row| {
-                // the hit's own columns come first, review_by among them now
+                // the hit's own columns come first, review_by among them
                 let hit = hit_from_row(row, 0.0);
-                let created: String = row.get(9)?;
-                let review_by: Option<String> = row.get(10)?;
-                let status: Option<String> = row.get(11)?;
+                let created: String = row.get(HIT_WIDTH + 1)?;
+                let review_by: Option<String> = row.get(HIT_WIDTH + 2)?;
+                let status: Option<String> = row.get(HIT_WIDTH + 3)?;
                 Ok((
                     hit,
-                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(HIT_WIDTH)?,
                     created,
                     review_by,
                     status,
-                    row.get::<_, Option<String>>(12)?,
-                    row.get::<_, Option<String>>(13)?,
-                    row.get::<_, String>(14)?,
+                    row.get::<_, Option<String>>(HIT_WIDTH + 4)?,
+                    row.get::<_, Option<String>>(HIT_WIDTH + 5)?,
+                    row.get::<_, String>(HIT_WIDTH + 6)?,
                 ))
             })
             .optional()?;
@@ -863,6 +960,8 @@ mod tests {
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec![],
                 session: None,
+                reach: Reach::Fleet,
+                task: None,
                 confidence: None,
                 trust_tier: TrustTier::Raw,
                 review_by: None,
@@ -1257,6 +1356,262 @@ mod tests {
             ["mem-a-last", "mem-a-later"],
             "a row the trigger could not key stays unkeyed after the next open"
         );
+    }
+
+    /// A raw entry in `dom-a` with this reach, written under this task.
+    fn reaching(id: &str, reach: Reach, task: Option<&str>) -> Entry {
+        let mut e = entry("dom-a", id, "Budget", "The budget.\n");
+        e.front.reach = reach;
+        e.front.task = task.map(str::to_string);
+        e
+    }
+
+    /// A filter over two domains with this raw reach and this chain. Two domains, so the
+    /// parameters of the chain come after more than one of the domains.
+    fn reads(raw_reach: RawReach, chain: &[&str]) -> ReadFilter {
+        let mut f = ReadFilter::for_domains(["dom-z", "dom-a"], Label::Restricted);
+        f.raw_reach = raw_reach;
+        f.chain = chain.iter().map(|t| (*t).to_string()).collect();
+        f
+    }
+
+    /// Two raw entries that replace `mem-a-first` and are due for review on [`DUE`]: one
+    /// with the fleet's reach, and a newer one with tap reach under `task-x`. The newer
+    /// one is first in each answer that has both.
+    fn a_fleet_entry_and_a_newer_tap_entry() -> Index {
+        let mut ix = Index::in_memory().unwrap();
+        let mut fleet = reaching("mem-a-fleet", Reach::Fleet, None);
+        let mut tap = reaching("mem-a-tap", Reach::Tap, Some("task-x"));
+        tap.front.created = datetime!(2026-10-01 11:00 UTC);
+        for e in [&mut fleet, &mut tap] {
+            e.front.review_by = Some(date!(2026 - 09 - 01));
+            e.front.supersedes = Some("mem-a-first".into());
+            ix.upsert(e).unwrap();
+        }
+        ix
+    }
+
+    const DUE: Date = date!(2026 - 10 - 01);
+
+    /// What each list-shaped read gives under `f`, newest first: search, list, every
+    /// entry, and the entries due for review.
+    fn each_list(ix: &Index, f: &ReadFilter) -> [Vec<String>; 4] {
+        let own = |hits: Vec<Hit>| hits.into_iter().map(|h| h.id).collect::<Vec<_>>();
+        let mut found = own(ix.search("budget", f, 10).unwrap());
+        found.sort_by(|a, b| b.cmp(a));
+        let mut due = own(ix.due_for_review(f, DUE, 10).unwrap());
+        due.reverse();
+        [
+            found,
+            own(ix.list(f, None, 10).unwrap()),
+            own(ix.list_every(f, None).unwrap()),
+            due,
+        ]
+    }
+
+    #[test]
+    fn each_read_leaves_out_a_raw_entry_with_tap_reach_whose_task_is_not_in_the_chain() {
+        let ix = a_fleet_entry_and_a_newer_tap_entry();
+        // a session of the fleet whose chain does not hold the task
+        let f = reads(RawReach::Fleet, &["task-other"]);
+        for listed in each_list(&ix, &f) {
+            assert_eq!(listed, ["mem-a-fleet"]);
+        }
+        assert_eq!(ix.count(&f).unwrap(), 1);
+        assert!(ix.meta("mem-a-tap", &f).unwrap().is_none());
+        assert!(ix.meta("mem-a-fleet", &f).unwrap().is_some());
+        assert_eq!(
+            ix.replaced_by("mem-a-first", &f).unwrap().as_deref(),
+            Some("mem-a-fleet")
+        );
+    }
+
+    #[test]
+    fn the_chain_that_holds_the_task_and_a_reader_of_all_get_a_raw_entry_with_tap_reach() {
+        let ix = a_fleet_entry_and_a_newer_tap_entry();
+        let both: &[&str] = &["mem-a-tap", "mem-a-fleet"];
+        for (f, want) in [
+            (reads(RawReach::Fleet, &["task-other", "task-x"]), both),
+            (reads(RawReach::Chain, &["task-x"]), &both[..1]),
+            (reads(RawReach::All, &[]), both),
+        ] {
+            for listed in each_list(&ix, &f) {
+                assert_eq!(listed, want, "{f:?}");
+            }
+            assert_eq!(ix.count(&f).unwrap(), want.len() as u64, "{f:?}");
+            assert!(ix.meta("mem-a-tap", &f).unwrap().is_some(), "{f:?}");
+            assert_eq!(
+                ix.replaced_by("mem-a-first", &f).unwrap().as_deref(),
+                Some("mem-a-tap"),
+                "{f:?}"
+            );
+        }
+    }
+
+    /// One entry for each tier (raw, curated), each reach and each task (none, `task-x`,
+    /// `task-y`), with those three in its id.
+    fn every_shape() -> Vec<Entry> {
+        let mut entries = Vec::new();
+        for tier in [TrustTier::Raw, TrustTier::Curated] {
+            for reach in [Reach::Chain, Reach::Fleet, Reach::Tap] {
+                for task in [None, Some("task-x"), Some("task-y")] {
+                    let id = format!("mem-a-{tier}-{reach}-{}", task.unwrap_or("none"));
+                    let mut e = reaching(&id, reach, task);
+                    e.front.trust_tier = tier;
+                    entries.push(e);
+                }
+            }
+        }
+        entries
+    }
+
+    /// The ids of the entries that `f` admits, in order. Holds that `meta` gives each
+    /// of them and no other.
+    fn admitted<'a>(ix: &Index, f: &ReadFilter, entries: &'a [Entry]) -> Vec<&'a str> {
+        let mut admitted = Vec::new();
+        for e in entries {
+            let front = &e.front;
+            let admits = f.admits_entry(
+                &front.domain,
+                front.classification,
+                front.trust_tier,
+                e.is_active(),
+                front.reach,
+                front.task.as_deref(),
+            );
+            let found = ix.meta(&front.id, f).unwrap().is_some();
+            assert_eq!(found, admits, "{} under {f:?}", front.id);
+            if admits {
+                admitted.push(front.id.as_str());
+            }
+        }
+        admitted.sort_unstable();
+        admitted
+    }
+
+    #[test]
+    fn the_query_admits_what_the_filter_admits_for_every_reach_chain_and_entry() {
+        let mut ix = Index::in_memory().unwrap();
+        let entries = every_shape();
+        assert_eq!(entries.len(), 18);
+        for e in &entries {
+            ix.upsert(e).unwrap();
+        }
+        let chains: [&[&str]; 4] = [&[], &["task-x"], &["task-w"], &["task-w", "task-x"]];
+        for raw_reach in [RawReach::Chain, RawReach::Fleet, RawReach::All] {
+            for chain in chains {
+                for min_tier in [TrustTier::Raw, TrustTier::Curated] {
+                    let mut f = reads(raw_reach, chain);
+                    f.min_tier = min_tier;
+                    let admitted = admitted(&ix, &f, &entries);
+                    let listed = ix.list_every(&f, None).unwrap();
+                    let mut listed = ids(&listed);
+                    listed.sort_unstable();
+                    assert_eq!(listed, admitted, "{f:?}");
+                    assert_eq!(ix.count(&f).unwrap(), admitted.len() as u64, "{f:?}");
+                }
+            }
+        }
+    }
+
+    /// Holds that each of `rows`, and no other row, is read under `raw_reach` as a raw
+    /// entry with the fleet's reach and no task is.
+    fn reads_as_fleet(ix: &Index, raw_reach: RawReach, rows: &[&str]) {
+        let f = reads(raw_reach, &["task-x"]);
+        let as_fleet = f.admits("dom-a", Label::Public, TrustTier::Raw, true);
+        assert_eq!(as_fleet, raw_reach != RawReach::Chain);
+        for id in rows {
+            let meta = ix.meta(id, &f).unwrap();
+            assert_eq!(meta.is_some(), as_fleet, "{id} under {raw_reach:?}");
+            if let Some(meta) = meta {
+                assert_eq!(meta.hit.reach, Reach::Fleet, "{id}");
+            }
+        }
+        let want = if as_fleet { rows.len() as u64 } else { 0 };
+        assert_eq!(ix.count(&f).unwrap(), want, "{raw_reach:?}");
+    }
+
+    #[test]
+    fn an_index_file_from_before_the_reach_gets_its_columns_on_open_and_its_rows_read_as_fleet() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("index.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            let before = SCHEMA.replace(
+                "TEXT NOT NULL,\n    reach          TEXT,\n    task           TEXT\n",
+                "TEXT NOT NULL\n",
+            );
+            assert_ne!(before, SCHEMA);
+            conn.execute_batch(&before).unwrap();
+            assert_eq!(
+                Index::reach_columns_missing(&conn).unwrap(),
+                ["reach", "task"]
+            );
+            insert_as_before(&conn, "mem-a-old", datetime!(2026-10-01 10:00 UTC));
+        }
+        let mut ix = Index::open(&path).unwrap();
+        assert!(Index::reach_columns_missing(&ix.conn).unwrap().is_empty());
+        // an older binary goes on writing to the file after a newer one opened it
+        insert_as_before(&ix.conn, "mem-a-later", datetime!(2026-10-01 11:00 UTC));
+        for raw_reach in [RawReach::Chain, RawReach::Fleet, RawReach::All] {
+            reads_as_fleet(&ix, raw_reach, &["mem-a-old", "mem-a-later"]);
+        }
+        // the file now keeps the reach of what is written to it
+        ix.upsert(&reaching("mem-a-tap", Reach::Tap, Some("task-y")))
+            .unwrap();
+        let fleet = reads(RawReach::Fleet, &["task-x"]);
+        assert!(ix.meta("mem-a-tap", &fleet).unwrap().is_none());
+        assert_eq!(ix.count(&fleet).unwrap(), 2);
+        drop(ix);
+        // the next open finds the columns and adds none
+        let ix = Index::open(&path).unwrap();
+        assert!(ix.meta("mem-a-tap", &fleet).unwrap().is_none());
+        assert!(ix.meta("mem-a-tap", &any()).unwrap().is_some());
+    }
+
+    #[test]
+    fn a_curated_upsert_is_admitted_where_the_raw_entry_was_refused_and_a_hit_gives_the_reach() {
+        let mut ix = Index::in_memory().unwrap();
+        let mut tap = reaching("mem-a-tap", Reach::Tap, Some("task-x"));
+        ix.upsert(&tap).unwrap();
+        ix.upsert(&reaching("mem-a-chain", Reach::Chain, Some("task-y")))
+            .unwrap();
+        ix.upsert(&reaching("mem-a-fleet", Reach::Fleet, None))
+            .unwrap();
+        let fleet = reads(RawReach::Fleet, &[]);
+        assert!(ix.meta("mem-a-tap", &fleet).unwrap().is_none());
+        assert_eq!(
+            ids(&ix.list(&reads(RawReach::Chain, &[]), None, 10).unwrap()),
+            [""; 0],
+            "a session with no chain that reads its chain only reads no raw entry"
+        );
+        tap.front.trust_tier = TrustTier::Curated;
+        ix.upsert(&tap).unwrap();
+        let meta = ix.meta("mem-a-tap", &fleet).unwrap().unwrap();
+        assert_eq!(meta.hit.reach, Reach::Tap);
+        assert_eq!(meta.hit.trust_tier, TrustTier::Curated);
+        assert_eq!(
+            ids(&ix.list(&reads(RawReach::Chain, &[]), None, 10).unwrap()),
+            ["mem-a-tap"]
+        );
+        let found = ix.search("budget", &fleet, 10).unwrap();
+        let reach_of = |id: &str| found.iter().find(|h| h.id == id).map(|h| h.reach);
+        assert_eq!(reach_of("mem-a-tap"), Some(Reach::Tap));
+        assert_eq!(reach_of("mem-a-chain"), Some(Reach::Chain));
+        assert_eq!(reach_of("mem-a-fleet"), Some(Reach::Fleet));
+        let chain = ix.meta("mem-a-chain", &fleet).unwrap().unwrap();
+        assert_eq!(chain.hit.reach, Reach::Chain);
+        // a row whose reach the index did not write is a bad row, as a bad status is
+        ix.conn
+            .execute(
+                "UPDATE entries SET reach = 'domain' WHERE id = 'mem-a-fleet'",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            ix.meta("mem-a-fleet", &any()),
+            Err(Error::BadRow { .. })
+        ));
     }
 
     #[test]

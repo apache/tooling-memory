@@ -477,7 +477,8 @@ calls again. Re-enactment runs the whole session.
 
 ## Act 9 · From outside
 
-On stage: the GitHub issues tap, GitHub's public API, and you.
+On stage: the GitHub issues tap, GitHub's public API, and you. In 9.5, also the scripted
+agents `agent:a` and `agent:reader`.
 
 **9.1 The grant.** The tap may reach api.github.com and nothing else. It files into
 `dom-demo`, and it holds no credential. It runs as a WebAssembly component with only that
@@ -492,6 +493,21 @@ there. The ledger knows each issue by its origin and last update.
 
 **9.4 A person admits.** What a tap brings is proposed. No worker claims it until a
 person admits it. You admit one.
+
+**9.5 Raw reach.** An issue is text from a stranger. `agent:a` holds the admitted task,
+reads it and writes a decision. The answer of the write says `reach: tap` and names the
+task, because the session read outside content. Then the step shows who reads the entry
+while it is raw:
+
+- A new session of `agent:a` on the same task finds it. That session is in the task
+  chain.
+- `agent:reader` holds no task. Its search finds nothing, and its `get` is refused as
+  not found.
+- You find it. A person reads all raw entries.
+
+You promote the entry to curated, and then `agent:reader` finds it. Last, `amem log
+outside` lists the sessions that read outside content. For the session of `agent:a`, it
+gives one write and no send. An auditor checks the sends of such a session first.
 
 ## Act 10 · The record moves
 

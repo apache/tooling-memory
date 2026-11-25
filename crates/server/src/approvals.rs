@@ -269,6 +269,19 @@ fn sign_off_redaction(id: &str) -> Redaction {
     }
 }
 
+/// The reach and the task of a copy. A copy is raw. The copy of a raw source keeps the
+/// reach and the task of the source, so the sessions that read the source while it is
+/// raw are the sessions that read the copy: the copy of an entry with tap reach has tap
+/// reach. The copy of a curated or a verified source has fleet reach and names no task,
+/// because the reach of such a source decides nothing.
+fn reach_of_copy(source: &Frontmatter) -> (dm_core::Reach, Option<String>) {
+    if source.trust_tier == TrustTier::Raw {
+        (source.reach, source.task.clone())
+    } else {
+        (dm_core::Reach::Fleet, None)
+    }
+}
+
 /// Why an entry that is not live gets no copy at a lower label.
 fn no_copy_of(id: &str, status: dm_core::Status) -> Error {
     use dm_core::Status;
@@ -521,12 +534,18 @@ impl Memory {
         }
     }
 
-    /// Whether the session's filter admits an entry, whatever its status.
+    /// Whether the session's filter admits an entry, whatever its status. A raw entry is
+    /// judged by its reach and its task, as each read judges it.
     fn may_read(&self, domain: &str, entry: &Entry) -> Result<bool, Error> {
         let front = &entry.front;
-        Ok(self
-            .session_filter()?
-            .admits(domain, front.classification, front.trust_tier, true))
+        Ok(self.session_filter()?.admits_entry(
+            domain,
+            front.classification,
+            front.trust_tier,
+            true,
+            front.reach,
+            front.task.as_deref(),
+        ))
     }
 
     /// With a collector, a span that names the approval an action ran under.
@@ -605,7 +624,8 @@ impl Memory {
             )));
         }
         // to ask is to read the entry: the log of its domain takes the read
-        if !self.observe_entry(&domain, id, from)? {
+        let outside = crate::reach::outside_content(&entry);
+        if !self.observe_entry(&domain, id, from, outside)? {
             return Err(Error::NotFound(id.to_string()));
         }
         let action = Gated::Declassify { to };
@@ -666,7 +686,8 @@ impl Memory {
     /// differences. The classification is the label asked for and is not raised to the
     /// session's label. The author, the date, the type, the text and the review date are
     /// the source's. The copy cites the source's version and nothing else: what the
-    /// source cites can be above the copy's label.
+    /// source cites can be above the copy's label. The reach and the task are those of
+    /// a raw source, and not what this session read.
     ///
     /// The third difference: the record takes the copy only when it holds no entry with
     /// this id. Every part of the copy follows from the source's version, the label and
@@ -675,6 +696,7 @@ impl Memory {
     /// to index.
     async fn write_copy(&self, source: &Entry, at: &Landing<'_>) -> Result<(), Error> {
         let from = &source.front;
+        let (reach, task) = reach_of_copy(from);
         let copy = Entry {
             front: Frontmatter {
                 id: at.id.clone(),
@@ -686,6 +708,11 @@ impl Memory {
                 // only a write gives an entry its session: the text of a copy follows
                 // from its origin alone, whichever session lands it
                 session: None,
+                // a copy is raw, so the reach of a raw source is the reach of its copy:
+                // the copy of content from outside the fleet stays with the task chain
+                // and the curators
+                reach,
+                task,
                 confidence: from.confidence,
                 trust_tier: TrustTier::Raw,
                 review_by: from.review_by,
@@ -1640,6 +1667,77 @@ mod tests {
         let (again, _) = landed(m.declassify(&id, Label::Internal, WHY).await);
         assert_eq!(again, copy);
         assert_eq!(entries(&m).await, 2, "the source and one copy");
+    }
+
+    /// The task that the writer of [`restricted_with_tap_reach`] holds. The ledger does
+    /// not hold it.
+    const PLANTED: &str = "task-planted-1";
+
+    /// A restricted raw entry with tap reach that names [`PLANTED`]: its writer read
+    /// content from outside the fleet.
+    async fn restricted_with_tap_reach(dir: &Path) -> String {
+        let writer = session(dir, "agent:writer");
+        writer.set_held_task(PLANTED);
+        crate::lock(&writer.session).read_outside();
+        restricted(&writer, DOOR).await
+    }
+
+    /// The reach of a stored entry, and the task that it names.
+    async fn reach_of(m: &Memory, id: &str) -> (dm_core::Reach, Option<String>) {
+        let front = stored(m, id).await.front;
+        (front.reach, front.task)
+    }
+
+    #[tokio::test]
+    async fn the_copy_of_a_raw_entry_keeps_its_reach_and_its_task() {
+        use dm_core::Reach;
+        let dir = tempfile::tempdir().unwrap();
+        let m = owner(dir.path());
+        let id = restricted_with_tap_reach(dir.path()).await;
+        let planted = (Reach::Tap, Some(PLANTED.to_string()));
+        assert_eq!(reach_of(&m, &id).await, planted);
+        assert!(!m.read_outside(), "before the request");
+        let (copy, _) = landed(m.declassify(&id, Label::Internal, WHY).await);
+        assert!(m.read_outside(), "to ask for the copy is to read the entry");
+        assert_eq!(reach_of(&m, &copy).await, planted);
+        // the copy has the readers of the source: the task chain, and no other agent
+        let reader = session(dir.path(), "agent:reader").with_handling_cap(Label::Internal);
+        let answer = reader.get(&copy).await;
+        assert!(matches!(answer, Err(Error::NotFound(_))), "{answer:?}");
+        let member = session(dir.path(), "agent:member").with_handling_cap(Label::Internal);
+        member.set_held_task(PLANTED);
+        assert!(member.get(&copy).await.unwrap().body.contains("4417"));
+        // a curated source keeps the field, and its reach decides nothing: its copy has
+        // fleet reach and names no task
+        let why = "checked against the door";
+        m.promote(&id, TrustTier::Curated, why).await.unwrap();
+        let curated = stored(&m, &id).await.front;
+        assert_eq!(
+            (curated.trust_tier, curated.reach),
+            (TrustTier::Curated, Reach::Tap)
+        );
+        let (second, _) = landed(m.declassify(&id, Label::Internal, WHY).await);
+        assert_ne!(second, copy, "a new version has a new copy");
+        assert_eq!(reach_of(&m, &second).await, (Reach::Fleet, None));
+        assert!(reader.get(&second).await.unwrap().body.contains("4417"));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_does_not_read_a_raw_entry_asks_for_no_erasure_of_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = owner(dir.path());
+        let id = restricted_with_tap_reach(dir.path()).await;
+        // an agent outside the task chain gets the answer for an entry that does not
+        // exist, and no task asks the owner
+        let outsider = session(dir.path(), AGENT);
+        let answer = outsider.erase(&id, Reason::Mistaken).await;
+        assert!(matches!(answer, Err(Error::NotFound(_))), "{answer:?}");
+        assert!(sign_offs(&m, &id).await.is_empty());
+        // an agent in the task chain reads the entry, so it asks
+        let member = session(dir.path(), AGENT);
+        member.set_held_task(PLANTED);
+        asked(&member, &id, "an approval of human:test:me").await;
+        assert_eq!(sign_offs(&m, &id).await.len(), 1);
     }
 
     /// A session that does not handle the label of a task does not get the task.
