@@ -73,6 +73,9 @@ term here in the same commit as the first document that needs it.
 | erasure journal | The receipts of the erasures of a root. The owner keeps a copy apart from each recovery bundle. A restore erases each entry that the erasure journal names | |
 | restore drill | A restore of a recovery bundle into a scratch root, and a report of each of the five cases of the paper as recovered, absent or failed. It does not write the record or the ledger of the root that runs it | restore test |
 | late handoff | A handoff that a holder leaves on a task after its claim is over | |
+| outage | The time in which reads and changes wait, because nothing can check them. The owner declares an outage and ends it. In an outage a session works from the T0 that it loaded, and a handoff and a heartbeat go into a queue. The end of the outage replays the queue | downtime, degraded mode |
+| horizon scanner | The person that `registry.toml` names for a unit. That person reads the evidence that an evidence task gathered, and proposes to start, change or stop work | scout, strategist |
+| evidence task | The task that is filed for each period of a unit with a horizon scanner. An agent can claim it. It gathers evidence and proposes no change. A second task, which requires a person, depends on it: there the horizon scanner reviews the evidence | scan task |
 | attempt key | A key that a caller makes for one claim or one completion. The same key asked again gives the same result, and the ledger does the operation one time | idempotency key, request id |
 | task definition | The record in the platform domain for one kind of work: its purpose, its tools, its acceptance checks and its outputs. A task names one as `<name>@<version>` | task type, task template |
 | quarantine | `state/quarantine`, where the policy holds a write that it refused, for the owner to release or drop | |

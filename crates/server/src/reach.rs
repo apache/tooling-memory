@@ -158,6 +158,7 @@ impl Memory {
     pub async fn hold_task(&self, id: &str) -> Result<(), Error> {
         self.set_held_task(id);
         if let Some(task) = self.chain_of_held().await? {
+            self.confirm_lease(task.lease_until);
             if self.task_is_outside(&task) {
                 lock(&self.session).read_outside();
             }

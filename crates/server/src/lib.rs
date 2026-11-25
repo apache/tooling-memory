@@ -42,9 +42,11 @@ pub mod bundle;
 pub mod contexts;
 pub mod duties;
 pub mod fabric;
+pub mod horizon;
 pub mod lineage;
 pub mod log;
 pub mod mcp;
+pub mod outage;
 pub mod platform;
 pub mod prefetch;
 pub mod projection;
@@ -146,6 +148,10 @@ pub enum Error {
     /// the session stops, and a new one starts under the grants as they are now.
     #[error("stopped: {0}")]
     Stale(String),
+    /// An outage is declared ([`Memory::declare_outage`]): the action waits until the
+    /// outage ends. The session is not stopped, and its grants are as they were.
+    #[error("outage: {0}")]
+    Outage(String),
     /// Not there, or not for this session to see. The two are deliberately the same.
     #[error("not found: {0}")]
     NotFound(String),
@@ -376,6 +382,9 @@ pub struct Memory {
     /// The domains this session has read: a send of the session goes into the log of
     /// each. Shared with the session's views.
     read_domains: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// What this session works from in an outage: each T0 that it loaded, and the last
+    /// lease that the ledger confirmed ([`outage`]). Shared with the session's views.
+    offline: Arc<Mutex<outage::Offline>>,
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -546,6 +555,7 @@ impl Memory {
             recording: Arc::new(Mutex::new(tape::Recording::default())),
             last_stamp: Arc::new(Mutex::new(OffsetDateTime::UNIX_EPOCH)),
             read_domains: Arc::default(),
+            offline: Arc::default(),
         })
     }
 
@@ -566,8 +576,9 @@ impl Memory {
     ///
     /// When the policy fails to give the read scope.
     pub fn for_request(&self) -> Result<Memory, Error> {
-        // without the chain: each read of the view lays the chain of that moment over it
-        let scope = self.policy_filter()?;
+        // without the chain: each read of the view lays the chain of that moment over it.
+        // A view is no read, so an outage does not refuse it: each read of the view waits
+        let scope = self.policy_scope()?;
         let version = self.policy().version().to_string();
         let mut session = self.grants.session();
         session.handling = session.handling.min(scope.handling);
@@ -603,6 +614,7 @@ impl Memory {
             recording: Arc::clone(&self.recording),
             last_stamp: Arc::clone(&self.last_stamp),
             read_domains: Arc::clone(&self.read_domains),
+            offline: Arc::clone(&self.offline),
         })
     }
 
@@ -618,8 +630,16 @@ impl Memory {
 
     /// The part of the read filter that the policy gives, kept until the policy in force
     /// is another: the domains, the handling, the lowest tier, and which raw entries the
-    /// principal reads. It has no task chain.
+    /// principal reads. It has no task chain. Each read passes here, so this is where a
+    /// read waits in an outage.
     fn policy_filter(&self) -> Result<ReadFilter, Error> {
+        self.serving()?;
+        self.policy_scope()
+    }
+
+    /// [`Memory::policy_filter`] with no check for an outage: for a caller that reads
+    /// nothing with the filter.
+    fn policy_scope(&self) -> Result<ReadFilter, Error> {
         self.fresh()?;
         let policy = self.policy();
         if let Some((version, f)) = lock(&self.scope).as_ref() {
@@ -815,6 +835,7 @@ impl Memory {
     /// Ask the policy, and log the decision under the record's state: every allow and
     /// deny, with the policy version that produced it, as the paper has decision logs.
     fn decide(&self, input: &Input) -> Result<Decision, Error> {
+        self.serving()?;
         self.fresh()?;
         let mut input = input.clone();
         input.held_task = self.held_task();
@@ -831,7 +852,8 @@ impl Memory {
         if d.denials.is_empty() {
             return Ok(());
         }
-        let filter = self.session_filter()?;
+        // nothing is read with this filter: it says which rule texts the refusal names
+        let filter = self.over_chain(self.policy_scope()?);
         let p = self.policy();
         let above = |id: &str| {
             p.entries().iter().any(|e| {
@@ -971,6 +993,8 @@ impl Memory {
     pub fn adopt_claims(&self, from: &Memory) {
         let theirs = lock(&from.claims).clone();
         lock(&self.claims).extend(theirs);
+        let confirmed = lock(&from.offline).lease;
+        self.confirm_lease(confirmed);
     }
 
     /// The capabilities this session's manifest carries, matched against task
@@ -1395,6 +1419,9 @@ impl Memory {
     /// [`Error::Denied`] when a raw write with tap reach would replace an entry with
     /// other readers. The log takes nothing of a write that those two refuse.
     pub async fn write(&self, req: WriteRequest) -> Result<Written, Error> {
+        if let Some(outage) = self.outage() {
+            return Err(self.write_in_outage(req, &outage));
+        }
         let mut entry = self.entry_to_write(req).await?;
         // the ledger's events so far come before the write in the log of its domain. A
         // copy that fails is late, not lost: the next one starts where this one stopped
@@ -2363,6 +2390,7 @@ impl Memory {
         id: &str,
         keep: bool,
     ) -> Result<Option<Written>, Error> {
+        self.serving()?;
         if self.author != self.grants.owner {
             return Err(Error::Denied(format!(
                 "only the owner {} releases from quarantine",
@@ -2421,6 +2449,9 @@ impl Memory {
     /// An ungranted domain, or an index or ledger error.
     pub async fn t0(&self, domain: Option<&str>) -> Result<String, Error> {
         let domain = self.resolve_domain(domain)?;
+        if let Some(outage) = self.outage() {
+            return self.t0_in_outage(&domain, &outage, OffsetDateTime::now_utc());
+        }
         let f = self.filter_for(Some(&domain))?;
         let (handoffs, decisions, conventions, total, due) = {
             let ix = self.index.lock().await;
@@ -2470,6 +2501,7 @@ impl Memory {
             policy_digest: &digest,
         });
         self.reads.text("t0", &text);
+        self.keep_t0(&domain, &text);
         Ok(text)
     }
 
@@ -2628,6 +2660,7 @@ impl Memory {
     /// `promote:` origin, which only [`Memory::promote`] files, or when the origin and
     /// upstream event name a task already filed that this session may not read.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
+        self.serving()?;
         // a task from this origin is an approval task: approve reads its event as the
         // version proposed and its filer as the proposer, so one filed here would be a
         // proposal nobody made
@@ -2661,6 +2694,7 @@ impl Memory {
     ///
     /// As [`Memory::create_task`].
     pub async fn file_own(&self, spec: TaskSpec) -> Result<Created, Error> {
+        self.serving()?;
         let mut l = self.ledger.lock().await;
         self.file_in(&mut l, spec, Filing::Own, None).await
     }
@@ -3252,6 +3286,7 @@ impl Memory {
         if let Some(c) = &claim {
             self.observe_task(&c.task);
             lock(&self.claims).insert(c.task.id.clone(), c.generation);
+            self.confirm_lease(Some(c.lease_until));
         }
         Ok(claim)
     }
@@ -3271,6 +3306,7 @@ impl Memory {
             .await?;
         self.observe_task(&c.task);
         lock(&self.claims).insert(c.task.id.clone(), c.generation);
+        self.confirm_lease(Some(c.lease_until));
         Ok(c)
     }
 
@@ -3285,10 +3321,14 @@ impl Memory {
         generation: Option<u64>,
         lease: Duration,
     ) -> Result<Task, Error> {
+        if let Some(outage) = self.outage() {
+            return Err(self.heartbeat_in_outage(id, generation, lease, &outage));
+        }
         let mut l = self.ledger.lock().await;
         self.check_task(&l.get(id).await?)?;
         let by = self.under(self.claim_of(id, generation)?);
         let t = l.heartbeat(id, by, lease).await?;
+        self.confirm_lease(t.lease_until);
         self.observe_task(&t);
         Ok(t)
     }
@@ -3593,6 +3633,7 @@ impl Memory {
     /// or I/O error; an index another connection holds is [`dm_index::Error::Held`],
     /// and the erasure is finished by running it again.
     pub async fn erase(&self, id: &str, reason: Reason) -> Result<Receipt, Error> {
+        // the decision waits in an outage, and nothing changes before the decision
         let d = self.decide(&Input {
             action: Action::Erase,
             principal: self.principal(),
@@ -3921,6 +3962,7 @@ impl Memory {
         src: &Path,
         into_domain: Option<&str>,
     ) -> Result<bundle::Imported, Error> {
+        self.serving()?;
         self.fresh()?;
         let domain = self.resolve_domain(into_domain)?;
         let default = self

@@ -234,6 +234,7 @@ impl Memory {
     /// ledger.
     pub async fn recovery_bundle(&self, dest: &Path) -> Result<RecoveryManifest, Error> {
         self.owner_makes("a recovery bundle")?;
+        self.serving()?;
         self.fresh()?;
         empty_or_absent(dest, "the directory for the bundle")?;
         std::fs::create_dir_all(dest).map_err(io(dest))?;

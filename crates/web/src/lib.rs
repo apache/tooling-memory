@@ -954,6 +954,7 @@ fn task_error(e: &dm_server::Error) -> Response {
         dm_server::Error::NotFound(_) => StatusCode::NOT_FOUND,
         dm_server::Error::Denied(_) | dm_server::Error::Stale(_) => StatusCode::FORBIDDEN,
         dm_server::Error::Ledger(_) => StatusCode::CONFLICT,
+        dm_server::Error::Outage(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, e.to_string()).into_response()
@@ -1220,6 +1221,7 @@ fn export_refusal(e: dm_server::Error) -> Refusal {
         | dm_server::Error::NotFound(_)
         | dm_server::Error::Stale(_)
         | dm_server::Error::Bundle(dm_server::bundle::Error::Invalid(_)) => StatusCode::FORBIDDEN,
+        dm_server::Error::Outage(_) => StatusCode::SERVICE_UNAVAILABLE,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
     (status, e.to_string())

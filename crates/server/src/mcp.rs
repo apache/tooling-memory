@@ -39,6 +39,7 @@ fn mcp_err(e: Error) -> McpError {
     match e {
         Error::Denied(_)
         | Error::Stale(_)
+        | Error::Outage(_)
         | Error::NotFound(_)
         | Error::Gone(_)
         | Error::Moved { .. }
@@ -2238,6 +2239,10 @@ mod tests {
         let stopped = mcp_err(Error::Stale("the grants changed".into()));
         assert_eq!(stopped.code, invalid.code);
         assert!(stopped.message.contains("stopped: the grants changed"));
+        // an action that waits in an outage is told so in words too, and is no fault
+        let waits = mcp_err(Error::Outage("reads wait".into()));
+        assert_eq!(waits.code, invalid.code);
+        assert!(waits.message.contains("outage: reads wait"));
         assert_eq!(t0_uri("dom-a"), "memory://t0/dom-a");
     }
 
