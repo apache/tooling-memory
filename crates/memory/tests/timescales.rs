@@ -369,7 +369,9 @@ fn recover_drill_restores_into_a_scratch_root_and_leaves_the_live_root_as_it_was
     the_drill_reports_the_cases(&drill, &task);
     // the scratch root is a new directory under the recovery directory of the live root
     let scratch = std::path::PathBuf::from(drill["scratch"].as_str().unwrap());
-    assert!(scratch.starts_with(root.join("state/recovery")), "{drill}");
+    // the command prints the path as the system resolves it, so resolve the root too
+    let recovery = root.join("state/recovery").canonicalize().unwrap();
+    assert!(scratch.starts_with(&recovery), "{drill}");
     assert!(scratch.join("grants.toml").is_file());
     // the live root: the same grants, no new event, and the claim still in force
     let grants_now = std::fs::read_to_string(root.join("grants.toml")).unwrap();

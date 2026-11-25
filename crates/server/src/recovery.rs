@@ -798,9 +798,13 @@ pub fn next_epoch(authority: &Path, at_least: u64) -> Result<u64, Error> {
     };
     let next = held.max(at_least) + 1;
     let temporary = beside(".tmp");
-    std::fs::write(&temporary, format!("{next}\n")).map_err(io(&temporary))?;
-    std::fs::File::open(&temporary)
-        .and_then(|f| f.sync_all())
+    // one handle that writes and then syncs: a sync needs write access on Windows
+    std::fs::File::create(&temporary)
+        .and_then(|mut f| {
+            use std::io::Write as _;
+            f.write_all(format!("{next}\n").as_bytes())?;
+            f.sync_all()
+        })
         .map_err(io(&temporary))?;
     std::fs::rename(&temporary, authority).map_err(io(authority))?;
     Ok(next)
