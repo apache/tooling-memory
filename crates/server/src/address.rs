@@ -37,9 +37,12 @@ pub struct Address {
     pub part: Part,
 }
 
-/// Whether `id` has the shape of a name the record holds for an entry.
+/// Whether `id` is a name that the record takes for an entry: what the store takes. An
+/// id that this code makes starts with `mem-`. An entry that a person wrote by hand, or
+/// that came from another root, can have another name, and a fetch serves it too.
 fn is_id(id: &str) -> bool {
-    dm_core::id::is_entry_id(id)
+    !id.is_empty()
+        && !id.starts_with('.')
         && id.len() <= MAX_ID
         && id
             .chars()
@@ -92,10 +95,12 @@ impl FromStr for Address {
 }
 
 /// The bare id of a citation that names an entry in one of the three forms. A link, a
-/// path, a transcript or a malformed address names no entry.
+/// path, a transcript or a malformed address names no entry. Nor does a name without
+/// the shape of an entry id: a citation is free text, and a word in it is no entry.
 #[must_use]
 pub fn entry_of(cite: &str) -> Option<&str> {
-    parts(cite).ok().map(|(id, _)| id)
+    let (id, _) = parts(cite).ok()?;
+    dm_core::id::is_entry_id(id).then_some(id)
 }
 
 /// The entries that a list of citations names, each one time, by the bare id, in the
@@ -239,7 +244,7 @@ mod tests {
         let both_reversed = format!("mem-me-abc12345@{V}#steps");
         let long_id = format!("mem-{}", "a".repeat(MAX_ID));
         for bad in [
-            "task-me-abc12345",
+            ".mem-me-abc12345",
             "mem-me-abc12345/steps",
             "mem-me-abc12345:steps",
             "mem-me abc12345",
@@ -263,6 +268,20 @@ mod tests {
                 "{bad}: {refused:?}"
             );
             assert_eq!(entry_of(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn an_address_takes_each_name_that_the_record_takes_and_a_citation_only_an_entry_id() {
+        for id in ["note-1", "task-me-abc12345", "v1.2_final", "A"] {
+            let whole: Address = id.parse().unwrap();
+            assert_eq!((whole.id.as_str(), &whole.part), (id, &Part::Whole));
+            let version: Address = format!("{id}@{V}").parse().unwrap();
+            assert_eq!(version.id, id);
+            let anchor: Address = format!("{id}#steps").parse().unwrap();
+            assert_eq!(anchor.part, Part::Anchor("steps".into()));
+            assert_eq!(entry_of(id), None, "{id}");
+            assert_eq!(entry_of(&format!("{id}@{V}")), None, "{id}");
         }
     }
 

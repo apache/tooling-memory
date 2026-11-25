@@ -405,6 +405,14 @@ pub struct Memory {
     read_domains: Arc<Mutex<std::collections::BTreeSet<String>>>,
 }
 
+/// The refusal of a demoted entry, for a fetch of its id and for a fetch of one of its
+/// versions.
+pub(crate) fn demoted_gone(id: &str) -> Error {
+    Error::Gone(format!(
+        "{id} was demoted by curation; the archive keeps it for audit"
+    ))
+}
+
 pub(crate) fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -1512,9 +1520,7 @@ impl Memory {
                 },
                 _ => Error::Gone(format!("{id} was replaced; search for its current version")),
             },
-            Some(Status::Demoted) => Error::Gone(format!(
-                "{id} was demoted by curation; the archive keeps it for audit"
-            )),
+            Some(Status::Demoted) => demoted_gone(id),
             Some(Status::Erased) => {
                 Error::Gone(format!("{id} was erased; a stub and a receipt remain"))
             }
@@ -3927,10 +3933,17 @@ impl Memory {
     /// Say in the log of `domain` that a bundle left: first a read of the entries it
     /// carries, at the highest classification among them and marked as a survey, since
     /// an export of a scope is no use of one entry, then the send, which names the
-    /// bound of the export and the digest of the manifest. The session's label does not
-    /// rise: an export hands the entries out and shows none of them to the session. The
-    /// send is at the highest classification the bundle holds when that is above the
-    /// session's label.
+    /// bound of the export and the digest of the manifest. The session's label rises to
+    /// the highest classification among the entries: the answer of an export says how
+    /// many entries are at or below the bound and gives a digest that changes with each
+    /// of them, and that is a fact about those entries, as the hits of a search are.
+    /// The send is at the label of the session after that.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] when the bundle holds an entry above the handling of the
+    /// session, which the read filter does not let happen; or the log could not take an
+    /// event.
     async fn log_export(
         &self,
         domain: &str,
@@ -3938,12 +3951,17 @@ impl Memory {
     ) -> Result<(), Error> {
         let ids: Vec<String> = manifest.entries.iter().map(|e| e.id.clone()).collect();
         if let Some(carried) = manifest.entries.iter().map(|e| e.classification).max() {
+            if !lock(&self.session).observe(carried) {
+                return Err(Error::Denied(format!(
+                    "the bundle holds an entry at {carried}, above the handling of the session"
+                )));
+            }
             self.log_survey(domain, ids, carried)?;
         }
         let to = format!("export:{}", manifest.max_label);
         let digest = dm_core::digest(&manifest.to_yaml());
-        let label = self.label().max(manifest.highest_label);
-        self.log_send_at(Some(domain), &to, digest, label).await
+        self.log_send_at(Some(domain), &to, digest, self.label())
+            .await
     }
 
     /// Erase an entry: the body leaves every version in the record and the index, the

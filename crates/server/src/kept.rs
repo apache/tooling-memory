@@ -1,7 +1,8 @@
 //! An export that the memory server keeps under the root. A session that a harness
 //! reaches gives no path: the place is made from the root, the session id, the domain and
-//! the label, and from nothing else. The answer holds counts, labels and a digest, so
-//! the session learns nothing of an entry from it and its label does not rise.
+//! the label, and from nothing else. The answer holds counts, labels and a digest, and
+//! no id or text of an entry. The count and the digest are facts about the entries of
+//! the bundle, so the label of the session rises to the highest label among them.
 
 use crate::bundle::{self, Kept, EXPORTS_DIR};
 use crate::{io, Error, Memory};
@@ -24,7 +25,8 @@ impl Memory {
     /// Export a domain at or below a label into a bundle that stays under the root, at
     /// `state/exports/<session id>/<domain>-<label>`. The bundle is the one that
     /// [`Memory::export`] writes, under the same checks: the read filter of the session,
-    /// the bound, and the two events in the log of the domain. A bundle that an earlier
+    /// the bound, the label of the session, which rises to the highest label in the
+    /// bundle, and the two events in the log of the domain. A bundle that an earlier
     /// call of this session left at that place is removed first. A call that fails
     /// leaves no bundle there.
     ///
@@ -240,7 +242,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = shelf(dir.path()).await;
         let b = as_author(dir.path(), "agent:b");
-        let before = b.label();
         let at = log::read(dir.path(), "dom-me", 0).unwrap().len() as u64;
         let kept = b
             .export_kept(Some("dom-me"), Label::Internal)
@@ -269,7 +270,7 @@ mod tests {
         assert_eq!(kept.highest_label, manifest.highest_label);
         assert_eq!(kept.manifest_digest, dm_core::digest(&text));
 
-        // the answer names no entry, and the session read none
+        // the answer names no entry
         let answer = serde_json::to_string(&kept).unwrap();
         for hidden in [&*s.open, &*s.inner, TITLE, WORD] {
             assert!(!answer.contains(hidden), "{hidden} in {answer}");
@@ -292,7 +293,6 @@ mod tests {
                 "max_label"
             ]
         );
-        assert_eq!(b.label(), before, "the label of the session did not rise");
 
         // the log of the domain: the read of what the bundle carries, then the send
         let events = log::read(dir.path(), "dom-me", at + 1).unwrap();
@@ -322,6 +322,49 @@ mod tests {
             ids(&manifest),
             sorted(vec![&s.open, &s.inner, &s.secret, &s.note])
         );
+    }
+
+    #[tokio::test]
+    async fn an_export_raises_the_label_of_the_session_to_the_highest_label_in_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = shelf(dir.path()).await;
+        let b = as_author(dir.path(), "agent:b");
+        assert_eq!(b.label(), Label::Public);
+        // the bound is restricted, and the highest entry that the session reads there
+        // is internal
+        let low = b.export_kept(Some("dom-me"), Label::Public).await.unwrap();
+        assert_eq!((low.entries, b.label()), (1, Label::Public));
+        let kept = b.export_kept(Some("dom-me"), Label::Internal).await;
+        let kept = kept.unwrap();
+        assert_eq!((kept.entries, kept.highest_label), (2, Label::Internal));
+        assert_eq!(
+            b.label(),
+            Label::Internal,
+            "as after a search with those hits"
+        );
+        // what the session writes next is at its label: the count is not public now
+        let said = b
+            .write(WriteRequest {
+                body: format!("dom-me holds {} entries.\n", kept.entries),
+                domain: Some("dom-me".into()),
+                ..WriteRequest::default()
+            })
+            .await
+            .unwrap();
+        let front = s.owner.archived(&said.id).await.unwrap().front;
+        assert_eq!(front.classification, Label::Internal);
+        // an export to a directory that the caller names is under the same rule
+        let c = as_author(dir.path(), "agent:c");
+        let out = tempfile::tempdir().unwrap();
+        c.export(Some("dom-me"), Label::Internal, out.path())
+            .await
+            .unwrap();
+        assert_eq!(c.label(), Label::Internal);
+        // a bundle with no entry raises nothing
+        crate::testing::agents_read(dir.path(), "\"raw_reach\": \"chain\"");
+        let d = as_author(dir.path(), "agent:d");
+        let none = d.export_kept(Some("dom-me"), Label::Internal).await;
+        assert_eq!((none.unwrap().entries, d.label()), (0, Label::Public));
     }
 
     #[tokio::test]

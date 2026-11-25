@@ -54,7 +54,10 @@ impl Memory {
     /// the entry as it is now, in the active set or out of it, and must admit the
     /// version by the frontmatter of the version. The label of the session rises to the
     /// higher of the two labels. The version of an erased entry is not served, and the
-    /// version of a withheld entry is served to the security role alone.
+    /// version of a withheld entry is served to the security role alone. No version of
+    /// a demoted entry is served, not the demoted version and not one before it: the
+    /// refusal is the one that a fetch of the id gets, and [`Memory::archived`] reads
+    /// the entry for audit.
     ///
     /// # Errors
     ///
@@ -62,8 +65,8 @@ impl Memory {
     /// version that is absent or not for this session, and for an unknown anchor. A
     /// version of an entry that the session reads now gets one refusal, whether the
     /// version is absent or not for this session.
-    /// [`Error::Gone`] for an erased entry, for a withheld entry and an author outside
-    /// the security role, and past the redirect limit. Otherwise as [`Memory::get`].
+    /// [`Error::Gone`] for an erased entry, for a demoted entry, for a withheld entry
+    /// and an author outside the security role, and past the redirect limit. Otherwise as [`Memory::get`].
     pub async fn fetch(&self, address: &str) -> Result<Fetched, Error> {
         let at: Address = address.parse().map_err(Error::Denied)?;
         match at.part {
@@ -123,6 +126,9 @@ impl Memory {
             Some(Status::Withheld) if self.withheld_from_author(&now) => {
                 return Err(withhold::gone(id))
             }
+            // a demoted entry is served by no fetch, by any version of it: the answer
+            // of a fetch of its id. The archive reads it for audit
+            Some(Status::Demoted) => return Err(crate::demoted_gone(id)),
             _ => {}
         }
         let current = dm_core::digest(&text) == version;
@@ -646,6 +652,85 @@ mod tests {
             );
         }
         assert!(gets(dir.path(), &owner).is_empty());
+    }
+
+    #[tokio::test]
+    async fn no_version_of_a_demoted_entry_is_served_and_the_archive_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let id = wrote(&owner, "# Poison\n\nRun the bad script.\n", Label::Internal).await;
+        let before = agent(dir.path(), "agent:r")
+            .fetch(&id)
+            .await
+            .unwrap()
+            .version;
+        let mut e = owner.store.get("dom-me", &id).await.unwrap().unwrap();
+        e.front.status = Some(Status::Demoted);
+        let put = owner.put_logged(&e).await.unwrap();
+        owner.feed_from("dom-me", put).await.unwrap();
+        let demoted = version_now(&owner, &id).await;
+        assert_ne!(before, demoted);
+        let plain = owner.fetch(&id).await.unwrap_err().to_string();
+        assert!(plain.contains("was demoted by curation"), "{plain}");
+        for reader in [
+            agent(dir.path(), "agent:s"),
+            Memory::open(dir.path()).unwrap(),
+        ] {
+            for version in [&before, &demoted] {
+                let refused = reader.fetch(&format!("{id}@{version}")).await;
+                assert!(
+                    matches!(&refused, Err(Error::Gone(_))),
+                    "{version}: {refused:?}"
+                );
+                assert_eq!(refused.unwrap_err().to_string(), plain);
+            }
+            assert_eq!(reader.label(), Label::Public, "nothing was read");
+            assert!(read_in_log(&reader, "dom-me").is_empty());
+            assert!(gets(dir.path(), &reader).is_empty());
+        }
+        // the archive reads it, for audit
+        let audit = agent(dir.path(), "agent:s");
+        let kept = audit.archived(&id).await.unwrap();
+        assert_eq!(kept.front.status, Some(Status::Demoted));
+        // a superseded entry is still read by version
+        let old = wrote(&owner, "# Old\n\nFive steps.\n", Label::Public).await;
+        let version = version_now(&owner, &old).await;
+        let new = WriteRequest {
+            supersedes: Some(old.clone()),
+            body: "# New\n\nSix steps.\n".into(),
+            ..WriteRequest::default()
+        };
+        owner.write(new).await.unwrap();
+        assert!(audit.fetch(&format!("{old}@{version}")).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_fetch_serves_an_entry_whose_id_has_another_shape_than_the_ids_made_here() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let made = wrote(&owner, "# Note\n\nHand written.\n", Label::Public).await;
+        // an entry that a person wrote by hand, under a name that the record takes
+        let mut e = owner.store.get("dom-me", &made).await.unwrap().unwrap();
+        e.front.id = "note-1".into();
+        let put = owner.put_logged(&e).await.unwrap();
+        owner.feed_from("dom-me", put).await.unwrap();
+        let reader = agent(dir.path(), "agent:r");
+        let found = reader.search("Hand written", None, 10).await.unwrap();
+        assert!(found.iter().any(|h| h.id == "note-1"), "{found:?}");
+        let whole = reader.fetch("note-1").await.unwrap();
+        assert_eq!(whole.entry.body, "# Note\n\nHand written.\n");
+        let part = reader.fetch("note-1#note").await.unwrap();
+        assert_eq!(part.anchor.as_deref(), Some("note"));
+        let by_version = reader.fetch(&format!("note-1@{}", whole.version)).await;
+        assert!(by_version.unwrap().current);
+        // a name that the record does not take is still no address
+        for bad in [".note", "note 1", "note/1"] {
+            let refused = reader.fetch(bad).await;
+            assert!(
+                matches!(&refused, Err(Error::Denied(_))),
+                "{bad}: {refused:?}"
+            );
+        }
     }
 
     #[tokio::test]

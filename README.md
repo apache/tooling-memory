@@ -202,6 +202,9 @@ two weeks. It is also the reason that none of it is the production shape.
   - `get` by version checks the creation time of the entry against the snapshot of a
     session, and not the time that the version was written.
   - `get` by version reads each earlier version of the entry to find one digest.
+  - `get` serves no version of a demoted entry. The archive reads only the current
+    version of such an entry.
+  - A citation names an entry for lineage only when the id starts with `mem-`.
   - No audit counts the citations that name no version.
   - `write` has no fast lane for a handoff.
 - **The rule lifecycle, in part.** `check_policy` gives all the rules in force for a

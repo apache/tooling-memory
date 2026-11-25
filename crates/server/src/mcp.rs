@@ -1861,7 +1861,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Export a domain as a bundle, at or below `max_label`. The memory server keeps the bundle under its own state; you name no path and get none that you can open. The answer holds where the bundle is kept (`kept_at`), the number of entries, the highest label inside and the digest of the manifest, and nothing of an entry, so your label does not rise. A `max_label` above what this session may handle is refused. A second export of the same domain at the same label replaces the first."
+        description = "Export a domain as a bundle, at or below `max_label`. The memory server keeps the bundle under its own state; you name no path and get none that you can open. The answer holds where the bundle is kept (`kept_at`), the number of entries, the highest label inside and the digest of the manifest, and no id or text of an entry. Your label rises to the highest label inside, as after a search that returned those entries. A `max_label` above what this session may handle is refused. A second export of the same domain at the same label replaces the first."
     )]
     async fn export(&self, p: Parameters<ExportParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;

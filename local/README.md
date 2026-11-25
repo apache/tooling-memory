@@ -1935,6 +1935,10 @@ the parts of `get`, `search`, `recall` and `export` that it adds to the read pat
 | `<id>#<anchor>` | One section of the current version |
 | `<id>@<version>` | One version of the entry. No redirect is followed |
 
+The id is each name that the record takes for an entry: at most 128 characters of
+letters, digits, `.`, `_` and `-`, and no `.` at the start. An id that this code makes
+starts with `mem-`. An entry that a person wrote by hand can have a different name.
+
 An anchor is the text of a Markdown heading in lower case, with `-` in place of each
 group of other characters: `## First step` has the anchor `first-step`. A section goes
 from its heading to the next heading of the same level or a higher level. A fetch of a
@@ -1947,7 +1951,9 @@ of `get` has `version`, and a later `get` takes `<id>@<version>`. Thus a citatio
 version reads the same text after the entry changed. The answer then has
 `current: false`. The read filter of the session must admit the entry as it is now, and
 must admit the version by its own frontmatter. The label of the session goes up to the
-higher of the two labels. A version of an erased entry is not served. A version that the
+higher of the two labels. A version of an erased entry is not served. No version of a
+demoted entry is served: the answer is `gone`, as for the id alone, and the archive
+keeps the entry for audit. A version that the
 session may not read gets the refusal of a version that the entry does not have:
 `<id> has no version <version>`. Thus the refusal does not confirm a guess of the text
 of that version.
@@ -2001,9 +2007,12 @@ keeps the choice in `choice`. A recall with neither value is as before, and has 
 The memory tool `export` takes `max_label` and an optional `domain`. It takes no path.
 The memory server writes the bundle under `state/exports/<session>/<domain>-<label>`.
 The answer has `kept_at`, the number of entries, the highest label in the bundle and the
-digest of the manifest. It has no id, title or summary of an entry, so the label of the
-session does not go up. A `max_label` above the handling of the session is refused. A
-second export of the same domain at the same label in one session replaces the first.
+digest of the manifest. It has no id, title or summary of an entry. The number and the
+digest are facts about the entries in the bundle. Thus the label of the session goes up
+to the highest label in the bundle, as after a search that returned those entries. An
+export to a destination obeys the same rule. A `max_label` above the handling of the
+session is refused. A second export of the same domain at the same label in one session
+replaces the first.
 
 The bundle holds only the entries that the session may read. Its read filter stays in
 force: the tiers, the reach of raw entries and the snapshot. Thus a session that reads
@@ -2011,7 +2020,8 @@ only curated entries gets no raw entry in its bundle.
 
 An erasure removes the kept bundles of the domain of the erased entry. It also removes
 the kept bundles of each domain that holds an entry that the erasure withholds. The
-served bundles of those domains go too.
+served bundles of those domains go too. The early erasure of a transcript does the
+same for the domain of the transcript: a bundle can hold an excerpt of the transcript.
 
 Two items are open:
 

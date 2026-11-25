@@ -2255,7 +2255,11 @@ mod tests {
         for e in &events {
             assert_eq!(e.session.as_deref(), Some(owner.session_id()));
         }
-        assert_eq!(owner.label(), Label::Public, "an export shows it nothing");
+        assert_eq!(
+            owner.label(),
+            Label::Restricted,
+            "the label rises to the highest label that the bundle carries"
+        );
     }
 
     fn task(title: &str, label: Label) -> dm_ledger::TaskSpec {
