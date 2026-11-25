@@ -918,6 +918,70 @@ mod tests {
         assert_eq!(l.get(&waiting).await.unwrap().status, Status::Blocked);
     }
 
+    /// The sweeps drop turns and sources from the record, and the lists read it: each
+    /// waits. The journals, the restore drill and the replay manifest answer: a restore
+    /// into another root takes the journals, the drill writes a scratch root only, and
+    /// the egress keeps a manifest for each model call.
+    #[tokio::test]
+    async fn the_sweeps_and_the_lists_wait_and_the_inputs_of_a_restore_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        let owner = init(dir.path());
+        owner.write(entry(EntryType::Fact, FACT)).await.unwrap();
+        let bundle = out.path().join("bundle");
+        owner.recovery_bundle(&bundle).await.unwrap();
+        owner.declare_outage("the ledger does not answer").unwrap();
+        let before = record(dir.path());
+        let now = OffsetDateTime::now_utc();
+        let answers = vec![
+            (
+                "sweep_transcripts",
+                owner.sweep_transcripts(now).await.map(|_| ()),
+            ),
+            ("sweep_sources", owner.sweep_sources(now).await.map(|_| ())),
+            ("transcripts", owner.transcripts().await.map(|_| ())),
+            ("sources", owner.sources().await.map(|_| ())),
+            ("kept_origins", owner.kept_origins().await.map(|_| ())),
+        ];
+        assert_eq!(did_not_wait(answers), Vec::<String>::new());
+        owner.erasure_journal().await.unwrap();
+        owner.transcript_journal().await.unwrap();
+        owner.refusal_journal().unwrap();
+        owner.replay_manifest().await.unwrap();
+        let drill = owner.drill(&bundle, &out.path().join("scratch")).await;
+        assert!(drill.unwrap().passed);
+        assert_eq!(record(dir.path()), before);
+    }
+
+    /// A line of the queue that does not say whether its session was served is the
+    /// line of a served session.
+    #[tokio::test]
+    async fn a_queued_handoff_that_does_not_say_is_of_a_served_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = crate::testing::held_out_root(dir.path());
+        let suite = "# A suite\n\nThe answer names the bird.\n";
+        let suite = crate::testing::written_in(&owner, "dom-held", suite, false).await;
+        let replace = WriteRequest {
+            domain: Some(DOMAIN.into()),
+            supersedes: Some(suite.clone()),
+            ..entry(EntryType::Handoff, HANDOFF)
+        };
+        let served = Memory::open(dir.path()).unwrap();
+        served.mark_served();
+        owner.declare_outage("the log does not answer").unwrap();
+        waits(served.write(replace).await);
+        let queue = dir.path().join(QUEUE_FILE);
+        let line = std::fs::read_to_string(&queue).unwrap();
+        let mut line: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        assert_eq!(line["served"], true);
+        line.as_object_mut().unwrap().remove("served");
+        std::fs::write(&queue, format!("{line}\n")).unwrap();
+        let done = owner.end_outage().await.unwrap();
+        assert_eq!(done.handoffs, Vec::<String>::new());
+        assert_eq!(done.failed.len(), 1, "{:?}", done.failed);
+        assert_eq!(owner.get(&suite).await.unwrap().front.status, None);
+    }
+
     #[tokio::test]
     async fn erase_export_and_a_bundle_wait_and_the_record_is_as_it_was() {
         let dir = tempfile::tempdir().unwrap();

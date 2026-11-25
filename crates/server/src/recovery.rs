@@ -18,13 +18,16 @@
 //! config/...                    the grants, the registry, the prices and the policy
 //! ```
 //!
-//! Four things are kept apart from every bundle, because a restore must not roll them
+//! Five things are kept apart from every bundle, because a restore must not roll them
 //! back:
 //!
 //! - **The grants.** The restore takes the grants in force now. The grants of the bundle
 //!   go to `restored-config/` for a person to read, and nothing loads them.
-//! - **The erasure journal.** The receipts of the erasures made after the bundle. The
-//!   restore erases each of those entries again before the root serves anything.
+//! - **The erasure journal.** The receipts of the erasures made after the bundle, of
+//!   entries and of transcripts. The restore erases each of those again before the root
+//!   serves anything.
+//! - **The drift windows.** The windows in force now. The restore adds them to those of
+//!   the bundle, so a window that was opened after the bundle holds in the restored root.
 //! - **The refusal journal.** The refusals of proposals to a personal domain, each as
 //!   the key of its origin. The restore removes each of those proposals that the bundle
 //!   holds, and the refusal record takes each key.
@@ -63,6 +66,11 @@ pub const RESTORED_CONFIG: &str = "restored-config";
 /// The file of a kept journal that holds the refusals of one domain, beside the receipts
 /// of that domain: one origin key on each line.
 const REFUSALS_FILE: &str = "refused.txt";
+/// The directory of a kept journal that holds the receipts of the transcripts of one
+/// domain, below the directory of that domain.
+const JOURNAL_TRANSCRIPTS: &str = "transcripts";
+/// The file of a kept journal that holds the drift windows.
+const JOURNAL_WINDOWS: &str = "drift-windows.jsonl";
 
 const QUARANTINE_DIR: &str = "state/quarantine";
 const LEDGER_EVENTS: &str = "ledger.jsonl";
@@ -254,14 +262,22 @@ fn number_in(file: &Path) -> u64 {
 }
 
 impl Memory {
+    /// The owner in person: a recovery bundle holds each granted domain, the held-out
+    /// one too, and the report of a drill names tasks and their holders. A harness
+    /// reaches a session that the memory server serves, so an agent may have asked.
     fn owner_makes(&self, what: &str) -> Result<(), Error> {
-        if self.author == self.grants.owner {
-            return Ok(());
+        if self.author != self.grants.owner {
+            return Err(Error::Denied(format!(
+                "only the owner {} may make {what}",
+                self.grants.owner
+            )));
         }
-        Err(Error::Denied(format!(
-            "only the owner {} may make {what}",
-            self.grants.owner
-        )))
+        if self.served() {
+            return Err(Error::Denied(format!(
+                "a session of the memory server does not make {what}: the owner makes it at the command line, or in `amem serve --person`"
+            )));
+        }
+        Ok(())
     }
 
     /// Make a recovery bundle of this root in `dest`. For each granted domain the log
@@ -404,11 +420,43 @@ impl Memory {
     /// [`Error::Denied`] for a session that is not the owner; a store error.
     pub async fn erasure_journal(&self) -> Result<Vec<Receipt>, Error> {
         self.owner_makes("a copy of the erasure journal")?;
+        // no check for an outage, here and in the other journals: a restore into
+        // another root takes them, and an outage is when the owner needs that restore.
+        // A receipt holds digests and no body
         let mut out = Vec::new();
         for domain in self.domains() {
             out.extend(self.store.receipts(&domain).await?);
         }
         Ok(out)
+    }
+
+    /// The receipt of each early erasure of a transcript in each granted domain: the
+    /// part of the erasure journal for transcripts ([`write_transcript_journal`]). A
+    /// restore takes it, and erases each of those transcripts again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a session that is not the owner in person; a store error.
+    pub async fn transcript_journal(&self) -> Result<Vec<Receipt>, Error> {
+        self.owner_makes("a copy of the erasure journal")?;
+        self.transcript_receipts().await
+    }
+
+    /// The text of the file of the drift windows of this root, when there is one
+    /// ([`write_windows`]). A restore takes it, so a window that was opened after a
+    /// bundle was made is in the restored root.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for a session that is not the owner in person; the file system.
+    pub fn drift_journal(&self) -> Result<Option<String>, Error> {
+        self.owner_makes("a copy of the drift windows")?;
+        let path = self.root.join(crate::drift_windows::FILE);
+        match std::fs::read_to_string(&path) {
+            Ok(text) => Ok(Some(text)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(io(&path)(e)),
+        }
     }
 
     /// The refusal journal of this root: each refusal of a proposal to a personal domain,
@@ -445,8 +493,12 @@ impl Memory {
     /// something; what [`restore`] returns for a bundle it refuses.
     pub async fn drill(&self, bundle: &Path, scratch: &Path) -> Result<Drill, Error> {
         self.owner_makes("a restore drill")?;
+        // no check for an outage: a drill reads a bundle and the journals, and writes a
+        // scratch root. In an outage the owner must know whether a bundle restores
         self.fresh()?;
         let journal = self.erasure_journal().await?;
+        let transcripts = self.transcript_journal().await?;
+        let windows = self.drift_journal()?;
         let refusals = self.refusal_journal()?;
         let grants_file = self.root.join(GRANTS_FILE);
         let grants = std::fs::read_to_string(&grants_file).map_err(io(&grants_file))?;
@@ -460,6 +512,8 @@ impl Memory {
             registry: registry.as_deref(),
             journal: &journal,
             refusals: &refusals,
+            transcripts: &transcripts,
+            drift_windows: windows.as_deref(),
             epoch_file: &epoch_file,
             file_ledger: true,
         };
@@ -509,7 +563,10 @@ pub fn write_journal(dir: &Path, receipts: &[Receipt]) -> Result<(), Error> {
 pub fn read_journal(dir: &Path) -> Result<Vec<Receipt>, Error> {
     let mut out = Vec::new();
     for below in files_below(dir)? {
-        if below.file_name().is_some_and(|n| n == REFUSALS_FILE) {
+        let name = below.file_name();
+        if name.is_some_and(|n| n == REFUSALS_FILE || n == JOURNAL_WINDOWS)
+            || of_a_transcript(&below)
+        {
             continue;
         }
         let path = dir.join(&below);
@@ -528,6 +585,106 @@ pub fn read_journal(dir: &Path) -> Result<Vec<Receipt>, Error> {
         out.push(receipt);
     }
     Ok(out)
+}
+
+/// Whether a file of a kept journal is the receipt of a transcript:
+/// `<domain>/transcripts/<session>.yaml`.
+fn of_a_transcript(below: &Path) -> bool {
+    let dir = below.parent().and_then(Path::file_name);
+    below.components().count() == 3 && dir.is_some_and(|d| d == JOURNAL_TRANSCRIPTS)
+}
+
+/// Where a kept journal holds the receipt of a transcript, below its directory.
+fn transcript_place(r: &Receipt) -> Result<PathBuf, Error> {
+    Ok(Path::new(valid_name(&r.domain)?)
+        .join(JOURNAL_TRANSCRIPTS)
+        .join(format!("{}.yaml", valid_name(&r.id)?)))
+}
+
+/// Keep the receipts of the early erasures of transcripts in `dir`, beside the
+/// receipts that [`write_journal`] keeps: `<dir>/<domain>/transcripts/<session>.yaml`.
+///
+/// # Errors
+///
+/// [`Error::Denied`] for a receipt whose domain or id is not a name; the file system.
+pub fn write_transcript_journal(dir: &Path, receipts: &[Receipt]) -> Result<(), Error> {
+    for r in receipts {
+        write_file(&dir.join(transcript_place(r)?), r.to_yaml().as_bytes())?;
+    }
+    Ok(())
+}
+
+/// Read the receipts that [`write_transcript_journal`] kept. A directory that is not
+/// there holds none.
+///
+/// # Errors
+///
+/// [`Error::Denied`] for a file whose place does not fit the receipt it holds, or a
+/// symbolic link; a receipt that does not parse; the file system.
+pub fn read_transcript_journal(dir: &Path) -> Result<Vec<Receipt>, Error> {
+    let mut out = Vec::new();
+    for below in files_below(dir)? {
+        if !of_a_transcript(&below) {
+            continue;
+        }
+        let path = dir.join(&below);
+        let text = std::fs::read_to_string(&path).map_err(io(&path))?;
+        let receipt = Receipt::from_yaml(&text)?;
+        if transcript_place(&receipt)? != below {
+            return Err(Error::Denied(format!(
+                "the erasure journal: {} holds the receipt of the transcript {} in {}",
+                path.display(),
+                receipt.id,
+                receipt.domain
+            )));
+        }
+        out.push(receipt);
+    }
+    Ok(out)
+}
+
+/// Keep the text of the drift windows in `dir`, beside the receipts, as
+/// `<dir>/drift-windows.jsonl`. With no text, nothing is written.
+///
+/// # Errors
+///
+/// The file system.
+pub fn write_windows(dir: &Path, text: Option<&str>) -> Result<(), Error> {
+    match text {
+        Some(text) => write_file(&dir.join(JOURNAL_WINDOWS), text.as_bytes()),
+        None => Ok(()),
+    }
+}
+
+/// Read the text that [`write_windows`] kept, when it is there.
+///
+/// # Errors
+///
+/// The file system.
+pub fn read_windows(dir: &Path) -> Result<Option<String>, Error> {
+    let path = dir.join(JOURNAL_WINDOWS);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => Ok(Some(text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(io(&path)(e)),
+    }
+}
+
+/// The lines of the drift windows of a bundle, and after them each line of the windows
+/// in force now that the bundle does not hold. The file is a list of events, and a root
+/// only adds to it, so the windows in force now begin with those of an earlier bundle.
+fn windows_together(of_bundle: &str, now: &str) -> String {
+    let mut lines: Vec<&str> = of_bundle.lines().collect();
+    for line in now.lines() {
+        if !lines.contains(&line) {
+            lines.push(line);
+        }
+    }
+    let mut text = lines.join("\n");
+    if !text.is_empty() {
+        text.push('\n');
+    }
+    text
 }
 
 /// One refusal of a proposal to a personal domain.
@@ -661,6 +818,12 @@ pub struct Authority<'a> {
     pub journal: &'a [Receipt],
     /// The refusal journal: each refusal of a proposal that the restored root must hold.
     pub refusals: &'a [Refusal],
+    /// The receipt of each early erasure of a transcript that the restored root must
+    /// hold.
+    pub transcripts: &'a [Receipt],
+    /// The text of the file of the drift windows in force now, when there is one. The
+    /// restored root holds each window of the bundle and each window of this text.
+    pub drift_windows: Option<&'a str>,
     /// The claim epoch file ([`next_epoch`]).
     pub epoch_file: &'a Path,
     /// Whether the restored root keeps its ledger in the file under the root, whatever
@@ -681,6 +844,9 @@ pub struct Restored {
     /// The entries of the journal that the restored record does not hold with a body
     /// and had no receipt for: the receipt is beside the record now.
     pub receipts_kept: Vec<String>,
+    /// The transcripts that the bundle held with turns and the journal says are erased:
+    /// each was erased again.
+    pub transcripts_erased: Vec<String>,
     /// The proposals that the bundle held and the refusal journal says are refused: each
     /// was removed.
     pub proposals_refused: Vec<String>,
@@ -697,13 +863,15 @@ pub struct Restored {
 ///    bundle that fails writes nothing into `into`.
 /// 2. `into` gets the marker [`RESTORING`], then the record, the logs, the quarantine,
 ///    the refusal records and the drift windows of the bundle, and the grants and the
-///    registry of `authority`.
+///    registry of `authority`. The drift windows of `authority` are added to those of
+///    the bundle.
 ///    The configuration of the bundle goes to [`RESTORED_CONFIG`].
 /// 3. The ledger takes its events, each with its sequence number.
 /// 4. The claim epoch file gives the next epoch, and the ledger begins it.
 /// 5. Each entry of the erasure journal that the record holds with a body is erased as a
 ///    live erasure does it. For an entry that the record does not hold, the receipt is
-///    put beside the record, so an import of that text is refused.
+///    put beside the record, so an import of that text is refused. Each transcript of
+///    the journal that the record holds with turns is erased again in the same way.
 /// 6. Each refusal of the refusal journal goes into the refusal record of its domain. A
 ///    proposal that the bundle holds with the key of a refusal is removed, and its task
 ///    is invalidated.
@@ -729,11 +897,12 @@ pub async fn restore(
         )));
     }
     empty_or_absent(into, "the directory to restore into")?;
-    lay_out(bundle, into, &manifest, &grants, authority.registry)?;
+    lay_out(bundle, into, &manifest, &grants, authority)?;
     let memory = Memory::open_unchecked(into)?;
     let ledger_events = restore_ledger(&memory, bundle, &manifest).await?;
     let (epoch, reopened) = begin_next_epoch(&memory, authority, &manifest).await?;
     let (erased, receipts_kept) = apply_journal(&memory, authority.journal).await?;
+    let transcripts_erased = apply_transcript_journal(&memory, authority.transcripts).await?;
     let proposals_refused = apply_refusals(&memory, authority.refusals).await?;
     let (entries, _) = memory.reindex().await?;
     let marker = into.join(RESTORING);
@@ -743,6 +912,7 @@ pub async fn restore(
         reopened,
         erased,
         receipts_kept,
+        transcripts_erased,
         proposals_refused,
         entries,
         ledger_events,
@@ -825,8 +995,9 @@ fn lay_out(
     into: &Path,
     manifest: &RecoveryManifest,
     grants: &str,
-    registry: Option<&str>,
+    authority: &Authority<'_>,
 ) -> Result<(), Error> {
+    let registry = authority.registry;
     write_file(
         &into.join(RESTORING),
         b"A restore of this root began and did not finish.\n",
@@ -841,6 +1012,11 @@ fn lay_out(
     write_file(&into.join(GRANTS_FILE), grants.as_bytes())?;
     if let Some(registry) = registry {
         write_file(&into.join(REGISTRY_FILE), registry.as_bytes())?;
+    }
+    if let Some(now) = authority.drift_windows {
+        let path = into.join(crate::drift_windows::FILE);
+        let of_bundle = std::fs::read_to_string(&path).unwrap_or_default();
+        write_file(&path, windows_together(&of_bundle, now).as_bytes())?;
     }
     Ok(())
 }
@@ -918,6 +1094,23 @@ async fn apply_journal(
         }
     }
     Ok((erased, kept))
+}
+
+/// The part of step 5 of [`restore`] for transcripts. Returns the transcripts erased
+/// again.
+async fn apply_transcript_journal(
+    memory: &Memory,
+    journal: &[Receipt],
+) -> Result<Vec<String>, Error> {
+    let mut erased = Vec::new();
+    for receipt in journal {
+        valid_name(&receipt.domain)?;
+        valid_name(&receipt.id)?;
+        if memory.erase_transcript_again(receipt).await? {
+            erased.push(receipt.id.clone());
+        }
+    }
+    Ok(erased)
 }
 
 /// Step 6 of [`restore`]. Returns the proposals removed.
@@ -1433,6 +1626,34 @@ mod tests {
                 registry: None,
                 journal,
                 refusals: &[],
+                transcripts: &[],
+                drift_windows: None,
+                epoch_file: &epoch_file,
+                file_ledger: false,
+            };
+            restore(&self.at(from), &self.at(into), &authority)
+                .await
+                .unwrap()
+        }
+
+        /// As [`Site::restore`], with the receipts of transcripts and the drift windows
+        /// of the live root.
+        async fn restore_with(
+            &self,
+            from: &str,
+            into: &str,
+            transcripts: &[Receipt],
+            windows: Option<&str>,
+        ) -> Restored {
+            let grants = self.grants();
+            let epoch_file = self.at("claim-epoch");
+            let authority = Authority {
+                grants: &grants,
+                registry: None,
+                journal: &[],
+                refusals: &[],
+                transcripts,
+                drift_windows: windows,
                 epoch_file: &epoch_file,
                 file_ledger: false,
             };
@@ -1450,6 +1671,8 @@ mod tests {
                 registry: None,
                 journal: &[],
                 refusals: &[],
+                transcripts: &[],
+                drift_windows: None,
                 epoch_file: &epoch_file,
                 file_ledger: false,
             };
@@ -1546,6 +1769,129 @@ mod tests {
         assert_eq!(m.drift_windows().unwrap(), windows);
         let entry = m.get(&inside).await.unwrap();
         assert_eq!(held(&m, &entry).as_ref(), Some(&windows[0]));
+    }
+
+    /// A window that was opened after the bundle was made, from a time before it,
+    /// holds an entry of the bundle. The restore and the drill take the windows in
+    /// force, so the restored root holds that entry from promotion.
+    #[tokio::test]
+    async fn a_window_opened_after_the_bundle_holds_in_the_restored_root() {
+        let site = Site::new();
+        let worker = Memory::open(&site.root()).unwrap().with_author(WORKER);
+        let from = OffsetDateTime::now_utc() - Duration::minutes(1);
+        let earlier = from - Duration::hours(2);
+        let closed = from - Duration::hours(1);
+        let open = |model, from| {
+            site.m
+                .open_drift_window("gateway", model, from, &[], "moved")
+        };
+        open("model-0", earlier).unwrap();
+        site.m
+            .close_drift_window("gateway", "model-0", closed, "a new baseline")
+            .unwrap();
+        let inside = worker.write(req("# Port\n\nIt listens on 8080.\n")).await;
+        let inside = inside.unwrap().id;
+        site.bundle("bundle").await;
+        let late = open("model-1", from).unwrap();
+        let live = site.m.drift_windows().unwrap();
+        assert_eq!(live.len(), 2);
+        let windows = site.m.drift_journal().unwrap();
+        write_windows(&site.at("journal"), windows.as_deref()).unwrap();
+        assert_eq!(read_journal(&site.at("journal")).unwrap(), Vec::new());
+        let windows = read_windows(&site.at("journal")).unwrap();
+        site.restore_with("bundle", "restored", &[], windows.as_deref())
+            .await;
+        let m = Memory::open(&site.at("restored")).unwrap();
+        assert_eq!(m.drift_windows().unwrap(), live);
+        let entry = m.get(&inside).await.unwrap();
+        assert_eq!(m.frozen_by(&entry).unwrap(), Some(late));
+        // the drill takes the windows of its own root
+        let drill = site.m.drill(&site.at("bundle"), &site.at("scratch")).await;
+        drill.unwrap();
+        let scratch = Memory::open(&site.at("scratch")).unwrap();
+        assert_eq!(scratch.drift_windows().unwrap(), live);
+    }
+
+    /// Each file below `dir` whose bytes hold `word`.
+    fn holding(dir: &Path, word: &str) -> Vec<PathBuf> {
+        let found = files_below(dir).unwrap().into_iter().filter(|below| {
+            let bytes = std::fs::read(dir.join(below)).unwrap();
+            bytes.windows(word.len()).any(|w| w == word.as_bytes())
+        });
+        found.collect()
+    }
+
+    fn zanzibar() -> crate::transcripts::Keep {
+        crate::transcripts::Keep {
+            domain: None,
+            harness: "claude".into(),
+            origin: "a.jsonl".into(),
+            raw: "{\"type\":\"user\",\"message\":{\"content\":\"The word is zanzibar.\"}}\n".into(),
+            turns: vec![("user".into(), "The word is zanzibar.".into())],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_transcript_erased_after_the_bundle_is_erased_in_the_restored_root() {
+        use crate::transcripts::State;
+        let site = Site::new();
+        let kept = site.m.keep_transcript(zanzibar()).await.unwrap();
+        site.bundle("bundle").await;
+        assert!(!holding(&site.at("bundle"), "zanzibar").is_empty());
+        site.m
+            .erase_transcript(&kept.session, Reason::Sensitive)
+            .await
+            .unwrap();
+        // the journal as a person keeps it: the receipt of a transcript is no receipt
+        // of an entry
+        let journal = site.m.transcript_journal().await.unwrap();
+        assert_eq!(journal.len(), 1);
+        assert_eq!(site.m.erasure_journal().await.unwrap(), Vec::new());
+        write_transcript_journal(&site.at("journal"), &journal).unwrap();
+        assert_eq!(read_journal(&site.at("journal")).unwrap(), Vec::new());
+        let journal = read_transcript_journal(&site.at("journal")).unwrap();
+        let restored = site
+            .restore_with("bundle", "restored", &journal, None)
+            .await;
+        assert_eq!(
+            restored.transcripts_erased,
+            std::slice::from_ref(&kept.session)
+        );
+        let record = site.at("restored").join("record");
+        assert_eq!(holding(&record, "zanzibar"), Vec::<PathBuf>::new());
+        let m = Memory::open(&site.at("restored")).unwrap();
+        let stub = &m.transcripts().await.unwrap()[0];
+        assert_eq!(
+            (stub.session.as_str(), stub.state),
+            (kept.session.as_str(), State::Erased)
+        );
+        let receipt = m.transcript_erasure(&kept.session).await.unwrap().unwrap();
+        assert_eq!(receipt.reason, Reason::Sensitive);
+        // the drill takes the receipts of its own root
+        let drill = site.m.drill(&site.at("bundle"), &site.at("scratch")).await;
+        drill.unwrap();
+        let scratch = site.at("scratch").join("record");
+        assert_eq!(holding(&scratch, "zanzibar"), Vec::<PathBuf>::new());
+    }
+
+    /// A harness reaches a session of the owner that the memory server serves, so an
+    /// agent may have asked: such a session makes no bundle, runs no drill and reads no
+    /// journal.
+    #[tokio::test]
+    async fn a_served_session_of_the_owner_makes_no_bundle_and_runs_no_drill() {
+        let site = Site::new();
+        site.bundle("bundle").await;
+        let served = Memory::open(&site.root()).unwrap();
+        served.mark_served();
+        let bundle = served.recovery_bundle(&site.at("served-bundle")).await;
+        assert!(matches!(bundle, Err(Error::Denied(_))));
+        assert!(!site.at("served-bundle").exists());
+        let drill = served.drill(&site.at("bundle"), &site.at("scratch")).await;
+        assert!(matches!(drill, Err(Error::Denied(_))));
+        assert!(!site.at("scratch").exists());
+        assert!(!site.root().join(EPOCH_FILE).exists());
+        assert!(served.erasure_journal().await.is_err());
+        assert!(served.transcript_journal().await.is_err());
     }
 
     #[tokio::test]
@@ -1687,6 +2033,8 @@ mod tests {
             registry: None,
             journal: &journal,
             refusals: &[],
+            transcripts: &[],
+            drift_windows: None,
             epoch_file: &epoch_file,
             file_ledger: false,
         };
@@ -1724,6 +2072,8 @@ mod tests {
             registry: None,
             journal: &[],
             refusals: &[],
+            transcripts: &[],
+            drift_windows: None,
             epoch_file: &epoch_file,
             file_ledger: true,
         };
@@ -2132,6 +2482,8 @@ mod tests {
             registry: Some(&registry),
             journal: &[],
             refusals: &refusals,
+            transcripts: &[],
+            drift_windows: None,
             epoch_file: &epoch_file,
             file_ledger: false,
         };

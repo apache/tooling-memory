@@ -436,8 +436,8 @@ two weeks. It is also the reason that none of it is the production shape.
   - The restore drill always reports one of the five cases as absent: the cross-domain
     dependency. For the uncertain external action, the drill checks only that the
     restored ledger holds the task back. No connector reconciles the action.
-  - A recovery bundle holds the drift windows as they were when it was made. A restore
-    does not take a drift window that was opened later.
+  - A restore takes the drift windows that are in force from the kept journal. A restore
+    without that journal has only the drift windows of the bundle.
   - Only the ledger refuses a claim of an earlier claim epoch. No tap and no outside
     tracker reads a generation.
   - The record is not encrypted. Thus there is no key for erased content to keep apart
@@ -447,9 +447,11 @@ two weeks. It is also the reason that none of it is the production shape.
     restore. The same command copies the refusal journal.
   - An erasure does not change a recovery bundle under the root. The receipt names each
     such bundle that holds the body, and a person deletes it.
-  - The erasure journal holds the receipts of entries only. A restore brings back a
-    transcript that was erased after the bundle was made, and the receipt of that erasure
-    names no recovery bundle.
+  - The receipt of the early erasure of a transcript names no recovery bundle under the
+    root that holds the transcript. A restore of such a bundle erases the transcript
+    again only when it gets the erasure journal.
+  - A session that a harness reaches makes no recovery bundle and runs no restore drill,
+    whatever its author. The owner uses the command line or `amem serve --person`.
   - The restore drill of a root with a PostgreSQL ledger is refused when two domains
     hold an event with the same number. The drill restores into a file ledger.
   - A recovery bundle that is made in the middle of a write can hold an event of the log

@@ -429,6 +429,8 @@ impl Memory {
     ///
     /// A store error, or a header that does not parse.
     pub async fn kept_origins(&self) -> Result<Vec<String>, Error> {
+        // a read of the record: it waits, and the launcher leaves the files in the home
+        self.serving()?;
         let mut out = Vec::new();
         for domain in self.domains() {
             for t in self.transcripts_in(&domain).await? {
@@ -564,6 +566,7 @@ impl Memory {
     ///
     /// A store error, or a header that does not parse.
     pub async fn transcripts(&self) -> Result<Vec<Transcript>, Error> {
+        self.serving()?;
         let mut out = Vec::new();
         for domain in self.domains() {
             for mut t in self.transcripts_in(&domain).await? {
@@ -770,6 +773,8 @@ impl Memory {
     ///
     /// A store error, or a header that does not parse.
     pub async fn sweep_transcripts(&self, now: OffsetDateTime) -> Result<Vec<Swept>, Error> {
+        // a sweep drops turns from the record: it waits in an outage
+        self.serving()?;
         let mut everything = ReadFilter::for_domains(self.domains(), Label::Restricted);
         everything.include_inactive = false;
         let mut citations = self.citations(&everything).await?;
@@ -983,6 +988,63 @@ impl Memory {
             )
             .await?;
         Ok(())
+    }
+
+    /// The receipt of each early erasure of a transcript in the granted domains.
+    pub(crate) async fn transcript_receipts(&self) -> Result<Vec<Receipt>, Error> {
+        let mut out = Vec::new();
+        for domain in self.domains() {
+            let names = self.store.objects(&domain, Area::Transcripts, &[], false);
+            for name in names.await? {
+                if !name.ends_with(".receipt.yaml") {
+                    continue;
+                }
+                let part = [name.as_str()];
+                let text = self.store.get_object(&domain, Area::Transcripts, &part);
+                if let Some(text) = text.await? {
+                    out.push(Receipt::from_yaml(&text)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Erase a transcript again in a root that a restore made, for a receipt of the
+    /// journal. A transcript that the record holds with turns, whole or swept, is erased:
+    /// in a granted domain as [`Memory::erase_transcript`] does it, with the reason of
+    /// the journal. In a domain that the grants in force do not hold, no session reads
+    /// it, and the erasure is of the record alone: the lines of the harness and the
+    /// excerpts go, and the stub and the receipt of the journal stay. For a transcript
+    /// that the record does not hold with turns, the receipt is kept when none is
+    /// there. Returns whether the transcript was erased now.
+    pub(crate) async fn erase_transcript_again(&self, receipt: &Receipt) -> Result<bool, Error> {
+        let (domain, session) = (receipt.domain.as_str(), receipt.id.as_str());
+        let held = self.read_header(domain, session).await?;
+        let Some(mut t) = held.filter(|t| t.state != State::Erased) else {
+            let kept = self
+                .store
+                .get_object(domain, Area::Transcripts, &[&receipt_name(session)])
+                .await?;
+            if kept.is_none() {
+                self.put_transcript_receipt(receipt).await?;
+            }
+            return Ok(false);
+        };
+        if self.grants.domains.contains_key(domain) {
+            self.erase_transcript(session, receipt.reason).await?;
+            return Ok(true);
+        }
+        self.store
+            .remove_object(domain, Area::Transcripts, &[&raw_name(session)])
+            .await?;
+        t.state = State::Erased;
+        t.ended_at = Some(receipt.erased_at);
+        t.turns.clear();
+        t.excerpts.clear();
+        self.put_transcript(&t, None).await?;
+        self.remove_session_excerpts(session).await?;
+        self.put_transcript_receipt(receipt).await?;
+        Ok(true)
     }
 
     /// The receipt of a transcript's early erasure, if it was erased.

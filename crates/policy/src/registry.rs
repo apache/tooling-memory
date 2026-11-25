@@ -285,8 +285,30 @@ impl Registry {
                 identity::parse(id)
                     .map_err(|e| Error::Registry(format!("[[assertions]] {word} = {id:?}: {e}")))?;
             }
+            self.ends(a)?;
         }
         Ok(())
+    }
+
+    /// Refuse an assertion whose chain comes back to an identifier that it passed. In a
+    /// cycle no identifier is the one that names the person now, so two identifiers of
+    /// the cycle would not be one person.
+    fn ends(&self, first: &Assertion) -> Result<(), Error> {
+        let mut seen = vec![first.was.as_str()];
+        let mut now = first.is.as_str();
+        loop {
+            if seen.contains(&now) {
+                return Err(Error::Registry(format!(
+                    "[[assertions]] was = {:?}: the assertions come back to {now:?}, so none of them names the person now",
+                    first.was
+                )));
+            }
+            seen.push(now);
+            match self.assertions.iter().find(|a| a.was == now) {
+                Some(next) => now = next.is.as_str(),
+                None => return Ok(()),
+            }
+        }
     }
 
     /// Read and parse the file. A root with no registry file has no registry.
@@ -580,6 +602,21 @@ since = 2026-11-01
         refused(&row("human:a:o", "human:b:o", "\"2026-02-30\""));
         // the form on disk today is a person: an assertion carries it to the dated form
         Registry::parse(&row("human:a:o", "human:a,2026-01-01:o", "2026-01-01")).unwrap();
+    }
+
+    #[test]
+    fn assertions_that_form_a_cycle_are_refused() {
+        let row = |was: &str, is: &str| {
+            format!("[[assertions]]\nwas = \"{was}\"\nis = \"{is}\"\nsince = 2026-01-01\n")
+        };
+        let (a, b, c) = ("human:a:o", "human:b:o", "human:c:o");
+        let why = refused(&(row(a, b) + &row(b, a)));
+        assert!(why.contains("come back to"), "{why}");
+        refused(&row(a, a));
+        refused(&(row(a, b) + &row(b, c) + &row(c, b)));
+        // a chain that ends is taken, and each identifier of it names one person
+        let chain = Registry::parse(&(row(a, b) + &row(b, c))).unwrap();
+        assert!(chain.same_person(a, c) && chain.same_person(b, c));
     }
 
     #[test]

@@ -205,15 +205,25 @@ async fn restore(
         |path: &Path| std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()));
     let grants = read(grants)?;
     let registry = registry.map(read).transpose()?;
+    let journal_dir = journal;
     let (journal, refusals) = match journal {
         Some(dir) => (recovery::read_journal(dir)?, recovery::read_refusals(dir)?),
         None => (Vec::new(), Vec::new()),
+    };
+    let (transcripts, windows) = match journal_dir {
+        Some(dir) => (
+            recovery::read_transcript_journal(dir)?,
+            recovery::read_windows(dir)?,
+        ),
+        None => (Vec::new(), None),
     };
     let authority = Authority {
         grants: &grants,
         registry: registry.as_deref(),
         journal: &journal,
         refusals: &refusals,
+        transcripts: &transcripts,
+        drift_windows: windows.as_deref(),
         epoch_file: epoch_authority,
         file_ledger: false,
     };
@@ -235,13 +245,19 @@ pub async fn recover(root: &Path, op: RecoverOp) -> Fallible {
         RecoverOp::Journal { dest } => {
             let m = Memory::open(root)?;
             let receipts = m.erasure_journal().await?;
+            let transcripts = m.transcript_journal().await?;
             let refusals = m.refusal_journal()?;
+            let windows = m.drift_journal()?;
             recovery::write_journal(&dest, &receipts)?;
+            recovery::write_transcript_journal(&dest, &transcripts)?;
             recovery::write_refusals(&dest, &refusals)?;
+            recovery::write_windows(&dest, windows.as_deref())?;
             crate::json(&json!({
                 "journal": dest,
                 "receipts": receipts.len(),
+                "transcripts": transcripts.len(),
                 "refusals": refusals.len(),
+                "drift_windows": windows.is_some(),
             }))
         }
         RecoverOp::Drill { bundle, scratch } => {

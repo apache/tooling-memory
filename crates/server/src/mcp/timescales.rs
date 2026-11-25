@@ -118,7 +118,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "For the owner; refused to any other author. Make a recovery bundle of this root in a new directory under `state/recovery/`: the record, the logs with their cursors, the events of the ledger, the writes held in quarantine, the drift windows and the configuration, with a digest for each file. Returns the `name` of the bundle, its path relative to the root, and the counts of the manifest. Copy the bundle off this machine yourself: no tool sends it."
+        description = "For the owner, in a session that a person started with `amem serve --person`; refused to any other author and in every session that a harness reaches. Make a recovery bundle of this root in a new directory under `state/recovery/`: the record, the logs with their cursors, the events of the ledger, the writes held in quarantine, the drift windows and the configuration, with a digest for each file. Returns the `name` of the bundle, its path relative to the root, and the counts of the manifest. Copy the bundle off this machine yourself: no tool sends it."
     )]
     async fn recovery_bundle(&self, _p: Parameters<NoParams>) -> Result<CallToolResult, McpError> {
         let made = self.memory.recovery_bundle_here().await.map_err(mcp_err)?;
@@ -126,7 +126,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "For the owner; refused to any other author. Run a restore drill on a bundle under `state/recovery/`, named by `bundle`: the bundle is restored into a scratch root under `state/recovery/`, and each of five cases is reported as `recovered`, `absent` or `failed`. A case is `recovered` only when the bundle held it. The record and the ledger of this root are not written: only the claim epoch file moves."
+        description = "For the owner, in a session that a person started with `amem serve --person`; refused to any other author and in every session that a harness reaches. Run a restore drill on a bundle under `state/recovery/`, named by `bundle`: the bundle is restored into a scratch root under `state/recovery/`, and each of five cases is reported as `recovered`, `absent` or `failed`. A case is `recovered` only when the bundle held it. The record and the ledger of this root are not written: only the claim epoch file moves."
     )]
     async fn recovery_drill(&self, p: Parameters<DrillParams>) -> Result<CallToolResult, McpError> {
         let run = self
@@ -342,7 +342,10 @@ mod tests {
         assert_eq!(during["t0_loaded"], json!(["dom-me"]));
         assert_eq!(during["confirmed_lease"], Value::Null);
         // a change waits, in the words of the library
-        let waits = owner.recovery_bundle(NONE()).await.unwrap_err();
+        let waits = person_of(dir.path())
+            .recovery_bundle(NONE())
+            .await
+            .unwrap_err();
         refused_with(&waits, "an outage is declared");
     }
 
@@ -373,7 +376,13 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_bundle_stays_under_the_root_and_is_refused_to_an_agent() {
-        let (dir, owner) = root_with(None);
+        let (dir, served) = root_with(None);
+        // a harness reaches the session of the owner that the memory server serves, so
+        // an agent may have asked: that session makes no bundle of every domain
+        let refused = served.recovery_bundle(NONE()).await.unwrap_err();
+        refused_with(&refused, "a session of the memory server does not make");
+        assert!(!dir.path().join("state/recovery").exists());
+        let owner = person_of(dir.path());
         let made = payload(&owner.recovery_bundle(NONE()).await.unwrap());
         let name = made["name"].as_str().unwrap();
         assert_eq!(made["bundle"], format!("state/recovery/{name}"));
@@ -391,9 +400,14 @@ mod tests {
 
     #[tokio::test]
     async fn recovery_drill_takes_a_name_and_reports_the_cases_of_the_library() {
-        let (dir, owner) = root_with(None);
+        let (dir, served) = root_with(None);
+        let owner = person_of(dir.path());
         let made = payload(&owner.recovery_bundle(NONE()).await.unwrap());
         let name = made["name"].as_str().unwrap();
+        // the report of a drill names tasks and their holders: a served session gets none
+        let refused = served.recovery_drill(drill(name)).await.unwrap_err();
+        refused_with(&refused, "a session of the memory server does not make");
+        assert!(!dir.path().join("claim-epoch").exists());
         let run = payload(&owner.recovery_drill(drill(name)).await.unwrap());
         assert_eq!(run["bundle"], made["bundle"]);
         assert_eq!(run["passed"], true);

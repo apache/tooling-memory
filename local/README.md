@@ -1270,9 +1270,9 @@ that hold a root.
 | `amem proposal list` | `proposals` | Lists the proposals to personal domains. Only the owner |
 | `amem proposal admit <id>`, `refuse <id>` | `answer_proposal` | Admits or refuses a proposal. Only the owner, at the command line or in `amem serve --person`. The memory tool is refused in a session that a harness reaches |
 | `amem proposal expire [--today D]` | none | Removes each proposal that waited longer than `proposal_days` |
-| `amem recover bundle <dest>` | `recovery_bundle` | Makes a recovery bundle. The memory tool makes it under `state/recovery/` |
-| `amem recover journal <dest>` | none | Copies the erasure journal and the refusal journal to a directory |
-| `amem recover drill <bundle> [--scratch DIR]` | `recovery_drill` | Runs a restore drill. The memory tool takes the name of a bundle under `state/recovery/` |
+| `amem recover bundle <dest>` | `recovery_bundle` | Makes a recovery bundle. The memory tool makes it under `state/recovery/`. The memory tool is refused in a session that a harness reaches |
+| `amem recover journal <dest>` | none | Copies the erasure journal, the refusal journal and the drift windows to a directory |
+| `amem recover drill <bundle> [--scratch DIR]` | `recovery_drill` | Runs a restore drill. The memory tool takes the name of a bundle under `state/recovery/`. The memory tool is refused in a session that a harness reaches |
 | `amem --root <new root> recover restore <bundle> --grants F --epoch-authority F [--registry F] [--journal DIR]` | none | Restores a recovery bundle into a new root |
 | `amem outage status` | `outage_status` | Gives the declared outage |
 | `amem outage declare --reason TEXT`, `amem outage end` | none | Declares an outage, and ends it. Only the owner |
@@ -1356,11 +1356,13 @@ and no text. An expired proposal keeps nothing, so the author can offer it again
 
 A copy of the record alone loses the tasks that were not finished. A recovery bundle
 holds the record, the event logs with their cursors, the events of the ledger, the
-quarantine, the drift windows and the configuration. It does not hold the index. Keep four things apart
+quarantine, the drift windows and the configuration. It does not hold the index. Keep five things apart
 from each bundle, because a restore must not roll them back:
 
 - the grants that are in force now
-- the erasure journal: the receipts of the erasures
+- the erasure journal: the receipts of the erasures, of entries and of transcripts
+- the drift windows that are in force now. `amem recover journal` puts them in the same
+  directory as the erasure journal
 - the refusal journal: the key of each refused proposal to a personal domain. `amem
   recover journal` puts it in the same directory as the erasure journal
 - the claim epoch file, `<root>/claim-epoch` by default
@@ -1413,7 +1415,8 @@ amem --root /srv/memory-new recover restore /backup/2026-11-25 \
 
 The restore begins the next claim epoch on the ledger. Thus each task that was claimed
 is open again, and the ledger refuses each claim from before the restore. The restore
-then erases each entry that the erasure journal names. It removes each proposal that
+then erases each entry and each transcript that the erasure journal names. It adds the
+drift windows of the journal to those of the bundle. It removes each proposal that
 the refusal journal names, and the refusal record takes each key. The grants of the bundle go to
 `restored-config/`, and nothing loads them. While a restore runs, the root holds
 `state/restoring`, and `amem` refuses to open it.
@@ -1437,6 +1440,10 @@ wait:
   confirmed.
 - A write of a handoff goes on a queue, `state/outage/queue.jsonl`.
 - A heartbeat goes on the same queue. It confirms no lease.
+
+The owner can also copy the journals (`amem recover journal`) and run a restore drill in
+an outage. A restore into another root takes the journals, and the drill writes only a
+scratch root and the claim epoch file.
 
 `amem outage end` replays the queue in order. A handoff goes through the ordinary write
 as its author, so the policy screens it. A heartbeat goes to the ledger, and the clock of

@@ -508,6 +508,7 @@ impl Memory {
         if self.author != self.grants.owner {
             return Err(Error::Denied("sources are listed by the owner".into()));
         }
+        self.serving()?;
         let mut out = Vec::new();
         for domain in self.domains() {
             for name in self
@@ -582,6 +583,8 @@ impl Memory {
     ///
     /// A store error.
     pub async fn sweep_sources(&self, now: OffsetDateTime) -> Result<Vec<String>, Error> {
+        // a sweep drops sources from the record: it waits in an outage
+        self.serving()?;
         let mut cited = std::collections::BTreeSet::new();
         for domain in self.domains() {
             for id in self.store.list(&domain).await? {
