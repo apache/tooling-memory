@@ -706,6 +706,8 @@ impl Memory {
                 entry_type: from.entry_type,
                 domain: at.domain.to_string(),
                 author: from.author.clone(),
+                // the person who answers for the source answers for its copy
+                owner: from.owner.clone(),
                 created: from.created,
                 cites: vec![at.cites.clone()],
                 // only a write gives an entry its session: the text of a copy follows
@@ -1723,6 +1725,28 @@ mod tests {
         assert_ne!(second, copy, "a new version has a new copy");
         assert_eq!(reach_of(&m, &second).await, (Reach::Fleet, None));
         assert!(reader.get(&second).await.unwrap().body.contains("4417"));
+    }
+
+    /// The person who answers for the source answers for its copy. A source that names
+    /// no owner gives a copy that names none.
+    #[tokio::test]
+    async fn the_copy_names_the_owner_of_its_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let m = owner(dir.path());
+        let writer = session(dir.path(), "agent:writer");
+        let owned = WriteRequest {
+            body: DOOR.into(),
+            classification: Some(Label::Restricted),
+            owner: Some("human:test:alice".into()),
+            ..WriteRequest::default()
+        };
+        let owned = writer.write(owned).await.unwrap().id;
+        let (copy, _) = landed(m.declassify(&owned, Label::Internal, WHY).await);
+        let front = stored(&m, &copy).await.front;
+        assert_eq!(front.owner.as_deref(), Some("human:test:alice"));
+        let bare = restricted(&writer, "The gate code is 2290.").await;
+        let (copy, _) = landed(m.declassify(&bare, Label::Internal, WHY).await);
+        assert_eq!(stored(&m, &copy).await.front.owner, None);
     }
 
     #[tokio::test]

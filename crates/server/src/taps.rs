@@ -266,7 +266,7 @@ mod tests {
             .into_iter()
             .filter(|e| e.session.as_deref() == Some(tap.session_id()))
             .filter_map(|e| match e.change {
-                crate::log::Change::Read { ids } => Some(ids),
+                crate::log::Change::Read { ids, .. } => Some(ids),
                 _ => None,
             })
             .collect();

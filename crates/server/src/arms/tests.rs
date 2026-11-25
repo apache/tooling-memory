@@ -91,6 +91,7 @@ impl<'a> Put<'a> {
                 entry_type: self.kind,
                 domain: "dom-a".into(),
                 author: "human:test:me".into(),
+                owner: None,
                 created: self.created,
                 cites: self.cites,
                 confidence: None,
@@ -710,7 +711,7 @@ fn reads_in_log(dir: &Path, domain: &str, m: &Memory) -> Vec<String> {
         .into_iter()
         .filter(|e| e.session.as_deref() == Some(session.as_str()))
         .filter_map(|e| match e.change {
-            crate::log::Change::Read { ids } => Some(ids),
+            crate::log::Change::Read { ids, .. } => Some(ids),
             _ => None,
         })
         .flatten()

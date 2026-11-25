@@ -19,6 +19,7 @@ mod curator;
 mod deputy;
 mod doctor;
 mod drift;
+mod duties;
 mod eval;
 mod eventlog;
 mod gofannon;
@@ -681,6 +682,53 @@ enum Command {
         #[arg(long)]
         why: String,
     },
+    /// Demote an entry behind a tombstone: retrieval no longer serves it, `get` says
+    /// that it was demoted, and the archive keeps its text. A person demotes for either
+    /// reason. An agent demotes only a dead entry, on a task of a curator or the auditor.
+    Demote {
+        id: String,
+        /// dead or wrong: a code, and never a text.
+        #[arg(long)]
+        reason: String,
+    },
+    /// Restore a demoted entry, so that retrieval serves it again. Only a person.
+    Restore { id: String },
+    /// The dead entries: older than the window, not read inside it, named by no active
+    /// entry, not verified, and not a handoff, a policy entry, a position or a canary.
+    Dead {
+        #[arg(long)]
+        domain: Option<String>,
+        /// The window in days.
+        #[arg(long, default_value_t = dm_server::duties::DEAD_WINDOW_DAYS)]
+        days: i64,
+    },
+    /// The convention checks over a domain: freshness, ownership, cross-links and
+    /// citations of a replaced entry. With --file, one task for each failure: for a
+    /// person, or for a curator when an entry cites a replaced entry.
+    Conventions {
+        #[arg(long)]
+        domain: Option<String>,
+        /// Days past its review date after which an entry fails the freshness check.
+        #[arg(long, default_value_t = 30)]
+        overdue_days: i64,
+        #[arg(long)]
+        file: bool,
+    },
+    /// The corrections of a domain: each task whose result a person corrected, rejected
+    /// or reverted. With --file, one task for a curator for each, or for a person when
+    /// the people who judged the result disagree.
+    Corrections {
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        file: bool,
+    },
+    /// The auditor: its mode, its qualification on the planted cases, and what it
+    /// checks besides summaries.
+    Auditor {
+        #[command(subcommand)]
+        op: duties::AuditorOp,
+    },
     /// Approve what a task asks a person for. A proposal to promote an entry to verified
     /// is promoted: the approver did not propose it, and is a person. A sign-off task
     /// gets an approval of the action and the version that it names, for the principal
@@ -992,6 +1040,9 @@ enum Command {
         cites: Vec<String>,
         #[arg(long)]
         supersedes: Option<String>,
+        /// The person who answers for the entry, as `human:...`.
+        #[arg(long)]
+        owner: Option<String>,
     },
     /// Ranked search, summaries only.
     Search {
@@ -1271,6 +1322,16 @@ enum PolicyOp {
         #[arg(long)]
         domain: Option<String>,
     },
+    /// What a curator finds in the policy and in the done work: the pairs of rules in
+    /// force in one layer whose sentences overlap, and the work done three times or
+    /// more with no task definition. With --file, a proposal to the owners for each
+    /// pair, and a task to write a task definition for each repeated work.
+    Curate {
+        #[arg(long)]
+        domain: Option<String>,
+        #[arg(long)]
+        file: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1454,11 +1515,22 @@ enum TaskOp {
         #[arg(long)]
         reject: bool,
     },
-    /// Record that the work of a task did not stand: `reverted` or `rejected`. The
-    /// level of the task's definition goes one step down.
+    /// Record what became of the work of a task. Only a person records either form.
+    /// With `reverted` or `rejected`: a work outcome. The work did not stand, and the
+    /// level of the task's definition goes one step down. With `--kind`: an outcome
+    /// event on the task, which the curator reads as a correction. The level does not
+    /// move.
     Outcome {
         id: String,
-        outcome: dm_ledger::WorkOutcome,
+        /// reverted or rejected: a work outcome, on the definition that the task names.
+        #[arg(conflicts_with_all = ["kind", "note"], required_unless_present = "kind")]
+        outcome: Option<dm_ledger::WorkOutcome>,
+        /// accepted, corrected, rejected or reverted: an outcome event.
+        #[arg(long)]
+        kind: Option<String>,
+        /// What was wrong, or what was changed. Only with `--kind`.
+        #[arg(long, default_value = "")]
+        note: String,
     },
     /// Close a task without doing it, and everything still open that was filed from it.
     Invalidate {
@@ -1502,6 +1574,8 @@ enum TaskOp {
         #[arg(long)]
         generation: Option<u64>,
     },
+    /// The outcome events of a task, oldest first.
+    Outcomes { id: String },
 }
 
 /// The filters of `amem search`: each one narrows the search.
@@ -1901,6 +1975,7 @@ async fn run_cli(cli: Cli, root: PathBuf, at_start: Vec<String>) -> Fallible {
         Command::Source { op } => sources::cmd(&Memory::open(&root)?, op).await,
         Command::Tap { op } => tap_cmd(&root, op).await,
         Command::Drift { op } => drift::run(&root, op).await,
+        Command::Auditor { op } => duties::auditor_cmd(&root, op).await,
         other => entries(&Memory::open(&root)?, other).await,
     }
 }
@@ -4566,6 +4641,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
             classification,
             cites,
             supersedes,
+            owner,
         } => {
             let w = m
                 .write(WriteRequest {
@@ -4579,6 +4655,7 @@ async fn entries(m: &Memory, command: Command) -> Fallible {
                     supersedes,
                     review_by: None,
                     summary: None,
+                    owner,
                 })
                 .await?;
             json(&w)
@@ -4728,8 +4805,8 @@ fn auditor_destination(auth: AuthMode, provider: Option<String>) -> String {
     })
 }
 
-/// How many curation tasks are open: proposed or admitted, filed by the survey, the
-/// auditor or the telemetry.
+/// How many curation tasks are open for a curator run: proposed or admitted, filed by
+/// the survey, the auditor or the telemetry, and not for a person.
 async fn open_curation_tasks(
     m: &Memory,
     domain: &str,
@@ -4744,13 +4821,7 @@ async fn open_curation_tasks(
             .tasks(Some(domain), status)
             .await?
             .iter()
-            .filter(|t| {
-                t.spec.origin.as_deref().is_some_and(|o| {
-                    o.starts_with("curator:")
-                        || o.starts_with("auditor:")
-                        || o.starts_with("telemetry:")
-                })
-            })
+            .filter(|t| duties::curators_work(&t.spec))
             .count();
     }
     Ok(n)
@@ -4797,7 +4868,8 @@ async fn curate_loop(root: &Path, plan: &CuratePlan, every: Option<u64>) -> Fall
     }
 }
 
-/// The auditor's part of a cycle: the sample judged, contradictions hunted, both filed.
+/// The auditor's part of a cycle: the sample judged, contradictions hunted, both filed;
+/// then entries together, the curations and the handoffs, and the sample for a person.
 async fn auditor_pass(
     p: &Prepared,
     plan: &CuratePlan,
@@ -4839,6 +4911,40 @@ async fn auditor_pass(
         cycle.contradictions = found.len();
         auditor::file_contradictions(m, domain, model, &found).await?;
     }
+    let judge = duties::Judge {
+        egress: &p.egress,
+        destination: &p.provider,
+        model,
+        spend: Some(&spend),
+    };
+    let judged = report
+        .checked
+        .into_iter()
+        .map(|v| dm_server::audit::Judged {
+            entry: v.id,
+            ok: v.entails,
+            why: v.why,
+        });
+    duties::auditor_duties(&judge, m, domain, plan.sample, cycle, judged.collect()).await?;
+    quarantine_and_drift(p, plan, domain, model, &spend, cycle).await?;
+    if let Some(t) = p.egress.telemetry().session(m.session_id())? {
+        cycle.calls = t.calls;
+        cycle.tokens_in = t.input_tokens;
+        cycle.tokens_out = t.output_tokens;
+    }
+    Ok(())
+}
+
+/// The quarantine's reader and the drift probes of a cycle, while the budget lasts.
+async fn quarantine_and_drift(
+    p: &Prepared,
+    plan: &CuratePlan,
+    domain: &str,
+    model: &str,
+    spend: &auditor::Spend<'_>,
+    cycle: &mut curation::Cycle,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let m = &p.memory;
     if !spend.exhausted() {
         let reviewed = review::review(&p.egress, m, &p.provider, model, plan.sample).await?;
         cycle.reviewed = reviewed.len();
@@ -4859,15 +4965,11 @@ async fn auditor_pass(
                 .unwrap_or_else(|e| Some(format!("probe failed: {e}")));
         }
     }
-    if let Some(t) = p.egress.telemetry().session(m.session_id())? {
-        cycle.calls = t.calls;
-        cycle.tokens_in = t.input_tokens;
-        cycle.tokens_out = t.output_tokens;
-    }
     Ok(())
 }
 
-/// The owner's part of a cycle: the canaries checked and the telemetry's alarms, filed.
+/// The owner's part of a cycle: the canaries checked, the telemetry's alarms, the
+/// convention checks, the corrections and the curation of the policy, each filed.
 async fn owner_pass(
     m: &Memory,
     root: &Path,
@@ -4883,6 +4985,7 @@ async fn owner_pass(
     let t = curation::telemetry(m, Some(domain)).await?;
     cycle.alarms = t.alarms.len();
     curation::file_alarms(m, &t).await?;
+    duties::file_surveys(m, domain, cycle).await?;
     transcripts::sweep(m).await?;
     Ok(())
 }
@@ -4903,7 +5006,12 @@ async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
     let m = &p.memory;
     m.disable_read_log();
     let domain = m.resolve_domain(plan.domain.as_deref())?;
-    let model = model::resolve(&p.egress, &p.provider, plan.model.as_deref()).await;
+    // a qualification on file names the model of the auditor; else the one asked for
+    let mode = m.auditor_mode()?;
+    let model = match &mode.auditor_model {
+        Some(qualified) => qualified.clone(),
+        None => model::resolve(&p.egress, &p.provider, plan.model.as_deref()).await,
+    };
     let mut cycle = curation::Cycle {
         at: time::OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
@@ -4912,6 +5020,8 @@ async fn curate_cmd(root: &Path, plan: &CuratePlan) -> Fallible {
         budget_tasks: plan.budget_tasks,
         budget_tokens: plan.budget_tokens,
         auditor_model: model.clone(),
+        auditor_mode: mode.mode.word().to_string(),
+        qualified: mode.qualified,
         ..curation::Cycle::default()
     };
     // the survey, filed up to the budget's gap
@@ -5055,6 +5165,9 @@ async fn perimeter_cmd(m: &Memory, command: Command) -> Fallible {
         Command::Policy {
             op: PolicyOp::Lint { file },
         } => policy_lint(m, file).await,
+        Command::Policy {
+            op: PolicyOp::Curate { domain, file },
+        } => duties::policy_curate(m, domain.as_deref(), file).await,
         Command::Policy { op } => rule_cmd(m, op).await,
         Command::Quarantine {
             op: QuarantineOp::List,
@@ -5161,7 +5274,11 @@ async fn rule_cmd(m: &Memory, op: PolicyOp) -> Fallible {
             }))
         }
         PolicyOp::Reset { domain } => json(&m.reset_rules(domain.as_deref()).await?),
-        PolicyOp::Show | PolicyOp::Eval { .. } | PolicyOp::List | PolicyOp::Lint { .. } => {
+        PolicyOp::Show
+        | PolicyOp::Eval { .. }
+        | PolicyOp::List
+        | PolicyOp::Lint { .. }
+        | PolicyOp::Curate { .. } => {
             unreachable!("routed by perimeter_cmd")
         }
     }
@@ -5260,25 +5377,51 @@ async fn bundle_cmd(m: &Memory, command: Command) -> Fallible {
     }
 }
 
+/// `amem demote`, `restore`, `dead`, `conventions` and `corrections`: the duties of a
+/// curator that need no model.
+async fn duty_cmd(m: &Memory, command: Command) -> Fallible {
+    match command {
+        Command::Demote { id, reason } => duties::demote(m, &id, &reason).await,
+        Command::Restore { id } => duties::restore(m, &id).await,
+        Command::Dead { domain, days } => duties::dead(m, domain.as_deref(), days).await,
+        Command::Conventions {
+            domain,
+            overdue_days,
+            file,
+        } => duties::conventions(m, domain.as_deref(), overdue_days, file).await,
+        Command::Corrections { domain, file } => {
+            duties::corrections(m, domain.as_deref(), file).await
+        }
+        _ => unreachable!("routed by maintain"),
+    }
+}
+
+/// `amem curator`: the survey of what needs curation, or the curator's telemetry.
+async fn survey_cmd(m: &Memory, command: Command) -> Fallible {
+    let Command::Curator {
+        domain,
+        file,
+        stale_days,
+        split_chars,
+        workdir,
+        telemetry,
+    } = command
+    else {
+        unreachable!("routed by maintain")
+    };
+    // the survey's reads are the curator's, not a session's
+    m.disable_read_log();
+    if telemetry {
+        return telemetry_cmd(m, domain.as_deref(), file).await;
+    }
+    let workdir = workdir.or_else(|| std::env::current_dir().ok());
+    curator_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
+}
+
 async fn maintain(m: &Memory, command: Command) -> Fallible {
     match command {
         cmd @ (Command::Export { .. } | Command::Import { .. }) => bundle_cmd(m, cmd).await,
-        Command::Curator {
-            domain,
-            file,
-            stale_days,
-            split_chars,
-            workdir,
-            telemetry,
-        } => {
-            // the survey's reads are the curator's, not a session's
-            m.disable_read_log();
-            if telemetry {
-                return telemetry_cmd(m, domain.as_deref(), file).await;
-            }
-            let workdir = workdir.or_else(|| std::env::current_dir().ok());
-            curator_cmd(m, domain.as_deref(), file, stale_days, split_chars, workdir).await
-        }
+        cmd @ Command::Curator { .. } => survey_cmd(m, cmd).await,
         cmd
         @ (Command::Approve { .. } | Command::Approvals { .. } | Command::Declassify { .. }) => {
             approval_cmd(m, cmd).await
@@ -5293,7 +5436,13 @@ async fn maintain(m: &Memory, command: Command) -> Fallible {
         cmd @ (Command::Metrics { .. } | Command::Limits { .. } | Command::Landing { .. }) => {
             measure::cmd(m, cmd).await
         }
+        cmd @ (Command::Demote { .. }
+        | Command::Restore { .. }
+        | Command::Dead { .. }
+        | Command::Conventions { .. }
+        | Command::Corrections { .. }) => duty_cmd(m, cmd).await,
         Command::Init { .. }
+        | Command::Auditor { .. }
         | Command::Serve { .. }
         | Command::Launch { .. }
         | Command::Work { .. }
@@ -5398,12 +5547,20 @@ async fn holds_cmd(m: &Memory, op: TaskOp) -> Fallible {
     }
 }
 
-/// `amem task verdict` and `amem task outcome`: what a person says of work that was
-/// handed in.
+/// `amem task verdict`, `amem task outcome` and `amem task outcomes`: what a person
+/// says of work that was handed in, and what was said.
 async fn judged_cmd(m: &Memory, op: TaskOp) -> Fallible {
     match op {
         TaskOp::Verdict { id, accept, .. } => json(&m.verdict(&id, accept).await?),
-        TaskOp::Outcome { id, outcome } => json(&m.record_outcome(&id, outcome).await?),
+        TaskOp::Outcome {
+            id,
+            outcome: Some(outcome),
+            ..
+        } => json(&m.record_outcome(&id, outcome).await?),
+        TaskOp::Outcome { id, kind, note, .. } => {
+            duties::record_outcome(m, &id, kind.as_deref().unwrap_or_default(), &note).await
+        }
+        TaskOp::Outcomes { id } => duties::outcomes(m, &id).await,
         _ => unreachable!("routed by task"),
     }
 }
@@ -5443,8 +5600,8 @@ async fn fabric_cmd(m: &Memory, op: TaskOp) -> Fallible {
     }
 }
 
-/// `amem task create`: file a task from the flags of the command.
-async fn create_task_cmd(m: &Memory, new: NewTask) -> Fallible {
+/// `amem task create`.
+async fn create_cmd(m: &Memory, new: NewTask) -> Fallible {
     let NewTask {
         title,
         body,
@@ -5494,7 +5651,7 @@ async fn create_task_cmd(m: &Memory, new: NewTask) -> Fallible {
 
 async fn task(m: &Memory, op: TaskOp) -> Fallible {
     match op {
-        TaskOp::Create(new) => create_task_cmd(m, *new).await,
+        TaskOp::Create(new) => create_cmd(m, *new).await,
         TaskOp::Admit { id } => json(&m.admit(&id).await?),
         TaskOp::List { status, domain } => json(&m.tasks(domain.as_deref(), status.into()).await?),
         TaskOp::ClaimNext {
@@ -5525,7 +5682,9 @@ async fn task(m: &Memory, op: TaskOp) -> Fallible {
         | TaskOp::Stats { .. }
         | TaskOp::Times { .. }
         | TaskOp::QueueLanding { .. }) => fabric_cmd(m, op).await,
-        op @ (TaskOp::Verdict { .. } | TaskOp::Outcome { .. }) => judged_cmd(m, op).await,
+        op @ (TaskOp::Verdict { .. } | TaskOp::Outcome { .. } | TaskOp::Outcomes { .. }) => {
+            judged_cmd(m, op).await
+        }
         TaskOp::Get { id } => json(&m.get_task(&id).await?),
     }
 }

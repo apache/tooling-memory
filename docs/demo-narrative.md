@@ -224,6 +224,29 @@ holds that write, and does not write it. You will see it again in 3.3.
 **2.5 Telemetry.** This shows what each curator did. The count comes from the record,
 not from the curators' own reports.
 
+**2.6 Dead material, demoted.** The script writes a note that nothing reads and no
+entry names. `amem dead --days 0` lists the note as a dead entry. `agent:curator` tries
+to demote it and is refused, because its session holds no task of a curator. You demote
+it with the reason `dead`. The tombstone stays: `get` answers that the entry was demoted,
+the list does not hold it, and the event log names who demoted it and the reason code.
+
+**2.7 Conventions and corrections.** You write a convention that names no owner. The
+convention checks find it, and `amem conventions --file` files a task that names the
+person who answers for the entry. Then the script files a small task and completes it.
+You record the outcome `corrected` with a note. `amem corrections --file` files a task
+for a curator. The task asks one question: was the method at fault, or was knowledge
+missing?
+
+**2.8 The auditor's mode.** With the gateway, the curators' model and gemma4-26b each
+judge the ten planted cases, and you see the two scores. gemma4-26b becomes the auditor
+only if it catches at least as many faults and gives no more false alarms. Without the
+gateway, this step says that the qualification was skipped. In both cases
+`amem auditor mode` prints the mode, whether a qualification is on file, and the number
+of verdicts that a person reviews in each cycle.
+
+Steps 2.1 to 2.3 and the qualification in 2.8 need the gateway. Without the gateway, the
+act says that it skipped them, and it runs steps 2.4 to 2.7 and the mode in 2.8.
+
 ## Act 3 · The perimeter
 
 On stage: scripted agents writing, reading and fetching, and asking to erase an entry and
@@ -445,8 +468,8 @@ the task is admitted. The last three lines are rows of the metric table: one cha
 landed through `main`, one task that an agent filed is open, and the share of upkeep is
 0.5. The script then closes that task and puts the grants back.
 
-With a gateway key, 5.5 to 5.7 follow. Without one, 5.5 and 5.7 do not run, and the
-transcripts are step 5.5.
+With a gateway key, 5.5 to 5.8 follow. Without one, 5.5 and 5.7 do not run. The
+transcripts are then step 5.5, and the freeze is step 5.6.
 
 **5.5 Vendor drift.** The demo probes qwen3.8-27b twice, with no alarms. Then it checks
 gemma4-26b against qwen's baseline, as if a vendor swapped the model behind the name.

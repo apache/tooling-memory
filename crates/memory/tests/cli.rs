@@ -865,6 +865,196 @@ fn log_show_serves_the_ledger_s_events_up_to_now_and_from_a_sequence_number() {
     assert_eq!(tail, serde_json::json!([last]));
 }
 
+/// The log events of the root with one kind.
+fn events_of(root: &Path, kind: &str) -> Vec<Value> {
+    let events = json(&ok(root, &["log", "show"], None));
+    let of = events.as_array().unwrap().iter();
+    of.filter(|e| e["kind"] == kind).cloned().collect()
+}
+
+#[test]
+fn demote_leaves_a_tombstone_and_a_log_event_and_restore_serves_the_entry_again() {
+    let d = step_init();
+    let note = ok(
+        &d.root,
+        &["write", "--title", "Port"],
+        Some("It is 8080.\n"),
+    );
+    let id = id_of(&note);
+    let none = json(&ok(&d.root, &["dead"], None));
+    assert_eq!(
+        none,
+        serde_json::json!({ "dead": [] }),
+        "the window is 90 days"
+    );
+    let dead = json(&ok(&d.root, &["dead", "--days", "0"], None));
+    assert_eq!(dead["dead"][0]["id"], id, "{dead}");
+    let bad = fails(&d.root, &["demote", &id, "--reason", "stale"]);
+    assert!(bad.contains("dead or wrong"), "{bad}");
+
+    let done = json(&ok(&d.root, &["demote", &id, "--reason", "dead"], None));
+    assert_eq!(done["reason"], "dead", "{done}");
+    assert_eq!(done["by"], "human:test:me", "{done}");
+    let gone = fails(&d.root, &["get", &id]);
+    assert!(gone.contains("demoted"), "{gone}");
+    let listed = ok(&d.root, &["list"], None);
+    assert!(!listed.contains(&id), "{listed}");
+    let demoted = events_of(&d.root, "demoted");
+    assert_eq!(demoted.len(), 1, "{demoted:?}");
+    assert_eq!(demoted[0]["id"], id);
+    assert_eq!(demoted[0]["by"], "human:test:me");
+    assert_eq!(demoted[0]["reason"], "dead");
+
+    let back = json(&ok(&d.root, &["restore", &id], None));
+    assert_eq!(back, serde_json::json!({ "restored": id }));
+    assert!(ok(&d.root, &["get", &id], None).contains("It is 8080."));
+    assert_eq!(events_of(&d.root, "restored")[0]["id"], id);
+}
+
+#[test]
+fn conventions_names_an_entry_with_no_owner_and_files_it_once() {
+    let d = step_init();
+    let convention = ["write", "--kind", "convention", "--title"];
+    let owned = [&convention[..], &["Titles", "--owner", "human:test:lead"]].concat();
+    let owned = id_of(&ok(&d.root, &owned, Some("A title says a claim.\n")));
+    assert!(ok(&d.root, &["get", &owned], None).contains("owner: human:test:lead"));
+    let agent = [&convention[..], &["Titles", "--owner", "agent:worker"]].concat();
+    fails(&d.root, &agent);
+    let clean = json(&ok(&d.root, &["conventions", "--file"], None));
+    let none = serde_json::json!({ "failures": [], "filed": [], "already_filed": 0 });
+    assert_eq!(clean, none);
+
+    let bare = [&convention[..], &["Bodies"]].concat();
+    let bare = id_of(&ok(&d.root, &bare, Some("A body gives the reason.\n")));
+    let found = json(&ok(&d.root, &["conventions"], None));
+    assert_eq!(found["failures"][0]["check"], "ownership", "{found}");
+    assert_eq!(found["failures"][0]["entry"], bare, "{found}");
+    assert_eq!(found["failures"][0]["owner"], "human:test:me", "{found}");
+    assert_eq!(found["filed"], serde_json::json!([]), "{found}");
+    let filed = json(&ok(&d.root, &["conventions", "--file"], None));
+    let task = filed["filed"][0].as_str().expect("a task");
+    let task = json(&ok(&d.root, &["task", "get", task], None));
+    assert_eq!(task["origin"], "convention:ownership", "{task}");
+    let again = json(&ok(&d.root, &["conventions", "--file"], None));
+    assert_eq!(again["filed"], serde_json::json!([]), "{again}");
+    assert_eq!(again["already_filed"], 1, "{again}");
+
+    // the window of the freshness check is the one that the command names
+    let due = time::OffsetDateTime::now_utc().date() - time::Duration::days(10);
+    let late = serde_json::json!({
+        "body": "The port is 8080.\n", "entry_type": "decision", "review_by": due.to_string(),
+    });
+    session(&d.root, "human:test:me", &[("write", late)]);
+    let fresh = |days: &str| {
+        let found = json(&ok(&d.root, &["conventions", "--overdue-days", days], None));
+        let all = found["failures"].as_array().unwrap().clone();
+        let fresh = all.into_iter().filter(|f| f["check"] == "freshness");
+        fresh.count()
+    };
+    assert_eq!((fresh("30"), fresh("5")), (0, 1));
+}
+
+/// `amem task outcome` has two forms, and each form makes its own record. A word alone
+/// is a work outcome, on the definition that the task names. `--kind` is an outcome
+/// event, on the task. One call takes one form.
+#[test]
+fn task_outcome_takes_one_form_and_each_form_makes_its_own_record() {
+    let d = step_init();
+    let task = json(&ok(&d.root, &["task", "create", "Find the port"], None));
+    let id = task["id"].as_str().unwrap().to_string();
+    let neither = fails(&d.root, &["task", "outcome", &id]);
+    assert!(neither.contains("required"), "{neither}");
+    let both = ["task", "outcome", &id, "rejected", "--kind", "rejected"];
+    let both = fails(&d.root, &both);
+    assert!(both.contains("cannot be used with"), "{both}");
+    let noted = ["task", "outcome", &id, "rejected", "--note", "No."];
+    let noted = fails(&d.root, &noted);
+    assert!(noted.contains("cannot be used with"), "{noted}");
+    // the task names no definition: the work outcome is refused, and leaves no event
+    let bare = fails(&d.root, &["task", "outcome", &id, "rejected"]);
+    assert!(bare.contains("names no task definition"), "{bare}");
+    let none = json(&ok(&d.root, &["task", "outcomes", &id], None));
+    assert_eq!(none, serde_json::json!({ "outcomes": [] }));
+    // the outcome event needs no definition
+    let event = ["task", "outcome", &id, "--kind", "rejected"];
+    let said = json(&ok(&d.root, &event, None));
+    assert_eq!(said["outcomes"][0]["outcome"], "rejected", "{said}");
+    assert_eq!(said["outcomes"].as_array().unwrap().len(), 1, "{said}");
+}
+
+#[test]
+fn an_outcome_makes_a_correction_and_corrections_files_it_for_a_curator() {
+    let d = step_init();
+    let task = json(&ok(&d.root, &["task", "create", "Find the port"], None));
+    let id = task["id"].as_str().unwrap().to_string();
+    let bad = fails(&d.root, &["task", "outcome", &id, "--kind", "wrong"]);
+    assert!(
+        bad.contains("accepted, corrected, rejected or reverted"),
+        "{bad}"
+    );
+    let none = json(&ok(&d.root, &["task", "outcomes", &id], None));
+    assert_eq!(none, serde_json::json!({ "outcomes": [] }));
+    let outcome = ["--kind", "corrected", "--note", "The port is 8443."];
+    let said = [&["task", "outcome", &id], &outcome[..]].concat();
+    let said = json(&ok(&d.root, &said, None));
+    assert_eq!(said["outcomes"][0]["outcome"], "corrected", "{said}");
+    assert_eq!(said["outcomes"][0]["note"], "The port is 8443.", "{said}");
+    assert_eq!(said["outcomes"][0]["by"], "human:test:me", "{said}");
+    assert_eq!(json(&ok(&d.root, &["task", "outcomes", &id], None)), said);
+
+    let found = json(&ok(&d.root, &["corrections"], None));
+    assert_eq!(found["corrections"][0]["task"], id, "{found}");
+    assert_eq!(found["corrections"][0]["disputed"], false, "{found}");
+    assert_eq!(found["filed"], serde_json::json!([]), "{found}");
+    let filed = json(&ok(&d.root, &["corrections", "--file"], None));
+    let curator = filed["filed"][0].as_str().expect("a task");
+    let curator = json(&ok(&d.root, &["task", "get", curator], None));
+    assert_eq!(curator["origin"], "curator:correction", "{curator}");
+    let question = "Could the agent have reached the right answer";
+    assert!(curator["body"].as_str().unwrap().contains(question));
+    let again = json(&ok(&d.root, &["corrections", "--file"], None));
+    assert_eq!(again["already_filed"], 1, "{again}");
+
+    let policy = json(&ok(&d.root, &["policy", "curate", "--file"], None));
+    let empty = serde_json::json!({
+        "overlaps": [], "repeated": [], "filed": [], "already_filed": 0,
+    });
+    assert_eq!(policy, empty);
+}
+
+#[test]
+fn the_auditor_commands_print_the_mode_a_case_the_handoffs_and_entries_together() {
+    let mut d = step_init();
+    step_write(&mut d);
+    let mode = json(&ok(&d.root, &["auditor", "mode"], None));
+    let fresh = serde_json::json!({
+        "mode": "fresh-session", "qualified": false,
+        "auditor_model": null, "human_sample": 3,
+    });
+    assert_eq!(mode, fresh);
+    let case = json(&ok(&d.root, &["auditor", "case", &d.decision], None));
+    assert_eq!(case["entry"], d.decision, "{case}");
+    assert_eq!(case["unsupported"], true, "{case}");
+    assert!(case["text"].as_str().unwrap().contains("FTS5 is built in"));
+    let later = ["write", "--kind", "handoff", "--title", "Stopped at step 4"];
+    let later = id_of(&ok(&d.root, &later, Some("Step 3 is done.\n")));
+    let handoffs = json(&ok(&d.root, &["auditor", "handoffs"], None));
+    let want = serde_json::json!({ "handoffs": [
+        { "id": later, "title": "Stopped at step 4" },
+        { "id": d.handoff, "title": "Stopped at step 3 of the import" },
+    ] });
+    assert_eq!(handoffs, want);
+    let newest = json(&ok(
+        &d.root,
+        &["auditor", "handoffs", "--sample", "1"],
+        None,
+    ));
+    assert_eq!(newest["handoffs"].as_array().unwrap().len(), 1, "{newest}");
+    assert_eq!(newest["handoffs"][0]["id"], later, "{newest}");
+    let together = json(&ok(&d.root, &["auditor", "together", "--file"], None));
+    assert_eq!(together, serde_json::json!({ "together": [], "filed": [] }));
+}
+
 #[test]
 fn log_outside_names_the_session_that_wrote_after_it_read_a_task_from_a_tap() {
     let d = step_init();

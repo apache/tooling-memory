@@ -176,6 +176,11 @@ mod tests {
         ids
     }
 
+    /// The `read` event of an export that carries `ids`: a survey, and no use of them.
+    fn survey_of(ids: Vec<String>) -> Change {
+        Change::Read { ids, survey: true }
+    }
+
     fn sorted(mut ids: Vec<&str>) -> Vec<&str> {
         ids.sort_unstable();
         ids
@@ -297,7 +302,7 @@ mod tests {
             .collect();
         assert_eq!(own.len(), 2, "{own:?}");
         let carried: Vec<String> = manifest.entries.iter().map(|e| e.id.clone()).collect();
-        assert_eq!(own[0].change, Change::Read { ids: carried });
+        assert_eq!(own[0].change, survey_of(carried));
         assert_eq!(own[0].label, Some(Label::Internal));
         let sent = Change::Send {
             to: "export:internal".into(),

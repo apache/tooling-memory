@@ -97,7 +97,7 @@ pub(crate) fn read_in_log(m: &Memory, domain: &str) -> Vec<String> {
         .into_iter()
         .filter(|e| e.session.as_deref() == Some(m.session_id.as_str()));
     own.filter_map(|e| match e.change {
-        crate::log::Change::Read { ids } => Some(ids),
+        crate::log::Change::Read { ids, .. } => Some(ids),
         _ => None,
     })
     .flatten()

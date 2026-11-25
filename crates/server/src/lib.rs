@@ -40,11 +40,13 @@ use tokio::sync::Mutex as AsyncMutex;
 pub mod address;
 pub mod approvals;
 pub mod arms;
+pub mod audit;
 pub mod autonomy;
 pub mod brief;
 pub mod bundle;
 pub mod contexts;
 pub mod drift_windows;
+pub mod duties;
 pub mod evaluation;
 pub mod fabric;
 pub mod fetch;
@@ -229,6 +231,10 @@ pub struct WriteRequest {
     /// A one-line summary; else the body's first paragraph.
     #[serde(default)]
     pub summary: Option<String>,
+    /// The person who answers for the entry, as `human:<system>:<id>`. A write that
+    /// replaces an entry and names none keeps the owner of that entry.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 fn default_type() -> EntryType {
@@ -1172,7 +1178,10 @@ impl Memory {
     /// The session has read `hits`: its label rises to the classification of each, and
     /// the log of each domain among them takes one read event, which names that domain's
     /// entries at the highest classification among them. A read is in the log whether
-    /// the read log is kept or not: the read log is telemetry, and this is lineage.
+    /// the read log is kept or not: the read log is telemetry, and this is lineage. The
+    /// event says that the read is a survey: it served no body, so the rule for a dead
+    /// entry does not count it as a use. A hit of a search has a snippet of the body,
+    /// and the search stays a survey: each curation cycle searches.
     ///
     /// # Errors
     ///
@@ -1196,7 +1205,7 @@ impl Memory {
             }
         }
         for (domain, (ids, label)) in served {
-            self.log_read(domain, ids, label)?;
+            self.log_survey(domain, ids, label)?;
         }
         Ok(())
     }
@@ -1217,17 +1226,41 @@ impl Memory {
         label: Label,
         outside: bool,
     ) -> Result<bool, Error> {
-        {
-            let mut s = lock(&self.session);
-            if !s.observe(label) {
-                return Ok(false);
-            }
-            if outside {
-                s.read_outside();
-            }
+        if !self.observe_label(label, outside) {
+            return Ok(false);
         }
         self.log_read(domain, vec![id.to_string()], label)?;
         Ok(true)
+    }
+
+    /// As [`Memory::observe_entry`], for a check that reads the body to test it and
+    /// serves it to no reader. The read event says that the read is a survey, so the
+    /// rule for a dead entry does not count it as a use.
+    fn observe_checked(
+        &self,
+        domain: &str,
+        id: &str,
+        label: Label,
+        outside: bool,
+    ) -> Result<bool, Error> {
+        if !self.observe_label(label, outside) {
+            return Ok(false);
+        }
+        self.log_survey(domain, vec![id.to_string()], label)?;
+        Ok(true)
+    }
+
+    /// The label of the session rises to `label`, when the session may handle it.
+    /// `outside` marks the session as one that read outside content.
+    fn observe_label(&self, label: Label, outside: bool) -> bool {
+        let mut s = lock(&self.session);
+        if !s.observe(label) {
+            return false;
+        }
+        if outside {
+            s.read_outside();
+        }
+        true
     }
 
     /// Ranked search, summaries only, within the session's filter.
@@ -1301,6 +1334,17 @@ impl Memory {
     /// [`Error::NotFound`] when absent or above the session's handling, [`Error::Gone`]
     /// for a withheld entry and an author outside the security role, or a store error.
     pub async fn archived(&self, id: &str) -> Result<Entry, Error> {
+        self.archived_as(id, false).await
+    }
+
+    /// As [`Memory::archived`], for a measurement that reads the entry to count it and
+    /// serves it to no reader. The read event says that the read is a survey, so the
+    /// rule for a dead entry does not count it as a use.
+    pub(crate) async fn archived_for_a_count(&self, id: &str) -> Result<Entry, Error> {
+        self.archived_as(id, true).await
+    }
+
+    async fn archived_as(&self, id: &str, survey: bool) -> Result<Entry, Error> {
         let mut f = self.session_filter()?;
         f.include_inactive = true;
         let meta = self.index.lock().await.meta(id, &f)?;
@@ -1316,7 +1360,13 @@ impl Memory {
             return Err(withhold::gone(id));
         }
         let outside = reach::outside_content(&entry);
-        if !self.observe_entry(&meta.hit.domain, id, entry.front.classification, outside)? {
+        let label = entry.front.classification;
+        let seen = if survey {
+            self.observe_checked(&meta.hit.domain, id, label, outside)?
+        } else {
+            self.observe_entry(&meta.hit.domain, id, label, outside)?
+        };
+        if !seen {
             return Err(Error::NotFound(id.to_string()));
         }
         Ok(entry)
@@ -1598,6 +1648,7 @@ impl Memory {
         if let Some(old) = &req.supersedes {
             self.may_replace(old, tier, reach, held.as_deref()).await?;
         }
+        let owner = self.owner_for_write(&domain, &req).await?;
         let cites = self.cites_for_write(&domain, req.entry_type, req.cites);
         let cites = cites.await?;
         let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
@@ -1613,6 +1664,7 @@ impl Memory {
                 entry_type: req.entry_type,
                 domain,
                 author: self.author.clone(),
+                owner,
                 created: now,
                 cites,
                 // the log gives it, with the event that offers the entry
@@ -1632,6 +1684,33 @@ impl Memory {
             },
             body: req.body,
         })
+    }
+
+    /// The owner of the entry that a request asks for: the person that the request
+    /// names, or else the owner of the entry that it replaces. That entry is one that
+    /// the session reads ([`Memory::may_replace`] ran before this).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for an owner that is not a person, or a store error.
+    async fn owner_for_write(
+        &self,
+        domain: &str,
+        req: &WriteRequest,
+    ) -> Result<Option<String>, Error> {
+        if let Some(owner) = &req.owner {
+            if !duties::is_person(owner) {
+                return Err(Error::Denied(format!(
+                    "the owner of an entry is a person, as human:<system>:<id>, and {owner:?} is not"
+                )));
+            }
+            return Ok(Some(owner.clone()));
+        }
+        let Some(old) = &req.supersedes else {
+            return Ok(None);
+        };
+        let replaced = self.store.get(domain, old).await?;
+        Ok(replaced.and_then(|e| e.front.owner))
     }
 
     /// The row of the raw-reach table for an entry that this session writes now: tap
@@ -2802,24 +2881,29 @@ impl Memory {
     }
 
     /// Refuse an origin that names a task, unless a person files it and names a task
-    /// that the session may read, or the session works the task that it names. An agent
-    /// that could name any task would choose the root of its own filing, and the answer
-    /// would say whether a hidden task is there. The task that a session works is no
-    /// choice: what the session files while it holds that task has it above already.
+    /// that the session may read, or the session works the task that it names. An
+    /// agent that could name any task would choose the root of its own filing, and the
+    /// answer would say whether a hidden task is there. A session that works a task
+    /// files into the chain of that task: the root is the root of its work. So does a
+    /// session that fills the position of a pinned task. Each other agent gets one
+    /// answer, for a task that is there, one that is hidden and one that is not there.
     async fn names_a_task_it_reads(&self, l: &Ledger, origin: &str) -> Result<(), Error> {
         let Some(named) = measure::filed_from(origin) else {
             return Ok(());
         };
-        if !measure::is_person(&self.author, &self.grants.owner) {
-            if l.get(named).await.is_ok_and(|task| self.works(&task)) {
+        if measure::is_person(&self.author, &self.grants.owner) {
+            return self.check_task(&l.get(named).await?);
+        }
+        if let Ok(task) = l.get(named).await {
+            let seated = task.spec.position.is_some() && self.commits(&task)?;
+            if self.sees(&task, self.handling()?) && (self.works(&task) || seated) {
                 return Ok(());
             }
-            return Err(Error::Denied(
-                "an origin task:<id>, continues:<id> or retries:<id> names the task that a task is filed from: the service sets it, or a person does"
-                    .into(),
-            ));
         }
-        self.check_task(&l.get(named).await?)
+        Err(Error::Denied(
+            "an origin task:<id>, continues:<id> or retries:<id> names the task that a task is filed from: the service sets it, a person does, or the session that works that task does"
+                .into(),
+        ))
     }
 
     /// File a task the system files on the owner's behalf, as the curator's survey,
@@ -3841,7 +3925,8 @@ impl Memory {
     }
 
     /// Say in the log of `domain` that a bundle left: first a read of the entries it
-    /// carries, at the highest classification among them, then the send, which names the
+    /// carries, at the highest classification among them and marked as a survey, since
+    /// an export of a scope is no use of one entry, then the send, which names the
     /// bound of the export and the digest of the manifest. The session's label does not
     /// rise: an export hands the entries out and shows none of them to the session. The
     /// send is at the highest classification the bundle holds when that is above the
@@ -3853,7 +3938,7 @@ impl Memory {
     ) -> Result<(), Error> {
         let ids: Vec<String> = manifest.entries.iter().map(|e| e.id.clone()).collect();
         if let Some(carried) = manifest.entries.iter().map(|e| e.classification).max() {
-            self.log_read(domain, ids, carried)?;
+            self.log_survey(domain, ids, carried)?;
         }
         let to = format!("export:{}", manifest.max_label);
         let digest = dm_core::digest(&manifest.to_yaml());

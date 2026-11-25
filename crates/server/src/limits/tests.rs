@@ -551,6 +551,15 @@ async fn an_agent_names_no_task_in_the_origin_of_its_filing() {
     let next = from("Go on", &format!("task:{}", asked.id));
     let next = person.create_task(next).await.unwrap().task;
     assert_eq!(next.spec.origin, Some(format!("task:{}", asked.id)));
+    // the session that works a task names it: the continuation is in the chain of its work
+    let holder = site.session("agent:a").await;
+    holder.claim(&asked.id, LEASE).await.unwrap();
+    let resumed = from("Resume", &format!("continues:{}", asked.id));
+    let resumed = holder.create_task(resumed).await.unwrap().task;
+    assert_eq!(resumed.spec.origin, Some(format!("continues:{}", asked.id)));
+    let other = site.session("agent:b").await;
+    let forged = from("Resume", &format!("continues:{}", asked.id));
+    assert!(denied(&other.create_task(forged).await, named));
 }
 
 /// The share of upkeep is the domain's: the tasks above the handling of the filer count

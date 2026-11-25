@@ -2979,10 +2979,10 @@ mod tests {
         in_force(&owner, &release()).await;
         let commitment = admitted(&owner, pinned("Cut 1.2")).await;
         let outside = session(dir.path(), "claude");
-        // an agent names in an origin only the task that it works
+        // an agent names only a task that it works: the answer names nothing of the task
         let why = denied(outside.create_task(resumes(&commitment.id)).await);
         assert!(
-            why.contains("names the task that a task is filed from"),
+            why.contains("the session that works that task does") && !why.contains("pos-"),
             "{why}"
         );
         let filed = owner.ledger.lock().await.filed_from(&commitment.id).await;
@@ -3139,9 +3139,10 @@ mod tests {
         );
         let filed = owner.ledger.lock().await.filed_from(&later.id).await;
         assert!(filed.unwrap().is_empty(), "nothing was filed");
-        // a task that the ledger does not hold gets the same answer as a hidden one
-        let none = denied(low.create_task(resumes("task-me-none")).await);
-        assert_eq!(none, why);
+        // a task that the ledger does not hold gets the same answer: the answer does
+        // not say whether a hidden task is there
+        let loose = denied(low.create_task(resumes("task-me-none")).await);
+        assert_eq!(loose, why);
     }
 
     #[tokio::test]
@@ -3192,7 +3193,7 @@ mod tests {
             .into_iter()
             .filter(|e| e.session.as_deref() == Some(m.session_id.as_str()));
         own.filter_map(|e| match e.change {
-            crate::log::Change::Read { ids } => Some(ids),
+            crate::log::Change::Read { ids, .. } => Some(ids),
             _ => None,
         })
         .flatten()

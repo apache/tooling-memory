@@ -207,6 +207,9 @@ pub fn to_json(f: &Fetched) -> Value {
     if let Some(task) = &front.task {
         v["task"] = json!(task);
     }
+    if let Some(owner) = &front.owner {
+        v["owner"] = json!(owner);
+    }
     if let Some(anchor) = &f.anchor {
         v["anchor"] = json!(anchor);
     }

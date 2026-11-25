@@ -743,3 +743,29 @@ async fn a_search_of_a_session_is_timed_in_the_read_log() {
     let targets = site.targets().await;
     assert!(targets[0].measured.is_some(), "{:?}", targets[0]);
 }
+
+/// The retrieval metrics read each entry that the write log names, to find the
+/// handoffs. That read is a survey in the event log: a count is no use of an entry, so
+/// it keeps no entry out of the dead entries.
+#[tokio::test]
+async fn the_read_of_the_retrieval_metrics_is_a_survey_in_the_event_log() {
+    let site = Site::new();
+    let agent = site.session("agent:a").await;
+    let req = WriteRequest {
+        body: "The port is 8080.\n".into(),
+        domain: Some(DOMAIN.into()),
+        ..WriteRequest::default()
+    };
+    let id = agent.write(req).await.unwrap().id;
+    let owner = site.owner().await;
+    owner.read_metrics().await.unwrap();
+    let events = crate::log::read(site.dir.path(), DOMAIN, 0).unwrap();
+    let reads: Vec<bool> = events
+        .iter()
+        .filter_map(|e| match &e.change {
+            crate::log::Change::Read { ids, survey } if ids.contains(&id) => Some(*survey),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(reads, [true], "{events:?}");
+}

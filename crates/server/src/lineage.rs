@@ -160,7 +160,7 @@ impl<'a> Logs<'a> {
     fn take(&mut self, e: &'a Event, at: At<'a>, log: &'a [Event], refused: &BTreeMap<u64, u64>) {
         let session = e.session.as_deref();
         match (&e.change, session) {
-            (Change::Read { ids }, Some(session)) => self.reads.push((session, at, ids)),
+            (Change::Read { ids, .. }, Some(session)) => self.reads.push((session, at, ids)),
             (Change::Send { to, .. }, Some(session)) => {
                 self.sends.push(SentAt { session, at, to });
             }
@@ -462,6 +462,7 @@ mod tests {
     fn read(ids: &[&str]) -> Change {
         Change::Read {
             ids: ids.iter().map(|i| (*i).to_string()).collect(),
+            survey: false,
         }
     }
 
