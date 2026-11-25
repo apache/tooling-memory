@@ -232,6 +232,10 @@ pub struct Frontmatter {
     pub domain: String,
     /// `agent:<name> (model: <id>)` or `human:<system>:<user-id>`.
     pub author: String,
+    /// The person who answers for the entry, as `human:<system>:<id>`. Absent on an
+    /// entry that names none: the owner of the grants then answers for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
     /// When the entry was written.
     #[serde(with = "time::serde::rfc3339")]
     pub created: OffsetDateTime,
@@ -515,6 +519,7 @@ mod tests {
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec!["https://example.org/thread/1".into()],
                 session: None,
+                owner: None,
                 reach: Reach::Fleet,
                 task: None,
                 confidence: Some(Confidence::High),
@@ -596,6 +601,27 @@ mod tests {
         let said = SAMPLE_AS_BEFORE.replace("\nconfidence:", "\nreach: fleet\nconfidence:");
         assert_ne!(said, SAMPLE_AS_BEFORE);
         assert_eq!(Entry::parse(&said).unwrap().render(), SAMPLE_AS_BEFORE);
+    }
+
+    #[test]
+    fn an_entry_without_an_owner_renders_as_before_and_one_with_an_owner_round_trips() {
+        let e = sample();
+        assert_eq!(e.front.owner, None);
+        let text = e.render();
+        assert_eq!(text, SAMPLE_AS_BEFORE, "no owner is written");
+        assert_eq!(digest(&text), digest(SAMPLE_AS_BEFORE));
+        assert_eq!(Entry::parse(SAMPLE_AS_BEFORE).unwrap().front.owner, None);
+        let mut owned = sample();
+        owned.front.owner = Some("human:test:alice".into());
+        let text = owned.render();
+        assert!(
+            text.contains("\nowner: human:test:alice\ncreated:"),
+            "after the author: {text}"
+        );
+        let back = Entry::parse(&text).unwrap();
+        assert_eq!(back, owned);
+        assert_eq!(back.render(), text);
+        assert_ne!(back, e);
     }
 
     #[test]

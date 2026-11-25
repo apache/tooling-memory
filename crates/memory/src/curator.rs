@@ -62,7 +62,17 @@ pub struct Proposal {
     pub why: String,
     /// What the task body tells the run to do.
     pub body: String,
+    /// The priority of the task: [`FIRST`] for an entry whose source changed, else
+    /// [`LATER`].
+    pub priority: i64,
 }
+
+/// The priority of curation that goes first: an entry made from a source that changed
+/// is checked again before each other curation. `curator:rederive` has the same priority.
+pub const FIRST: i64 = 3;
+
+/// The priority of each other proposal of the survey.
+pub const LATER: i64 = -1;
 
 /// The survey's result.
 #[derive(Debug, Default, Serialize)]
@@ -270,6 +280,7 @@ fn signals(root: &Path, live: &std::collections::BTreeSet<String>, out: &mut Vec
             body: format!(
                 "Read `{a}` and `{b}` with `get`. Searches keep returning them together, which is how a split topic looks. If they say the same thing, `write` one entry that holds what both say, with `supersedes` naming the older one; if they differ, give each a title that says how. Change no facts. Leave a handoff."
             ),
+            priority: LATER,
         });
     }
     for (id, n) in opened.into_iter().filter(|(_, n)| *n >= 3) {
@@ -283,6 +294,7 @@ fn signals(root: &Path, live: &std::collections::BTreeSet<String>, out: &mut Vec
             body: format!(
                 "Read `{id}` with `get`. Sessions keep opening its body after seeing its summary: write a one- or two-sentence summary that says what they were looking for, the kind a search hit should show. Then `write` the entry again with the same body and type, your summary as `summary`, and `supersedes: {id}`. Do not change the body. Leave a handoff."
             ),
+            priority: LATER,
         });
     }
 }
@@ -306,6 +318,7 @@ fn survey_entry(
             body: format!(
                 "Read `{id}` with `get`. Write a one- or two-sentence summary of what it says and why it matters, the kind a search hit should show. Then `write` the entry again with the same body and type, your summary as `summary`, and `supersedes: {id}`. Do not change the body. Leave a handoff naming the new entry."
             ),
+            priority: LATER,
         });
     }
     let chars = e.body.chars().count();
@@ -317,6 +330,7 @@ fn survey_entry(
             body: format!(
                 "Read `{id}` with `get`. It is too large for one entry. Split it into entries of one topic each, every one with a title and a one-sentence summary, written with `write`; the first carries `supersedes: {id}` and a short body pointing at the others by id. Change no facts. Leave a handoff listing the new ids."
             ),
+            priority: LATER,
         });
     }
     // a canary is planted to be left alone
@@ -352,6 +366,8 @@ fn survey_entry(
             entries: vec![id.clone()],
             why,
             body: verify_body(id),
+            // superseded-derived first: the source of the entry changed under it
+            priority: if changed.is_some() { FIRST } else { LATER },
         });
     }
 }
@@ -381,6 +397,7 @@ fn merges(by_title: BTreeMap<String, Vec<String>>, out: &mut Vec<Proposal>) {
             body: format!(
                 "Read {named} with `get`. They share a title. If they say the same thing, `write` one entry that holds what both say, with `supersedes` naming the older one, and leave the other as it is; if they differ, give each a title that says how. Change no facts. Leave a handoff."
             ),
+            priority: LATER,
         });
     }
 }
@@ -403,6 +420,7 @@ fn authoring(root: &Path, out: &mut Vec<Proposal>) {
             body: format!(
                 "Sessions searched the record for \"{q}\" {n} times and found nothing. Find out the answer from the working tree and the record, and `write` an entry that answers it, titled so that the same search finds it. If the answer cannot be found, write a question entry saying so. Leave a handoff."
             ),
+            priority: LATER,
         });
     }
 }
@@ -442,7 +460,7 @@ pub async fn file(
                 upstream_event: Some(dm_core::digest(&subject)[..16].to_string()),
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
-                priority: -1,
+                priority: p.priority,
                 ..dm_ledger::TaskSpec::default()
             })
             .await?;
@@ -593,6 +611,7 @@ pub(crate) mod tests {
                 created: time::OffsetDateTime::now_utc() + time::Duration::seconds(5),
                 cites: vec!["file:notes.md".into(), "transcript:/x.jsonl".into()],
                 session: None,
+                owner: None,
                 reach: dm_core::Reach::Fleet,
                 task: None,
                 confidence: None,
@@ -630,6 +649,7 @@ pub(crate) mod tests {
                 created: time::OffsetDateTime::now_utc(),
                 cites: Vec::new(),
                 session: None,
+                owner: None,
                 reach: dm_core::Reach::Fleet,
                 task: None,
                 confidence: None,
@@ -666,6 +686,60 @@ pub(crate) mod tests {
             "{}",
             verify.body
         );
+    }
+
+    #[tokio::test]
+    async fn a_verify_for_a_changed_source_is_filed_first_and_a_stale_entry_later() {
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        std::fs::create_dir_all(&tree).unwrap();
+        std::fs::write(tree.join("notes.md"), "v1").unwrap();
+        let m = Memory::init(&dir.path().join("memory"), "human:test:me", "dom-me").unwrap();
+        // two facts past their review date: one cites a file of the working tree
+        let due = time::OffsetDateTime::now_utc().date() - time::Duration::days(1);
+        let fact = |body: &str, cites: &[&str]| dm_server::WriteRequest {
+            body: body.into(),
+            cites: cites.iter().map(|c| (*c).to_string()).collect(),
+            review_by: Some(due),
+            ..dm_server::WriteRequest::default()
+        };
+        let cited = fact(
+            "The notes are kept in notes.md, one section per topic.\n",
+            &["file:notes.md"],
+        );
+        let cited = m.write(cited).await.unwrap().id;
+        let plain = fact("The import runs each night at two.\n", &[]);
+        let plain = m.write(plain).await.unwrap().id;
+        // the file changes after the entry was written
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        let file_handle = std::fs::File::options()
+            .write(true)
+            .open(tree.join("notes.md"));
+        file_handle.unwrap().set_modified(later).unwrap();
+
+        let options = Options {
+            source_root: Some(tree),
+            ..Options::default()
+        };
+        let found = survey(&m, m.root(), Some("dom-me"), &options)
+            .await
+            .unwrap();
+        let verify = |id: &String| {
+            let of = |p: &&Proposal| p.kind == Kind::Verify && p.entries == [id.clone()];
+            found.proposals.iter().find(of).expect("a verify").priority
+        };
+        assert_eq!((verify(&cited), verify(&plain)), (FIRST, LATER));
+        assert_eq!((FIRST, LATER), (3, -1));
+        let (ids, _) = file(&m, &found).await.unwrap();
+        let mut filed = Vec::new();
+        for id in ids {
+            let spec = m.get_task(&id).await.unwrap().spec;
+            if spec.origin.as_deref() == Some("curator:verify") {
+                filed.push((spec.title.contains(&cited), spec.priority));
+            }
+        }
+        filed.sort_unstable();
+        assert_eq!(filed, [(false, LATER), (true, FIRST)]);
     }
 
     #[test]

@@ -113,6 +113,14 @@ pub enum Change {
     Read {
         /// The entries.
         ids: Vec<String>,
+        /// Whether the read is a survey, and so no use of the entries. A survey served
+        /// no body: the hits of a search or of a list, a brief, the rules of a policy
+        /// check, or the summaries in the prompt of a task. A check of the auditor that
+        /// reads bodies to test them together is a survey too, and so is the read of an
+        /// export, which carries each entry of its scope. A read that served a body to a
+        /// reader leaves the field out.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        survey: bool,
     },
     /// Something left the perimeter in a session: a handoff a tap posted, a bundle an
     /// export wrote, or a model call the egress saw answered.
@@ -123,6 +131,19 @@ pub enum Change {
         /// The digest of what went: the handoff's stored text, the bundle's manifest, or
         /// the request of the model call.
         digest: String,
+    },
+    /// An entry was demoted behind a tombstone. The `put` before this event holds the
+    /// version. This event holds the reason as a code, and no text.
+    Demoted {
+        /// The entry.
+        id: String,
+        /// The reason code: `dead` or `wrong`.
+        reason: String,
+    },
+    /// A person restored a demoted entry. The `put` before this event holds the version.
+    Restored {
+        /// The entry.
+        id: String,
     },
     /// A copy of one event of the ledger: what happened to a task, and no text of it.
     Ledger {
@@ -510,8 +531,10 @@ pub fn state(events: &[Event]) -> BTreeMap<String, Option<(String, bool)>> {
                 out.insert(id.clone(), None);
             }
             // offered, refused, read, sent, or the ledger's: none of these says what the
-            // record holds
+            // record holds. A demotion and a restore have a `put` that does
             Change::Write { .. }
+            | Change::Demoted { .. }
+            | Change::Restored { .. }
             | Change::Quarantined { .. }
             | Change::Read { .. }
             | Change::Send { .. }
@@ -620,6 +643,21 @@ impl Memory {
         }
     }
 
+    /// Say in the log of its domain what a duty did to `entry`, after the `put` of the
+    /// version: a demotion or a restore. The event names this session, and carries the
+    /// classification of the entry.
+    pub(crate) fn log_duty(&self, entry: &Entry, change: Change) -> Result<Event, Error> {
+        append_with(
+            &self.root,
+            &entry.front.domain,
+            &self.author,
+            Some(self.actor()),
+            Some(entry.front.classification),
+            true,
+            |_| Ok(change),
+        )
+    }
+
     /// Say in its domain's log that an entry is offered, before anything screens it.
     /// The entry gets its `session` here, this session and the sequence number of the
     /// event, so the digest the event names is of the text the record will hold. An
@@ -701,14 +739,34 @@ impl Memory {
         }
     }
 
-    /// Say in `domain`'s log that this session was served `ids`, at `label`: the highest
-    /// classification among them. The session keeps the domain as one it has read, so a
-    /// later send of the session goes into this log too.
+    /// Say in `domain`'s log that this session was served the bodies of `ids`, at
+    /// `label`: the highest classification among them. The session keeps the domain as
+    /// one it has read, so a later send of the session goes into this log too.
     pub(crate) fn log_read(
         &self,
         domain: &str,
         ids: Vec<String>,
         label: Label,
+    ) -> Result<(), Error> {
+        self.log_served(domain, ids, label, false)
+    }
+
+    /// As [`Memory::log_read`], for a survey: a read that is no use of `ids`.
+    pub(crate) fn log_survey(
+        &self,
+        domain: &str,
+        ids: Vec<String>,
+        label: Label,
+    ) -> Result<(), Error> {
+        self.log_served(domain, ids, label, true)
+    }
+
+    fn log_served(
+        &self,
+        domain: &str,
+        ids: Vec<String>,
+        label: Label,
+        survey: bool,
     ) -> Result<(), Error> {
         append_with(
             &self.root,
@@ -717,7 +775,7 @@ impl Memory {
             Some(self.actor()),
             Some(label),
             false,
-            |_| Ok(Change::Read { ids }),
+            |_| Ok(Change::Read { ids, survey }),
         )?;
         crate::lock(&self.read_domains).insert(domain.to_string());
         Ok(())
@@ -1399,7 +1457,7 @@ mod tests {
             .unwrap()
             .into_iter()
             .filter_map(|e| match e.change {
-                Change::Read { ids } => Some((e.session.unwrap_or_default(), ids)),
+                Change::Read { ids, .. } => Some((e.session.unwrap_or_default(), ids)),
                 _ => None,
             })
             .collect()
@@ -2194,7 +2252,11 @@ mod tests {
         assert!(carried.len() >= 3, "{carried:?}");
         let events = read(dir.path(), "dom-me", at + 1).unwrap();
         assert_eq!(events.len(), 2, "{events:?}");
-        assert_eq!(events[0].change, Change::Read { ids: carried });
+        let read = Change::Read {
+            ids: carried,
+            survey: true,
+        };
+        assert_eq!(events[0].change, read, "an export is no use of an entry");
         assert_eq!(events[0].label, Some(Label::Restricted), "the highest");
         let manifest = std::fs::read_to_string(out.path().join("manifest.yaml")).unwrap();
         let sent = Change::Send {
@@ -2678,6 +2740,7 @@ mod tests {
             },
             _ => Change::Read {
                 ids: vec![format!("mem-me-{seq}")],
+                survey: false,
             },
         };
         Event {

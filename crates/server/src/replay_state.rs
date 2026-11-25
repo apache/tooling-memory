@@ -310,6 +310,7 @@ mod tests {
         // an event that names no version leaves the offset where it is
         let read = log::Change::Read {
             ids: vec!["a".into()],
+            survey: false,
         };
         log::append(dir.path(), "dom-a", "me", read).unwrap();
         assert_eq!(log::offset(dir.path(), "dom-a").unwrap(), 2, "after a read");

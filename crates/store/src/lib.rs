@@ -712,6 +712,7 @@ mod tests {
                 created: datetime!(2026-10-01 10:00 UTC),
                 cites: vec![],
                 session: None,
+                owner: None,
                 reach: dm_core::Reach::Fleet,
                 task: None,
                 confidence: None,

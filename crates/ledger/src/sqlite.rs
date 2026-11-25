@@ -929,8 +929,8 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
             "UPDATE tasks SET extra = json_remove(extra, '$.position', '$.pin_reason')
              WHERE id = ?1 AND extra IS NOT NULL AND extra != ''"
         }
-        // the record that someone tried, or spoke after its claim, or approved an action,
-        // or of what a task definition earned: no task moves
+        // the record that someone tried, or spoke after its claim, or judged the result,
+        // or approved an action, or of what a task definition earned: no task moves
         _ => return Ok(()),
     };
     conn.execute(sql, params![id])?;
@@ -979,6 +979,7 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         | Event::Unpinned { .. }
         | Event::ClaimRefused { .. }
         | Event::LateHandoff { .. }
+        | Event::Outcome { .. }
         | Event::Approved(_)
         | Event::Definition(_) => project_waiting(conn, id, event)?,
         Event::Claimed { holder, until, .. } => {

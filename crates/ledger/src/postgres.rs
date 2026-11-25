@@ -1528,10 +1528,11 @@ async fn project<C: GenericClient>(
              WHERE id = $1 AND extra IS NOT NULL AND extra <> ''",
             vec![&id],
         ),
-        // the record that someone tried, or spoke after its claim, or approved an action,
-        // or of what a task definition earned: no task moves
+        // the record that someone tried, or spoke after its claim, or judged the result,
+        // or approved an action, or of what a task definition earned: no task moves
         Event::ClaimRefused { .. }
         | Event::LateHandoff { .. }
+        | Event::Outcome { .. }
         | Event::Approved(_)
         | Event::Definition(_) => return Ok(()),
         Event::Claimed { holder, .. } => (

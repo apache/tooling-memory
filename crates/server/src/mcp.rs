@@ -5,6 +5,7 @@
 //! ledger operations, and a `memory://t0/<domain>` resource per granted domain. What it
 //! never gets is a path on disk, a credential, or an entry its grants do not admit.
 
+use crate::duties::{CheckOptions, DemoteReason, DEAD_WINDOW_DAYS};
 use crate::lineage::Direction;
 use crate::recall::{self, Budget, Depth};
 use crate::{tape, Error, Memory, WriteRequest};
@@ -31,6 +32,8 @@ use time::Duration;
 const DEFAULT_LEASE_SECONDS: i64 = 30 * 60;
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 100;
+/// The entries that `test_together` searches from when the caller names no number.
+const DEFAULT_SAMPLE: usize = 8;
 
 fn mcp_err(e: Error) -> McpError {
     match e {
@@ -344,6 +347,79 @@ pub struct WriteParams {
     /// A one-line summary; else the body's first paragraph.
     #[serde(default)]
     pub summary: Option<String>,
+    /// The person who answers for the entry, as `human:...`. A convention and a method
+    /// name one.
+    #[serde(default)]
+    pub owner: Option<String>,
+}
+
+/// Parameters of `demote`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct DemoteParams {
+    /// The entry id.
+    pub id: String,
+    /// `dead` or `wrong`. An agent gives `dead`.
+    pub reason: String,
+}
+
+/// Parameters of `dead`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct DeadParams {
+    /// A granted domain. Omit for every granted domain.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// The window in days. Default 90, the window of a demotion by an agent.
+    #[serde(default)]
+    pub days: Option<i64>,
+}
+
+/// Parameters of a survey that can file what it finds: `check_conventions`,
+/// `corrections` and `policy_curation`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct SurveyParams {
+    /// The domain; the only granted domain when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// File one task for each finding. A finding that has a task gets no second task.
+    #[serde(default)]
+    pub file: Option<bool>,
+}
+
+/// Parameters of `record_outcome`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct RecordOutcomeParams {
+    /// The task id.
+    pub task: String,
+    /// accepted, corrected, rejected or reverted.
+    pub kind: String,
+    /// What was wrong, or what was changed. At most 2000 characters.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+/// Parameters of `outcomes`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct OutcomesParams {
+    /// The task id.
+    pub task: String,
+}
+
+/// Parameters of `auditor_mode`: none.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct NoParams {}
+
+/// Parameters of `test_together`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct TogetherParams {
+    /// The domain; the only granted domain when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+    /// How many of the newest entries to search from. Default 8.
+    #[serde(default)]
+    pub sample: Option<usize>,
+    /// File one task for a person for each pair found.
+    #[serde(default)]
+    pub file: Option<bool>,
 }
 
 /// Parameters of `list`.
@@ -811,6 +887,10 @@ const READS: &[&str] = &[
     "lineage",
     "log",
     "outside_readers",
+    "dead",
+    "outcomes",
+    "auditor_mode",
+    "curation_case",
     "autonomy",
     "candidate_gates",
 ];
@@ -935,6 +1015,9 @@ impl McpServer {
             "body": e.body,
         });
         put_reach(&mut v, f.reach, f.task.as_deref());
+        if let Some(owner) = &f.owner {
+            v["owner"] = json!(owner);
+        }
         if !from.is_empty() {
             // as a client shows the URL it was redirected to: cite this id, not the one asked
             v["redirected_from"] = json!(from);
@@ -971,6 +1054,7 @@ impl McpServer {
             supersedes: p.supersedes,
             review_by,
             summary: p.summary,
+            owner: p.owner,
         };
         let w = self.memory.write(req).await.map_err(mcp_err)?;
         let mut v = json!({
@@ -1062,6 +1146,166 @@ impl McpServer {
             .await
             .map_err(mcp_err)?;
         ok(serde_json::to_value(r).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Demote an entry behind a tombstone: retrieval no longer serves it, `get` says that it was demoted, and its text stays in the archive. `reason` is `dead` or `wrong`, a code and never a text. As an agent you demote only while you hold a task of a curator or of the auditor, only for `dead`, and only an entry that the `dead` tool lists. A person judges that an entry is wrong, and only a person restores."
+    )]
+    async fn demote(&self, p: Parameters<DemoteParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let reason = DemoteReason::parse(&p.reason)
+            .ok_or_else(|| McpError::invalid_params("reason: dead or wrong", None))?;
+        let d = self.memory.demote(&p.id, reason).await.map_err(mcp_err)?;
+        ok(json!(d))
+    }
+
+    #[tool(
+        description = "Restore a demoted entry: retrieval serves it again. Only a person does this."
+    )]
+    async fn restore(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+        self.memory.restore(&p.0.id).await.map_err(mcp_err)?;
+        ok(json!({ "restored": p.0.id }))
+    }
+
+    #[tool(
+        description = "The dead entries that you read: older than the window, not read inside it, named by no active entry, not verified, and not a handoff, a policy entry, a position or a canary. Each is a candidate for `demote` with the reason `dead`. The list is not a read of the entries, but it raises your label to their classification."
+    )]
+    async fn dead(&self, p: Parameters<DeadParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let days = p.days.unwrap_or(DEAD_WINDOW_DAYS);
+        let dead = self
+            .memory
+            .dead(p.domain.as_deref(), days)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "dead": dead }))
+    }
+
+    #[tool(
+        description = "The convention checks over the entries of a domain: freshness (a fact has a review date, and no entry is more than 30 days past its review date), ownership (a convention and a method name an owner), cross-link (each entry named is one that the record serves) and superseded (no citation of a replaced entry). Each failure names the entry and the person who answers for it. With `file`, each failure becomes one task: for a person, or for a curator when the entry cites a replaced entry."
+    )]
+    async fn check_conventions(
+        &self,
+        p: Parameters<SurveyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let m = &self.memory;
+        let domain = p.domain.as_deref();
+        let today = time::OffsetDateTime::now_utc().date();
+        let failures = m
+            .check_conventions(domain, today, &CheckOptions::default())
+            .await
+            .map_err(mcp_err)?;
+        let filed = if p.file.unwrap_or(false) {
+            m.file_failures(domain, &failures).await.map_err(mcp_err)?
+        } else {
+            (Vec::new(), 0)
+        };
+        ok(json!({ "failures": failures, "filed": filed.0, "already_filed": filed.1 }))
+    }
+
+    #[tool(
+        description = "Record what became of the result of a task: `accepted`, `corrected`, `rejected` or `reverted`, with a note. Only a person records an outcome. A result that was corrected, rejected or reverted is a correction, and the `corrections` tool gives it to a curator."
+    )]
+    async fn record_outcome(
+        &self,
+        p: Parameters<RecordOutcomeParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let kind = dm_ledger::OutcomeKind::parse(&p.kind).ok_or_else(|| {
+            McpError::invalid_params("kind: accepted, corrected, rejected or reverted", None)
+        })?;
+        let said = self
+            .memory
+            .record_outcome_event(&p.task, kind, p.note.as_deref().unwrap_or(""))
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "outcomes": said }))
+    }
+
+    #[tool(
+        description = "The outcome events of a task, oldest first: what became of its result, who said so, and the note."
+    )]
+    async fn outcomes(&self, p: Parameters<OutcomesParams>) -> Result<CallToolResult, McpError> {
+        let said = self.memory.outcomes(&p.0.task).await.map_err(mcp_err)?;
+        ok(json!({ "outcomes": said }))
+    }
+
+    #[tool(
+        description = "The corrections of a domain: each task whose result a person corrected, rejected or reverted, with its outcome events. `disputed` is true when one person accepted the result and another person did not. With `file`, each correction becomes one task: for a curator, with the question whether the method or the knowledge was at fault, or for a person when the correction is disputed."
+    )]
+    async fn corrections(&self, p: Parameters<SurveyParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let m = &self.memory;
+        let domain = p.domain.as_deref();
+        let found = m.corrections(domain).await.map_err(mcp_err)?;
+        let filed = if p.file.unwrap_or(false) {
+            m.file_corrections(domain, &found).await.map_err(mcp_err)?
+        } else {
+            (Vec::new(), 0)
+        };
+        ok(json!({ "corrections": found, "filed": filed.0, "already_filed": filed.1 }))
+    }
+
+    #[tool(
+        description = "What a curator finds in the policy and in the done work of a domain: the pairs of rules in force in one layer whose sentences overlap, and the work that was done three times or more with no task definition. With `file`, each pair becomes a proposal to the owners of the two rules to merge them, and each repeated work becomes a task to write a task definition."
+    )]
+    async fn policy_curation(
+        &self,
+        p: Parameters<SurveyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let m = &self.memory;
+        let domain = p.domain.as_deref();
+        let found = m.policy_curation(domain).await.map_err(mcp_err)?;
+        let filed = if p.file.unwrap_or(false) {
+            m.file_policy_curation(domain, &found)
+                .await
+                .map_err(mcp_err)?
+        } else {
+            (Vec::new(), 0)
+        };
+        ok(json!({
+            "overlaps": found.overlaps, "repeated": found.repeated,
+            "filed": filed.0, "already_filed": filed.1,
+        }))
+    }
+
+    #[tool(
+        description = "How the auditor runs: `other-model` when a model that is not the model of the curators qualified on the planted faults, else `fresh-session`. `qualified` says whether a qualification is on file, and `human_sample` how many verdicts a person reviews in each cycle."
+    )]
+    async fn auditor_mode(&self, _p: Parameters<NoParams>) -> Result<CallToolResult, McpError> {
+        ok(json!(self.memory.auditor_mode().map_err(mcp_err)?))
+    }
+
+    #[tool(
+        description = "One curated entry as a judge reads it: the entry, the version that it replaced and the entries that it cites, in `text`. The handoff of the curator and the reason of a promotion are never given, so judge the entry on its sources. `unsupported` is true when it cites no entry that you can read. Each entry given is a read of this session."
+    )]
+    async fn curation_case(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+        let case = self.memory.curation_case(&p.0.id).await.map_err(mcp_err)?;
+        ok(case.to_json())
+    }
+
+    #[tool(
+        description = "Test entries together: for each of the newest entries of a domain, the scan of the write gate over each ordered pair of the entries that one search returns with it. A pair is reported when the two bodies together carry a finding that neither carries alone. The report names the ids and the kinds of finding, and never text. With `file`, each pair becomes one task for a person."
+    )]
+    async fn test_together(
+        &self,
+        p: Parameters<TogetherParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let m = &self.memory;
+        let domain = p.domain.as_deref();
+        let found = m
+            .test_together(domain, p.sample.unwrap_or(DEFAULT_SAMPLE))
+            .await
+            .map_err(mcp_err)?;
+        let filed = if p.file.unwrap_or(false) {
+            m.file_together(domain, &found).await.map_err(mcp_err)?
+        } else {
+            Vec::new()
+        };
+        ok(json!({ "together": found, "filed": filed }))
     }
 
     #[tool(
@@ -3311,6 +3555,278 @@ mod tests {
         assert!(owner.outside_readers(Parameters(other)).await.is_err());
     }
 
+    fn id_params(id: &str) -> Parameters<GetParams> {
+        Parameters(GetParams { id: id.into() })
+    }
+
+    fn demote_params(id: &str, reason: &str) -> Parameters<DemoteParams> {
+        Parameters(DemoteParams {
+            id: id.into(),
+            reason: reason.into(),
+        })
+    }
+
+    #[tokio::test]
+    async fn demote_is_refused_to_an_agent_with_no_curator_s_task_in_the_words_of_the_library() {
+        let (dir, owner) = server().await;
+        let id = write_note(&owner, "# Port\n\nIt listens on 8080.\n").await;
+        let worker = server_of(dir.path(), "agent:worker");
+        let refused = worker.demote(demote_params(&id, "dead")).await.unwrap_err();
+        assert_eq!(refused.code, McpError::invalid_params("", None).code);
+        let library = worker.memory.demote(&id, DemoteReason::Dead).await;
+        assert_eq!(refused.message, library.unwrap_err().to_string());
+        let why = "only on a task of a curator or of the auditor, and agent:worker holds none";
+        assert!(refused.message.contains(why), "{refused:?}");
+        let bad = owner.demote(demote_params(&id, "stale")).await.unwrap_err();
+        assert_eq!(bad.message, "reason: dead or wrong");
+
+        // the survey of the dead: the window of the caller, and 90 days with none
+        let now = DeadParams {
+            days: Some(0),
+            ..DeadParams::default()
+        };
+        let dead = payload(&owner.dead(Parameters(now)).await.unwrap());
+        assert_eq!(dead["dead"][0]["id"], id, "{dead}");
+        let default = payload(&owner.dead(Parameters(DeadParams::default())).await.unwrap());
+        assert_eq!(default, json!({ "dead": [] }));
+
+        let done = payload(&owner.demote(demote_params(&id, "wrong")).await.unwrap());
+        assert_eq!(done["id"], id);
+        assert_eq!(done["reason"], "wrong");
+        assert_eq!(done["by"], "human:test:me");
+        let gone = owner.get(id_params(&id)).await.unwrap_err();
+        assert!(gone.message.contains("demoted"), "{gone:?}");
+        let refused = worker.restore(id_params(&id)).await.unwrap_err();
+        let why = "only a person restores a demoted entry";
+        assert!(refused.message.contains(why), "{refused:?}");
+        let back = payload(&owner.restore(id_params(&id)).await.unwrap());
+        assert_eq!(back, json!({ "restored": id }));
+        owner.get(id_params(&id)).await.unwrap();
+    }
+
+    fn outcome_params(task: &str, kind: &str) -> Parameters<RecordOutcomeParams> {
+        Parameters(RecordOutcomeParams {
+            task: task.into(),
+            kind: kind.into(),
+            note: Some("The port is 8443.".into()),
+        })
+    }
+
+    /// A survey that files what it finds, or one that names no `file`.
+    fn filing(file: bool) -> Parameters<SurveyParams> {
+        Parameters(SurveyParams {
+            domain: None,
+            file: file.then_some(true),
+        })
+    }
+
+    #[tokio::test]
+    async fn record_outcome_is_refused_to_an_agent_and_a_correction_is_filed_once() {
+        let (dir, owner) = server().await;
+        let task = admitted_task(&owner, "Find the port", None).await;
+        let worker = server_of(dir.path(), "agent:worker");
+        let refused = worker.record_outcome(outcome_params(&task, "corrected"));
+        let refused = refused.await.unwrap_err();
+        let why = "only a person records the outcome of a task";
+        assert!(refused.message.contains(why), "{refused:?}");
+        let bad = owner.record_outcome(outcome_params(&task, "wrong"));
+        let bad = bad.await.unwrap_err().message;
+        assert_eq!(bad, "kind: accepted, corrected, rejected or reverted");
+        let empty = payload(&owner.corrections(filing(true)).await.unwrap());
+        let none = json!({ "corrections": [], "filed": [], "already_filed": 0 });
+        assert_eq!(empty, none);
+
+        let said = owner.record_outcome(outcome_params(&task, "corrected"));
+        let said = payload(&said.await.unwrap());
+        assert_eq!(said["outcomes"][0]["outcome"], "corrected");
+        assert_eq!(said["outcomes"][0]["by"], "human:test:me");
+        assert_eq!(said["outcomes"][0]["note"], "The port is 8443.");
+        let params = OutcomesParams { task: task.clone() };
+        let read = payload(&owner.outcomes(Parameters(params)).await.unwrap());
+        assert_eq!(read, said);
+        let library = owner.memory.outcomes(&task).await.unwrap();
+        assert_eq!(read["outcomes"], serde_json::to_value(library).unwrap());
+
+        let only = payload(&owner.corrections(filing(false)).await.unwrap());
+        assert_eq!(only["corrections"][0]["task"], task);
+        assert_eq!(only["filed"], json!([]), "not filed unless asked: {only}");
+        let found = payload(&owner.corrections(filing(true)).await.unwrap());
+        let filed = found["filed"][0].as_str().expect("a task").to_string();
+        let t = owner.memory.get_task(&filed).await.unwrap();
+        assert_eq!(t.spec.origin.as_deref(), Some("curator:correction"));
+        let again = payload(&owner.corrections(filing(true)).await.unwrap());
+        assert_eq!(again["filed"], json!([]));
+        assert_eq!(again["already_filed"], 1);
+    }
+
+    #[tokio::test]
+    async fn auditor_mode_gives_the_answer_of_the_library() {
+        let (_dir, owner) = server().await;
+        let mode = || async {
+            let none = Parameters(NoParams::default());
+            payload(&owner.auditor_mode(none).await.unwrap())
+        };
+        let fresh = json!({
+            "mode": "fresh-session", "qualified": false,
+            "auditor_model": null, "human_sample": 3,
+        });
+        assert_eq!(mode().await, fresh);
+        let score = |model: &str, caught| crate::audit::Score {
+            model: model.into(),
+            caught,
+            missed: 6 - caught,
+            false_alarms: 0,
+        };
+        let at = time::OffsetDateTime::UNIX_EPOCH;
+        let q = crate::audit::qualify(score("m-a", 4), Some(score("m-b", 5)), at);
+        owner.memory.set_qualification(&q).unwrap();
+        let other = mode().await;
+        assert_eq!(other["mode"], "other-model");
+        assert_eq!(other["auditor_model"], "m-b");
+        assert_eq!(other["human_sample"], 1);
+        let library = owner.memory.auditor_mode().unwrap();
+        assert_eq!(other, serde_json::to_value(library).unwrap());
+    }
+
+    fn convention(owner: Option<&str>) -> Parameters<WriteParams> {
+        Parameters(WriteParams {
+            body: "# Titles\n\nA title says what an entry claims.\n".into(),
+            entry_type: Some("convention".into()),
+            owner: owner.map(str::to_string),
+            ..WriteParams::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn write_takes_an_owner_and_check_conventions_files_an_entry_that_names_none() {
+        let (_dir, s) = server().await;
+        let refused = s.write(convention(Some("agent:worker"))).await;
+        assert!(refused.is_err(), "an owner is a person");
+        let owned = payload(&s.write(convention(Some("human:test:lead"))).await.unwrap());
+        let got = payload(
+            &s.get(id_params(owned["id"].as_str().unwrap()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(got["owner"], "human:test:lead", "{got}");
+        let clean = payload(&s.check_conventions(filing(true)).await.unwrap());
+        let none = json!({ "failures": [], "filed": [], "already_filed": 0 });
+        assert_eq!(clean, none);
+
+        let bare = payload(&s.write(convention(None)).await.unwrap());
+        let found = payload(&s.check_conventions(filing(false)).await.unwrap());
+        assert_eq!(found["failures"][0]["check"], "ownership", "{found}");
+        assert_eq!(found["failures"][0]["entry"], bare["id"]);
+        assert_eq!(found["failures"][0]["owner"], "human:test:me");
+        assert_eq!(found["filed"], json!([]), "not filed unless asked: {found}");
+        let filed = payload(&s.check_conventions(filing(true)).await.unwrap());
+        let task = filed["filed"][0].as_str().expect("a task").to_string();
+        let t = s.memory.get_task(&task).await.unwrap();
+        assert_eq!(t.spec.origin.as_deref(), Some("convention:ownership"));
+        let again = payload(&s.check_conventions(filing(true)).await.unwrap());
+        assert_eq!(again["filed"], json!([]));
+        assert_eq!(again["already_filed"], 1);
+    }
+
+    /// File a task through `s`, claim it and complete it with a handoff.
+    async fn done_task(s: &McpServer, title: &str) -> String {
+        let id = admitted_task(s, title, None).await;
+        let claim = LeaseParams {
+            id: id.clone(),
+            ..LeaseParams::default()
+        };
+        s.claim(Parameters(claim)).await.unwrap();
+        let done = CompleteParams {
+            id: id.clone(),
+            handoff: write_handoff(s, "Done.").await,
+            ..CompleteParams::default()
+        };
+        s.complete(Parameters(done)).await.unwrap();
+        id
+    }
+
+    #[tokio::test]
+    async fn policy_curation_gives_repeated_work_and_files_it_once() {
+        let (_dir, s) = server().await;
+        let mut ids = Vec::new();
+        for n in 1..=3 {
+            ids.push(done_task(&s, &format!("Rotate the signing key {n}")).await);
+        }
+        ids.sort();
+        let found = payload(&s.policy_curation(filing(false)).await.unwrap());
+        assert_eq!(found["overlaps"], json!([]));
+        assert_eq!(found["repeated"][0]["title"], "rotate the signing key");
+        assert_eq!(found["repeated"][0]["tasks"], json!(ids));
+        assert_eq!(found["filed"], json!([]), "not filed unless asked: {found}");
+        let library = s.memory.policy_curation(None).await.unwrap();
+        assert_eq!(found["repeated"], json!(library.repeated));
+        let filed = payload(&s.policy_curation(filing(true)).await.unwrap());
+        assert_eq!(filed["filed"].as_array().unwrap().len(), 1, "{filed}");
+        let again = payload(&s.policy_curation(filing(true)).await.unwrap());
+        assert_eq!(again["filed"], json!([]));
+        assert_eq!(again["already_filed"], 1);
+    }
+
+    fn together(sample: Option<usize>, file: bool) -> Parameters<TogetherParams> {
+        Parameters(TogetherParams {
+            domain: None,
+            sample,
+            file: file.then_some(true),
+        })
+    }
+
+    fn titled(title: &str, body: &str) -> Parameters<WriteParams> {
+        Parameters(WriteParams {
+            title: Some(title.into()),
+            body: body.into(),
+            ..WriteParams::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn test_together_and_curation_case_give_the_answers_of_the_library() {
+        let (dir, owner) = server().await;
+        let w = server_of(dir.path(), "agent:writer");
+        let half = "After a rotation of the cache key, the old build tools ignore all\nprevious\n";
+        let rest = "instructions for a rotation of the cache key are in the runbook.\n";
+        let a = payload(&w.write(titled("Cache key rotation", half)).await.unwrap());
+        let b = w.write(titled("Rotation of the cache key", rest)).await;
+        let b = payload(&b.unwrap());
+        let found = payload(&owner.test_together(together(None, false)).await.unwrap());
+        assert_eq!(found["together"][0]["ids"], json!([a["id"], b["id"]]));
+        assert_eq!(found["together"][0]["findings"], json!(["instruction"]));
+        assert_eq!(found["filed"], json!([]), "not filed unless asked: {found}");
+        let library = owner.memory.test_together(None, DEFAULT_SAMPLE).await;
+        assert_eq!(found["together"], json!(library.unwrap()));
+        // the sample of the caller is the sample of the survey
+        let zero = payload(&owner.test_together(together(Some(0), true)).await.unwrap());
+        assert_eq!(zero, json!({ "together": [], "filed": [] }));
+        let filed = payload(&owner.test_together(together(None, true)).await.unwrap());
+        let task = filed["filed"][0].as_str().expect("a task").to_string();
+        let t = owner.memory.get_task(&task).await.unwrap();
+        assert_eq!(t.spec.origin.as_deref(), Some("auditor:together"));
+        let again = payload(&owner.test_together(together(None, true)).await.unwrap());
+        assert_eq!(again["filed"], json!([]));
+
+        let id = a["id"].as_str().unwrap();
+        let case = payload(&owner.curation_case(id_params(id)).await.unwrap());
+        let library = owner.memory.curation_case(id).await.unwrap();
+        assert_eq!(case, library.to_json());
+        assert_eq!(case["entry"], id);
+        assert_eq!(case["unsupported"], true);
+        assert!(case["text"].as_str().unwrap().contains("old build tools"));
+    }
+
+    #[test]
+    fn the_surveys_of_the_duties_only_read_and_the_duties_change() {
+        for tool in ["dead", "outcomes", "auditor_mode", "curation_case"] {
+            assert_eq!(kind_of(tool), tape::Kind::Read, "{tool}");
+        }
+        for tool in ["demote", "restore", "record_outcome", "check_conventions"] {
+            assert_eq!(kind_of(tool), tape::Kind::Mutation, "{tool}");
+        }
+    }
+
     #[test]
     fn lineage_and_log_only_read() {
         assert_eq!(kind_of("lineage"), tape::Kind::Read);
@@ -3570,11 +4086,13 @@ mod tests {
         }
 
         /// A re-run serves the two reads from the record as it is, and captures the
-        /// other three as it captures a write. An outcome is a person's at the command
-        /// line, and a list of who is flagged would tell an agent where the threshold
-        /// is: no tool does either.
+        /// other three as it captures a write. A work outcome is a person's at the
+        /// command line, and a list of who is flagged would tell an agent where the
+        /// threshold is: no tool does either. The tools `record_outcome` and `outcomes`
+        /// are for the outcome event of a task, which is on no definition and moves no
+        /// level.
         #[test]
-        fn the_reads_are_reads_and_no_tool_records_an_outcome_or_lists_probing() {
+        fn the_reads_are_reads_and_no_tool_records_a_work_outcome_or_lists_probing() {
             for read in ["autonomy", "candidate_gates"] {
                 assert_eq!(kind_of(read), tape::Kind::Read, "{read}");
             }
@@ -3584,9 +4102,11 @@ mod tests {
             let router = McpServer::tool_router();
             let tools = router.list_all();
             let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+            let of_an_outcome_event = ["record_outcome", "outcomes"];
             let neither: Vec<&&str> = names
                 .iter()
                 .filter(|n| n.contains("outcome") || n.contains("probing"))
+                .filter(|n| !of_an_outcome_event.contains(n))
                 .collect();
             assert!(neither.is_empty(), "a tool that should not be: {neither:?}");
         }

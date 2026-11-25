@@ -38,10 +38,12 @@ use tokio::sync::Mutex as AsyncMutex;
 
 pub mod approvals;
 pub mod arms;
+pub mod audit;
 pub mod autonomy;
 pub mod bundle;
 pub mod contexts;
 pub mod drift_windows;
+pub mod duties;
 pub mod evaluation;
 pub mod fabric;
 pub mod gates;
@@ -219,6 +221,10 @@ pub struct WriteRequest {
     /// A one-line summary; else the body's first paragraph.
     #[serde(default)]
     pub summary: Option<String>,
+    /// The person who answers for the entry, as `human:<system>:<id>`. A write that
+    /// replaces an entry and names none keeps the owner of that entry.
+    #[serde(default)]
+    pub owner: Option<String>,
 }
 
 fn default_type() -> EntryType {
@@ -1160,7 +1166,9 @@ impl Memory {
     /// The session has read `hits`: its label rises to the classification of each, and
     /// the log of each domain among them takes one read event, which names that domain's
     /// entries at the highest classification among them. A read is in the log whether
-    /// the read log is kept or not: the read log is telemetry, and this is lineage.
+    /// the read log is kept or not: the read log is telemetry, and this is lineage. The
+    /// event says that the read is a survey: it served no body, so the rule for a dead
+    /// entry does not count it as a use.
     ///
     /// # Errors
     ///
@@ -1184,7 +1192,7 @@ impl Memory {
             }
         }
         for (domain, (ids, label)) in served {
-            self.log_read(domain, ids, label)?;
+            self.log_survey(domain, ids, label)?;
         }
         Ok(())
     }
@@ -1205,17 +1213,41 @@ impl Memory {
         label: Label,
         outside: bool,
     ) -> Result<bool, Error> {
-        {
-            let mut s = lock(&self.session);
-            if !s.observe(label) {
-                return Ok(false);
-            }
-            if outside {
-                s.read_outside();
-            }
+        if !self.observe_label(label, outside) {
+            return Ok(false);
         }
         self.log_read(domain, vec![id.to_string()], label)?;
         Ok(true)
+    }
+
+    /// As [`Memory::observe_entry`], for a check that reads the body to test it and
+    /// serves it to no reader. The read event says that the read is a survey, so the
+    /// rule for a dead entry does not count it as a use.
+    fn observe_checked(
+        &self,
+        domain: &str,
+        id: &str,
+        label: Label,
+        outside: bool,
+    ) -> Result<bool, Error> {
+        if !self.observe_label(label, outside) {
+            return Ok(false);
+        }
+        self.log_survey(domain, vec![id.to_string()], label)?;
+        Ok(true)
+    }
+
+    /// The label of the session rises to `label`, when the session may handle it.
+    /// `outside` marks the session as one that read outside content.
+    fn observe_label(&self, label: Label, outside: bool) -> bool {
+        let mut s = lock(&self.session);
+        if !s.observe(label) {
+            return false;
+        }
+        if outside {
+            s.read_outside();
+        }
+        true
     }
 
     /// Ranked search, summaries only, within the session's filter.
@@ -1535,6 +1567,7 @@ impl Memory {
         if let Some(old) = &req.supersedes {
             self.may_replace(old, tier, reach, held.as_deref()).await?;
         }
+        let owner = self.owner_for_write(&domain, &req).await?;
         let cites = self.cites_for_write(&domain, req.entry_type, req.cites);
         let cites = cites.await?;
         let now = next_stamp(&mut lock(&self.last_stamp), OffsetDateTime::now_utc());
@@ -1550,6 +1583,7 @@ impl Memory {
                 entry_type: req.entry_type,
                 domain,
                 author: self.author.clone(),
+                owner,
                 created: now,
                 cites,
                 // the log gives it, with the event that offers the entry
@@ -1569,6 +1603,33 @@ impl Memory {
             },
             body: req.body,
         })
+    }
+
+    /// The owner of the entry that a request asks for: the person that the request
+    /// names, or else the owner of the entry that it replaces. That entry is one that
+    /// the session reads ([`Memory::may_replace`] ran before this).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`] for an owner that is not a person, or a store error.
+    async fn owner_for_write(
+        &self,
+        domain: &str,
+        req: &WriteRequest,
+    ) -> Result<Option<String>, Error> {
+        if let Some(owner) = &req.owner {
+            if !duties::is_person(owner) {
+                return Err(Error::Denied(format!(
+                    "the owner of an entry is a person, as human:<system>:<id>, and {owner:?} is not"
+                )));
+            }
+            return Ok(Some(owner.clone()));
+        }
+        let Some(old) = &req.supersedes else {
+            return Ok(None);
+        };
+        let replaced = self.store.get(domain, old).await?;
+        Ok(replaced.and_then(|e| e.front.owner))
     }
 
     /// The row of the raw-reach table for an entry that this session writes now: tap
@@ -3736,7 +3797,8 @@ impl Memory {
     }
 
     /// Say in the log of `domain` that a bundle left: first a read of the entries it
-    /// carries, at the highest classification among them, then the send, which names the
+    /// carries, at the highest classification among them and marked as a survey, since
+    /// an export of a scope is no use of one entry, then the send, which names the
     /// bound of the export and the digest of the manifest. The session's label does not
     /// rise: an export hands the entries out and shows none of them to the session. The
     /// send is at the highest classification the bundle holds when that is above the
@@ -3748,7 +3810,7 @@ impl Memory {
     ) -> Result<(), Error> {
         let ids: Vec<String> = manifest.entries.iter().map(|e| e.id.clone()).collect();
         if let Some(carried) = manifest.entries.iter().map(|e| e.classification).max() {
-            self.log_read(domain, ids, carried)?;
+            self.log_survey(domain, ids, carried)?;
         }
         let to = format!("export:{}", manifest.max_label);
         let digest = dm_core::digest(&manifest.to_yaml());

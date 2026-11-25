@@ -340,6 +340,125 @@ with a budget of 1,500 tokens, the auditor stopped after five entries, as the lo
 shows. The curator left one side remark in its handoff: the Makefile's usage examples
 still implied a default harness. That remark was correct, and the issue is now fixed.
 
+## The duties of the curator and the auditor
+
+These commands and memory tools reach the duties. Each command and each tool calls one
+function of the library, so the two give the same answer. A command prints JSON.
+
+| Command | Memory tool | What it does |
+|---|---|---|
+| `amem dead [--domain D] [--days 90]` | `dead` | Lists the dead entries: the candidates for a demotion |
+| `amem demote <id> --reason dead\|wrong` | `demote` | Puts an entry behind a tombstone |
+| `amem restore <id>` | `restore` | Makes a demoted entry active again. Only a person |
+| `amem conventions [--domain D] [--overdue-days 30] [--file]` | `check_conventions` | Runs the convention checks. With `--file`, it files a task for each failure |
+| `amem task outcome <id> --kind K [--note TEXT]` | `record_outcome` | Records an outcome event. Only a person |
+| `amem task outcomes <id>` | `outcomes` | Gives the outcome events of a task |
+| `amem corrections [--domain D] [--file]` | `corrections` | Gives the corrections. With `--file`, it files a task for each |
+| `amem policy curate [--domain D] [--file]` | `policy_curation` | Gives the overlapping rules and the repeated work. With `--file`, it files a task for each |
+| `amem auditor mode` | `auditor_mode` | Gives the auditor mode |
+| `amem auditor qualify --curator-model M [--model C]` | none | Decides the qualification of the auditor. It calls a model, so it has no memory tool |
+| `amem auditor case <id>` | `curation_case` | Gives the curation case of one entry |
+| `amem auditor together [--domain D] [--sample 8] [--file]` | `test_together` | Tests entries together. With `--file`, it files a task for each pair |
+| `amem auditor handoffs [--domain D] [--sample 8]` | none | Lists the handoffs that a cycle gives to the auditor |
+
+`amem write --owner human:...` and the `owner` parameter of the `write` tool name the
+owner of an entry. The `get` tool gives the owner when an entry names one.
+
+A demotion deletes nothing. The entry gets a new version with `status: demoted`, and
+this version is the tombstone. `get` answers that the entry was demoted. Search, list and
+T0 do not give the entry. The log of the domain gets a `put` event and then a `demoted`
+event. The `demoted` event holds who demoted the entry and a reason code, `dead` or
+`wrong`. It holds no text.
+
+A person demotes each entry that the person reads, for either reason. An agent demotes
+only when all of these are true:
+
+- Its session holds a task of a curator or of the auditor.
+- The reason is `dead`.
+- The entry is a dead entry inside a window of 90 days.
+
+A handoff, a policy entry and a position are not demoted. Only a person restores an entry.
+
+A survey is not a use of an entry. Search, list and T0 give summaries, and their `read`
+events have `"survey": true`. The check that tests entries together reads bodies, and
+an export carries each entry of its scope. Their `read` events have the same field. Only a `read` event without this field keeps an
+entry out of the dead entries: `get` and `recall` write such events. Thus a curation
+cycle does not make each entry live again.
+
+The convention checks are `freshness`, `ownership`, `cross-link` and `superseded`. The
+check `cross-link` finds a linked entry through the read filter of the session. A linked
+entry that the session does not read fails as an entry that no granted domain holds,
+and the failure does not tell its status. A
+failure of the first three checks becomes a task that requires a person, with the origin
+`convention:<check>`. The text of the task names the owner of the entry. A failure of
+the check `superseded` becomes a task for a curator, with the origin `curator:rederive`
+and priority 3. A verify for an entry whose source file changed has the same priority.
+These two kinds of curation go first.
+
+An outcome event has one of four kinds: `accepted`, `corrected`, `rejected` or
+`reverted`. A task with an outcome that is not `accepted` is a correction. An outcome
+event is not a work outcome: it does not change the autonomy level of a task definition
+(see "A work outcome").
+`amem corrections --file` files a task for a curator with the origin
+`curator:correction`. The task asks whether the method was at fault or knowledge was
+missing. A disputed correction becomes a task for a person, with the origin
+`correction:disputed`. If a curator task for that correction is not closed, the command
+invalidates it. The text of each of these tasks names the task, each outcome and each
+person. It does not hold a note or the title of the task: `outcomes` gives the notes.
+Thus an erasure that removes a note from a task leaves no copy of the note.
+
+`curation_case` gives the version that an entry replaced, and a cited entry that is
+demoted or replaced, only to a person and to a session that holds a task of the auditor.
+For each other session, the replaced version is absent and such a cited entry is in
+`missing`.
+
+`amem auditor qualify` puts each of the ten planted cases to the model of the curators,
+and to the candidate that `--model` names. A candidate qualifies when all of these are
+true:
+
+- It is not the model of the curators.
+- It catches at least as many faults as the model of the curators.
+- It gives no more false alarms.
+
+The command keeps the decision in `state/auditor.json`. It needs a destination with a
+credential, as `amem audit` does. With no qualification on file, the auditor mode is
+`fresh-session`, and a person reviews three verdicts in each cycle. In the mode
+`other-model`, a person reviews one verdict.
+
+A curation cycle (`amem curate`) does the duties too:
+
+- It runs the auditor on the model that the qualification names. With no qualification
+  on file, it uses `--model`.
+- It tests entries together, and files a task for each pair (`auditor:together`).
+- It gives each of the newest curations to the model as a curation case. The model does
+  not get the handoff of the curator or the reason of a promotion. A curation that the
+  cited entries do not support becomes a task for a person (`auditor:curation`). A
+  curation that cites no entry becomes such a task without a model call.
+- It asks the model whether each of the newest handoffs holds an instruction for the
+  next agent. A finding becomes a task for a person (`auditor:handoff`).
+- It files the human sample of the verdicts for a person (`auditor:review`). A verdict
+  that has a task already takes no place in the sample.
+- It files the failures of the convention checks, the corrections, and the findings of
+  the curation of the policy.
+
+The line of the cycle in `state/curation.jsonl` has these fields for the duties:
+`auditor_mode`, `qualified`, `conventions`, `corrections`, `policy_curation`,
+`together`, `curations_judged`, `handoffs_sampled` and `human_review`. The budget of open
+curation tasks (`--budget-tasks`) counts only the tasks for a curator run. A task that
+requires a person does not count.
+
+The telemetry of the curator (`amem curator --telemetry`) counts a demotion for the
+principal of the `demoted` event in the log of the domain. It does not count the
+demotion for the author of the entry.
+
+These items are open:
+
+- A task with the origin `auditor:review`, `auditor:curation` or `auditor:handoff` holds
+  the reason that the model gave. The reason can repeat text of the entry. An erasure of
+  the entry does not change these tasks.
+- An erasure does not close a correction task for a task that the erasure changed.
+- When the people who disputed a correction agree later, no new task goes to a curator.
+
 ## The perimeter: policy, admission and the gates
 
 Every later session reads shared memory. Thus shared memory can send messages to agents
@@ -1530,6 +1649,12 @@ one time. The task does not change. Only a person records a work outcome, at the
 line. No memory tool records one. A work outcome is not the outcome of an external
 action, which is `applied` or `not_applied` (`amem task effect-settle`).
 
+A work outcome is not an outcome event either. `amem task outcome <task> --kind <kind>`
+and the tool `record_outcome` record an outcome event on the task. An outcome event goes
+to a curator as a correction, and it does not change a level. A work outcome, and a
+verdict that rejects the work, make no correction. One call of `amem task outcome` takes
+one of the two forms.
+
 ### The held-out domain and the evaluator
 
 A version earns a level on a held-out suite. The grants name the domain that holds the
@@ -2199,8 +2324,8 @@ Parquet, which you query with DuckDB or DataFusion. That shape takes the same va
 
 On each backend, the ledger adds a `task.<transition>` span for each transition that takes
 effect. The transitions are created, admitted, blocked, unblocked, retriaged, claimed,
-claim_refused, heartbeat, released, handoff_left, late_handoff, completed, invalidated and
-posted. The span holds the task as it is at that time:
+claim_refused, heartbeat, released, handoff_left, late_handoff, outcome, completed,
+invalidated and posted. The span holds the task as it is at that time:
 
 - the id, the domain, the status, the priority and the generation;
 - who filed it, its holder and its origin;
