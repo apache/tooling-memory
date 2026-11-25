@@ -379,6 +379,11 @@ pub struct Cycle {
     pub handoffs_sampled: usize,
     /// The verdicts of the auditor that this cycle filed for a person to review.
     pub human_review: usize,
+    /// The flags of the ownership registry: each has a task for a person.
+    pub registry_flags: usize,
+    /// The units whose horizon scanner got an evidence task and a review task for a new
+    /// period in this cycle.
+    pub horizon_filed: usize,
 }
 
 /// Append a cycle's record.

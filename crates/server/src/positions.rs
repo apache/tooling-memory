@@ -1957,6 +1957,33 @@ mod tests {
         );
     }
 
+    /// A handoff that a session in a position queues in an outage is written at the
+    /// end under the envelope of the position, as the session read.
+    #[tokio::test]
+    async fn a_handoff_queued_in_an_outage_replaces_no_entry_above_the_envelope() {
+        let dir = tempfile::tempdir().unwrap();
+        let (owner, fact) = public_seat(dir.path()).await;
+        let seated = session(dir.path(), "codex");
+        seated.fill_position(RELEASE, None).await.unwrap();
+        let replace = || WriteRequest {
+            supersedes: Some(fact.clone()),
+            ..handoff("The release is half done.\n")
+        };
+        // with no outage the write does not find the entry
+        let live = seated.write(replace()).await;
+        assert!(matches!(live, Err(Error::NotFound(_))), "{live:?}");
+        owner.declare_outage("the log does not answer").unwrap();
+        let queued = seated.write(replace()).await;
+        assert!(matches!(queued, Err(Error::Outage(_))), "{queued:?}");
+        let done = owner.end_outage().await.unwrap();
+        assert_eq!(done.handoffs, Vec::<String>::new());
+        assert_eq!(done.failed.len(), 1, "{:?}", done.failed);
+        assert!(done.failed[0].contains("not found"), "{:?}", done.failed);
+        // the entry is as it was: nothing replaced it
+        let still = owner.get(&fact).await.unwrap();
+        assert_eq!(still.body, "The staging host is alder.\n");
+    }
+
     #[tokio::test]
     async fn the_views_of_a_session_share_its_seat() {
         let dir = tempfile::tempdir().unwrap();

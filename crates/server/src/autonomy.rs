@@ -159,8 +159,10 @@ impl Memory {
         if !awaits_verdict(task) || task.handoff.as_deref() != Some(handoff) {
             return Ok(false);
         }
-        let worker = l.claimant(&task.id, task.generation).await?;
-        Ok(worker.as_deref() == Some(self.author.as_str()))
+        // the last claim, and not the claim of the task's generation: a claim epoch
+        // gives the task a generation that no claim was made under
+        let worker = l.last_claimant(&task.id).await?;
+        Ok(worker.is_some_and(|w| self.same_principal(&w, &self.author)))
     }
 
     /// Hand the work of a held task in for its verdict: the task is blocked on its
@@ -232,8 +234,12 @@ impl Memory {
     /// Nobody gives the verdict on its own work. At `person`, only a person in person
     /// gives it. Above that, every other principal than the worker does.
     async fn may_give_verdict(&self, l: &Ledger, task: &Task) -> Result<Autonomy, Error> {
-        let worker = l.claimant(&task.id, task.generation).await?;
-        if worker.as_deref() == Some(self.author.as_str()) {
+        // the last claim, and not the claim of the task's generation: a claim epoch
+        // gives the task a generation that no claim was made under
+        let worker = l.last_claimant(&task.id).await?;
+        // a person under an earlier identifier is the same person: the assertions of the
+        // registry say so
+        if worker.is_some_and(|w| self.same_principal(&w, &self.author)) {
             return Err(self.refusal(
                 "verdict",
                 &task.spec.domain,
@@ -854,6 +860,55 @@ mod tests {
         reviewer.mark_served();
         let verdict = reviewer.verdict(&task.id, true).await.unwrap();
         assert_eq!((verdict.accepted, verdict.level), (true, Autonomy::Review));
+        assert!(is_done(&verdict.task, &h), "{:?}", verdict.task);
+    }
+
+    #[tokio::test]
+    async fn after_a_claim_epoch_the_worker_still_gives_no_verdict_on_its_own_work() {
+        let dir = tempfile::tempdir().unwrap();
+        let (owner, reference) = platform(dir.path()).await;
+        set_level(&owner, &reference, Autonomy::Review).await;
+        let task = tidy_task(&owner, "Tidy the importer").await;
+        let (h, parked) = handed_in(dir.path(), &task, "agent:a").await;
+        assert!(is_parked(&parked, &h), "{parked:?}");
+        // a restore begins a claim epoch: each task gets a generation of that epoch
+        owner.ledger.lock().await.begin_epoch(1).await.unwrap();
+        let after = owner.get_task(&task.id).await.unwrap();
+        assert_ne!(after.generation, parked.generation);
+        let worker = as_author(dir.path(), "agent:a");
+        for accept in [true, false] {
+            let refused = worker.verdict(&task.id, accept).await;
+            assert!(denied(&refused, "its own work"), "{refused:?}");
+        }
+        assert_eq!(owner.get_task(&task.id).await.unwrap(), after);
+        let reviewer = as_author(dir.path(), "agent:b");
+        let verdict = reviewer.verdict(&task.id, true).await.unwrap();
+        assert!(is_done(&verdict.task, &h), "{:?}", verdict.task);
+    }
+
+    /// A person handed work in under an identifier that the registry has replaced
+    /// since. Under the new identifier, the verdict on that work is still on its own
+    /// work.
+    #[tokio::test]
+    async fn a_person_under_a_later_identifier_gives_no_verdict_on_its_own_work() {
+        let (was, is) = ("human:old,2019-05-01:kim", "human:new,2026-11-01:kim");
+        let dir = tempfile::tempdir().unwrap();
+        let (owner, reference) = platform(dir.path()).await;
+        set_level(&owner, &reference, Autonomy::Review).await;
+        let registry =
+            format!("[[assertions]]\nwas = \"{was}\"\nis = \"{is}\"\nsince = 2026-11-01\n");
+        std::fs::write(dir.path().join(crate::REGISTRY_FILE), registry).unwrap();
+        let owner = Memory::open(dir.path()).unwrap();
+        let task = tidy_task(&owner, "Tidy the importer").await;
+        let (h, parked) = handed_in(dir.path(), &task, was).await;
+        assert!(is_parked(&parked, &h), "{parked:?}");
+        let later = as_author(dir.path(), is);
+        let refused = later.verdict(&task.id, true).await;
+        assert!(denied(&refused, "its own work"), "{refused:?}");
+        assert_eq!(owner.get_task(&task.id).await.unwrap(), parked);
+        // another person gives it
+        let other = as_author(dir.path(), "human:new,2026-11-01:lee");
+        let verdict = other.verdict(&task.id, true).await.unwrap();
         assert!(is_done(&verdict.task, &h), "{:?}", verdict.task);
     }
 

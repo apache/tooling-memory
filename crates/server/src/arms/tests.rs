@@ -478,6 +478,20 @@ fn digest_of(t0: &str) -> String {
     t0[from..to].to_string()
 }
 
+/// The line of a T0 that is off reads nothing, so it is the same line in an outage. A
+/// session that loads T0 gets an answer that says that an outage is declared.
+#[tokio::test]
+async fn t0_off_is_the_same_line_in_an_outage() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = root(dir.path());
+    let off = agent(dir.path(), Some(Arm::NoMemory.settings()));
+    let whole = agent(dir.path(), None);
+    owner.declare_outage("the index is down").unwrap();
+    assert_eq!(off.t0(Some("dom-a")).await.unwrap(), T0_OFF);
+    let waits = whole.t0(Some("dom-a")).await;
+    assert!(matches!(waits, Err(Error::Outage(_))), "{waits:?}");
+}
+
 /// Rule 5: T0 off holds nothing of the record; the digest holds the policy and the
 /// tasks that wait, and no entry.
 #[tokio::test]

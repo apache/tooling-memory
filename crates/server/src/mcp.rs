@@ -30,6 +30,8 @@ use std::sync::Arc;
 use time::format_description::well_known::{Iso8601, Rfc3339};
 use time::Duration;
 
+mod timescales;
+
 const DEFAULT_LEASE_SECONDS: i64 = 30 * 60;
 const DEFAULT_LIMIT: usize = 10;
 const MAX_LIMIT: usize = 100;
@@ -40,6 +42,7 @@ fn mcp_err(e: Error) -> McpError {
     match e {
         Error::Denied(_)
         | Error::Stale(_)
+        | Error::Outage(_)
         | Error::NotFound(_)
         | Error::Gone(_)
         | Error::Moved { .. }
@@ -1033,6 +1036,9 @@ const READS: &[&str] = &[
     "outcomes",
     "auditor_mode",
     "curation_case",
+    "resolve_identity",
+    "proposals",
+    "outage_status",
     "autonomy",
     "candidate_gates",
     "metrics",
@@ -1045,8 +1051,11 @@ const READS: &[&str] = &[
 /// The tools that reach outside, refused after a re-run diverges.
 const OUTSIDE: &[&str] = &["fetch", "web_search", "gofannon"];
 
-fn kind_of(tool: &str) -> tape::Kind {
-    if READS.contains(&tool) {
+/// What a call does: a read, a reach outside, or a change. `registry_check` reads, and
+/// with `file` it files tasks, so its arguments decide.
+fn kind_of(tool: &str, arguments: &Value) -> tape::Kind {
+    let files = arguments.get("file").and_then(Value::as_bool) == Some(true);
+    if READS.contains(&tool) || (tool == "registry_check" && !files) {
         tape::Kind::Read
     } else if OUTSIDE.contains(&tool) {
         tape::Kind::Outside
@@ -1096,9 +1105,15 @@ impl McpServer {
         memory.mark_served();
         Self {
             memory,
-            tool_router: Self::tool_router(),
+            tool_router: Self::routes(),
             taped: true,
         }
+    }
+
+    /// Each tool of the server: the tools of this file, and the tools for the long
+    /// timescales.
+    fn routes() -> ToolRouter<Self> {
+        Self::tool_router() + Self::timescales_router()
     }
 
     /// A server for the launcher's own calls in the same process, which are not the
@@ -1119,7 +1134,7 @@ impl McpServer {
     pub fn for_person(memory: Arc<Memory>) -> Self {
         Self {
             memory,
-            tool_router: Self::tool_router(),
+            tool_router: Self::routes(),
             taped: false,
         }
     }
@@ -2165,7 +2180,7 @@ impl McpServer {
         if let Some(play) = self.memory.playback() {
             // a tool this server does not have is the router's to refuse, as it was
             let kind = if self.tool_router.get(&tool).is_some() {
-                kind_of(&tool)
+                kind_of(&tool, &arguments)
             } else {
                 tape::Kind::Read
             };
@@ -2349,7 +2364,7 @@ mod tests {
 
     #[test]
     fn every_tool_has_a_description_and_a_schema() {
-        let router = McpServer::tool_router();
+        let router = McpServer::routes();
         let tools = router.list_all();
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for expected in [
@@ -2384,6 +2399,14 @@ mod tests {
             "lineage",
             "log",
             "outside_readers",
+            "registry_check",
+            "resolve_identity",
+            "proposals",
+            "answer_proposal",
+            "outage_status",
+            "horizon_schedule",
+            "recovery_bundle",
+            "recovery_drill",
             "verdict",
             "autonomy",
             "grade",
@@ -2427,15 +2450,15 @@ mod tests {
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
         for gated in ["erase", "declassify", "approve", "export"] {
             assert!(names.contains(&gated), "missing tool {gated}: {names:?}");
-            assert_eq!(kind_of(gated), tape::Kind::Mutation, "{gated}");
+            assert_eq!(kind_of(gated, &json!({})), tape::Kind::Mutation, "{gated}");
         }
         assert!(names.contains(&"approvals"), "{names:?}");
-        assert_eq!(kind_of("approvals"), tape::Kind::Read);
+        assert_eq!(kind_of("approvals", &json!({})), tape::Kind::Read);
     }
 
     #[test]
     fn write_schema_names_every_field_and_requires_only_the_body() {
-        let router = McpServer::tool_router();
+        let router = McpServer::routes();
         let write = router
             .list_all()
             .into_iter()
@@ -3082,6 +3105,10 @@ mod tests {
         let stopped = mcp_err(Error::Stale("the grants changed".into()));
         assert_eq!(stopped.code, invalid.code);
         assert!(stopped.message.contains("stopped: the grants changed"));
+        // an action that waits in an outage is told so in words too, and is no fault
+        let waits = mcp_err(Error::Outage("reads wait".into()));
+        assert_eq!(waits.code, invalid.code);
+        assert!(waits.message.contains("outage: reads wait"));
         assert_eq!(t0_uri("dom-a"), "memory://t0/dom-a");
     }
 
@@ -3361,9 +3388,9 @@ mod tests {
         assert_eq!(row["waiting"], json!([id]), "{listed}");
         assert_eq!(row["wake"], true, "{listed}");
         // both tools only read the record: a re-run that diverged still serves them
-        assert_eq!(kind_of("position"), tape::Kind::Read);
-        assert_eq!(kind_of("positions"), tape::Kind::Read);
-        assert_eq!(kind_of("retire_position"), tape::Kind::Mutation);
+        assert_eq!(kind_of("position", &json!({})), tape::Kind::Read);
+        assert_eq!(kind_of("positions", &json!({})), tape::Kind::Read);
+        assert_eq!(kind_of("retire_position", &json!({})), tape::Kind::Mutation);
     }
 
     #[tokio::test]
@@ -3561,8 +3588,9 @@ mod tests {
             "{}",
             refused.message
         );
-        assert_eq!(kind_of("scorecards"), tape::Kind::Read);
-        assert_eq!(kind_of("score_evaluation"), tape::Kind::Mutation);
+        let none = json!({});
+        assert_eq!(kind_of("scorecards", &none), tape::Kind::Read);
+        assert_eq!(kind_of("score_evaluation", &none), tape::Kind::Mutation);
     }
 
     /// A server over the record at `dir`, for a session of `author`.
@@ -4068,20 +4096,31 @@ mod tests {
 
     #[test]
     fn the_surveys_of_the_duties_only_read_and_the_duties_change() {
-        for tool in ["dead", "outcomes", "auditor_mode", "curation_case"] {
-            assert_eq!(kind_of(tool), tape::Kind::Read, "{tool}");
+        let none = json!({});
+        for tool in [
+            "dead",
+            "outcomes",
+            "auditor_mode",
+            "curation_case",
+            "registry_check",
+            "resolve_identity",
+            "proposals",
+            "outage_status",
+        ] {
+            assert_eq!(kind_of(tool, &none), tape::Kind::Read, "{tool}");
         }
         for tool in ["demote", "restore", "record_outcome", "check_conventions"] {
-            assert_eq!(kind_of(tool), tape::Kind::Mutation, "{tool}");
+            assert_eq!(kind_of(tool, &none), tape::Kind::Mutation, "{tool}");
         }
     }
 
     #[test]
     fn lineage_and_log_only_read() {
-        assert_eq!(kind_of("lineage"), tape::Kind::Read);
-        assert_eq!(kind_of("log"), tape::Kind::Read);
-        assert_eq!(kind_of("outside_readers"), tape::Kind::Read);
-        assert_eq!(kind_of("write"), tape::Kind::Mutation);
+        let none = json!({});
+        assert_eq!(kind_of("lineage", &none), tape::Kind::Read);
+        assert_eq!(kind_of("log", &none), tape::Kind::Read);
+        assert_eq!(kind_of("outside_readers", &none), tape::Kind::Read);
+        assert_eq!(kind_of("write", &none), tape::Kind::Mutation);
     }
 
     /// The autonomy level, the grade and the gates over the memory server.
@@ -4343,10 +4382,14 @@ mod tests {
         #[test]
         fn the_reads_are_reads_and_no_tool_records_a_work_outcome_or_lists_probing() {
             for read in ["autonomy", "candidate_gates"] {
-                assert_eq!(kind_of(read), tape::Kind::Read, "{read}");
+                assert_eq!(kind_of(read, &json!({})), tape::Kind::Read, "{read}");
             }
             for change in ["verdict", "grade", "raise_autonomy"] {
-                assert_eq!(kind_of(change), tape::Kind::Mutation, "{change}");
+                assert_eq!(
+                    kind_of(change, &json!({})),
+                    tape::Kind::Mutation,
+                    "{change}"
+                );
             }
             let router = McpServer::tool_router();
             let tools = router.list_all();
@@ -4533,9 +4576,9 @@ mod tests {
         #[test]
         fn the_reads_of_measurement_are_reads_and_no_tool_lands_or_raises() {
             for read in ["metrics", "limits", "task_times", "landing"] {
-                assert_eq!(kind_of(read), tape::Kind::Read, "{read}");
+                assert_eq!(kind_of(read, &json!({})), tape::Kind::Read, "{read}");
             }
-            assert_eq!(kind_of("queue_landing"), tape::Kind::Mutation);
+            assert_eq!(kind_of("queue_landing", &json!({})), tape::Kind::Mutation);
             let router = McpServer::tool_router();
             let tools = router.list_all();
             let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();

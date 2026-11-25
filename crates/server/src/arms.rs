@@ -391,7 +391,14 @@ impl Memory {
     /// as it is now, at every tier, so the tier ceiling and the snapshot do not apply to
     /// it.
     pub(crate) fn policy_filter(&self) -> Result<ReadFilter, Error> {
-        let f = self.chained_filter()?;
+        self.serving()?;
+        self.policy_scope()
+    }
+
+    /// [`Memory::policy_filter`] with no check for an outage: for a caller that reads
+    /// nothing with the filter.
+    pub(crate) fn policy_scope(&self) -> Result<ReadFilter, Error> {
+        let f = self.chained_scope()?;
         Ok(if self.settings().memory {
             f
         } else {

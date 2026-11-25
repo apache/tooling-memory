@@ -135,6 +135,21 @@ pub enum Error {
         /// What was wrong.
         what: String,
     },
+    /// The claim epoch asked for is not later than the one in force, or is too large to
+    /// be the prefix of a generation: an epoch is never used twice.
+    #[error(
+        "the claim epoch {given} is not later than the epoch in force, {current}, or is too large"
+    )]
+    EpochNotLater {
+        /// The epoch asked for.
+        given: u64,
+        /// The epoch in force.
+        current: u64,
+    },
+    /// The ledger holds events, or an epoch, already: a checkpoint is restored only into
+    /// an empty ledger.
+    #[error("the ledger is not empty: a checkpoint is restored only into an empty ledger")]
+    NotEmpty,
 }
 
 /// Where a task is in its life.
@@ -489,9 +504,12 @@ pub struct Task {
     /// When the current lease runs out, while claimed.
     #[serde(with = "time::serde::rfc3339::option")]
     pub lease_until: Option<OffsetDateTime>,
-    /// The generation of its latest claim: how many times it has been claimed. Every
-    /// claim gets the next one, and what a holder does under a claim carries it, so a
-    /// holder of an earlier claim is told apart from the holder now, whatever its name.
+    /// The generation of its latest claim. The low 32 bits count how many times it has
+    /// been claimed, and the high 32 bits are the claim epoch in force
+    /// ([`Ledger::begin_epoch`]); with no epoch begun it is the count alone. Every claim
+    /// gets the next one, and what a holder does under a claim carries it, so a holder of
+    /// an earlier claim, or of a claim of an earlier epoch, is told apart from the holder
+    /// now, whatever its name.
     pub generation: u64,
     /// The handoff entry that closed it, or the last one a lost lease left behind.
     pub handoff: Option<String>,
@@ -908,6 +926,12 @@ enum Event {
         #[serde(default, skip_serializing_if = "is_false")]
         why_erased: bool,
     },
+    /// A claim epoch begins: every claim made before it is over. Each task's generation
+    /// gets the epoch as its high 32 bits, and each claimed task is open again with no
+    /// holder. Appended under [`EPOCH_KEY`], never a task id.
+    Epoch {
+        epoch: u64,
+    },
     /// A person approved one action on one version of one entry. Appended under
     /// [`approval_key`], never a task id, and projected nowhere: the event is the record.
     /// Boxed: a record is larger than every other event but a boxed one.
@@ -943,6 +967,7 @@ impl Event {
             Event::Rescored { .. } => "rescored",
             Event::Unpinned { .. } => "unpinned",
             Event::Promoted { .. } => "promoted",
+            Event::Epoch { .. } => "epoch",
             Event::Approved(_) => "approved",
             Event::Definition(_) => "definition",
         }
@@ -998,6 +1023,28 @@ pub struct Logged {
     /// The classification of the task, or of the promotion. An approval and a record of
     /// a task definition record none, and each is given at the highest label.
     pub classification: Label,
+}
+
+/// One row of the ledger's events table as a checkpoint carries it: all of the row, so a
+/// restore puts back what a replay needs. Unlike [`Logged`] it holds the payload, and so
+/// the text of the tasks and the promotions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Checkpointed {
+    /// The row's sequence number. A restore keeps it: the log of a domain counts the
+    /// events it has copied by this number.
+    pub seq: u64,
+    /// The task, or the key of an event of no task.
+    pub task: String,
+    /// The `kind` column.
+    pub kind: String,
+    /// The `at` column.
+    pub at: String,
+    /// The `payload` column.
+    pub payload: String,
+    /// The domain whose events table held the row, on a backend that keeps one table for
+    /// each domain and numbers each apart. Absent from a backend with one table.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub domain: Option<String>,
 }
 
 /// The kinds of event that say who holds a task: a backend gives these for a task from
@@ -1069,6 +1116,7 @@ fn who(
         | Event::Posted { .. }
         | Event::Arrived { .. }
         | Event::Rescored { .. }
+        | Event::Epoch { .. }
         // the event names the position the pin was on, and no person
         | Event::Unpinned { .. } => (None, None),
     }
@@ -1094,6 +1142,11 @@ fn logged(rows: Vec<RawEvent>, domain: &str, after: u64) -> Result<Vec<Logged>, 
     let mut out = Vec::new();
     for row in rows {
         let event = Event::parse(&row.task, &row.payload)?;
+        // an epoch ends every claim, and is an event of no domain: none of them is given
+        if matches!(event, Event::Epoch { .. }) {
+            held.clear();
+            continue;
+        }
         let at = OffsetDateTime::parse(&row.at, &Rfc3339).ok();
         let (principal, attempt) = who(&event, held.get(&row.task), at);
         let (own_domain, own_label) = match &event {
@@ -1311,6 +1364,46 @@ fn label_from_rank(id: &str, rank: i64) -> Result<Label, Error> {
 /// never meet.
 fn promotion_key(entry: &str) -> String {
     format!("promotion:{entry}")
+}
+
+/// The key a claim epoch's event is appended under. It is no task id and no promotion key.
+pub(crate) const EPOCH_KEY: &str = "epoch:claims";
+
+/// How many bits of a generation count the claims of a task; the bits above them are the
+/// claim epoch.
+pub(crate) const CLAIM_BITS: u32 = 32;
+
+/// One more than the highest claim epoch: the epoch and the count of claims together fit
+/// the signed 64-bit column that both backends keep a generation in.
+const EPOCH_LIMIT: u64 = 1 << 31;
+
+/// The lowest generation of a claim epoch.
+pub(crate) fn epoch_floor(epoch: u64) -> i64 {
+    i64::try_from(epoch << CLAIM_BITS).unwrap_or(i64::MAX)
+}
+
+/// The holder that a claim event names, when the event is the claim of `generation`. A
+/// claim of an older ledger carries no generation, and is found by its place alone.
+pub(crate) fn claimant_of(
+    id: &str,
+    payload: &str,
+    generation: u64,
+) -> Result<Option<String>, Error> {
+    Ok(match Event::parse(id, payload)? {
+        Event::Claimed {
+            holder,
+            generation: made,
+            ..
+        } if made == generation || made == 0 => Some(holder),
+        _ => None,
+    })
+}
+
+/// The place of the claim of `generation` among the claim events of its task, counted
+/// from zero: the low bits of a generation count the claims across every epoch.
+pub(crate) fn claim_offset(generation: u64) -> Option<i64> {
+    let count = generation & ((1 << CLAIM_BITS) - 1);
+    count.checked_sub(1).and_then(|n| i64::try_from(n).ok())
 }
 
 /// The key an approval's event is appended under. A task id starts `task-`, so the two
@@ -2676,6 +2769,25 @@ impl Ledger {
         on_backend!(&self.backend, db => db.claimant(id, generation))
     }
 
+    /// Who the ledger gave the last claim of a task to: the principal that last worked
+    /// on it, also after that claim is over and the task holds no holder. It is read
+    /// from the last claim event, and not from the generation of the task: a claim epoch
+    /// gives each task a generation that no claim event of an earlier epoch holds. None
+    /// for a task that nobody claimed.
+    ///
+    /// # Errors
+    ///
+    /// A database error, or an event the ledger did not write.
+    pub async fn last_claimant(&self, id: &str) -> Result<Option<String>, Error> {
+        let claims = on_backend!(&self.backend, db => db.payloads_of(id, "claimed"))?;
+        Ok(
+            match claims.last().map(|p| Event::parse(id, p)).transpose()? {
+                Some(Event::Claimed { holder, .. }) => Some(holder),
+                _ => None,
+            },
+        )
+    }
+
     /// The handoffs left on a task after the claims they were written under, oldest first.
     ///
     /// # Errors
@@ -3196,6 +3308,62 @@ impl Ledger {
         logged(rows, domain, after)
     }
 
+    /// The claim epoch in force: the highest one begun, and 0 when none was.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn epoch(&self) -> Result<u64, Error> {
+        on_backend!(&self.backend, db => db.epoch())
+    }
+
+    /// Begin claim epoch `epoch`: every claim made before it is over. Each task's
+    /// generation gets the epoch as its high 32 bits, and each claimed task is open again
+    /// with no holder, in one transaction. A holder of a claim from before then carries a
+    /// generation of an earlier epoch, and is refused as any earlier generation is.
+    /// Returns the ids of the tasks that were claimed and are open again.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::EpochNotLater`] when `epoch` is not above the epoch in force, or is 2^31
+    /// or more; a database error.
+    pub async fn begin_epoch(&mut self, epoch: u64) -> Result<Vec<String>, Error> {
+        if epoch >= EPOCH_LIMIT {
+            return Err(Error::EpochNotLater {
+                given: epoch,
+                current: self.epoch().await?,
+            });
+        }
+        let now = self.now();
+        on_backend!(&mut self.backend, db => db.begin_epoch(now, epoch))
+    }
+
+    /// Every row of the events table, in the order of the sequence numbers, for all
+    /// domains: what a recovery bundle keeps of the ledger.
+    ///
+    /// # Errors
+    ///
+    /// A database error.
+    pub async fn checkpoint(&self) -> Result<Vec<Checkpointed>, Error> {
+        on_backend!(&self.backend, db => db.checkpoint())
+    }
+
+    /// Put the rows of a checkpoint into this ledger, each with its sequence number, and
+    /// replay them into the projection. Returns the number of events replayed.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotEmpty`] when the ledger holds an event or an epoch;
+    /// [`Error::BadRow`] when a row names no domain that this backend can find, or when
+    /// two rows that go into one table have one sequence number; a database error.
+    pub async fn restore(&mut self, events: &[Checkpointed]) -> Result<u64, Error> {
+        if self.event_count().await? > 0 || self.epoch().await? > 0 {
+            return Err(Error::NotEmpty);
+        }
+        on_backend!(&mut self.backend, db => db.restore(events))?;
+        self.rebuild().await
+    }
+
     /// Drop the projection and replay every event into a fresh one. Returns the number
     /// of events replayed.
     ///
@@ -3329,6 +3497,18 @@ mod tests {
             }
         }
 
+        /// Another place of the same kind with nothing in it, or `None` where a second
+        /// server cannot be had.
+        async fn another(&self) -> Option<Site> {
+            match self {
+                Site::Sqlite(_) => Some(Site::Sqlite(tempfile::tempdir().unwrap())),
+                Site::Postgres(_) => PgServer::start()
+                    .await
+                    .unwrap()
+                    .map(|server| Site::Postgres(Box::new(server))),
+            }
+        }
+
         /// A ledger on a clock the test moves.
         async fn ledger(&self) -> (Ledger, Arc<Mutex<OffsetDateTime>>) {
             let now = Arc::new(Mutex::new(T0));
@@ -3453,6 +3633,16 @@ mod tests {
         a_completion_after_the_lease_ran_out_names_no_principal,
         the_events_given_hold_no_text_of_a_task_or_of_a_promotion,
         a_task_filed_as_outside_keeps_it_and_another_task_does_not,
+        an_epoch_ends_every_claim_made_before_it,
+        an_epoch_moves_only_a_claimed_task_and_a_new_task_starts_in_it,
+        an_epoch_is_begun_only_when_it_is_later_than_the_one_in_force,
+        a_replay_after_an_epoch_gives_the_same_tasks,
+        a_key_used_before_an_epoch_makes_a_new_claim_after_it,
+        a_late_handoff_is_taken_from_the_holder_of_a_claim_before_the_epoch,
+        the_last_claimant_of_a_task_is_named_after_an_epoch_too,
+        a_checkpoint_restores_into_an_empty_ledger_with_its_numbers,
+        a_checkpoint_is_not_restored_into_a_ledger_that_holds_an_event,
+        a_restore_keeps_a_number_that_the_checkpoint_does_not_use,
         a_definition_record_is_one_event_and_is_read_back_whole,
         definition_records_are_of_one_definition_and_one_domain_oldest_first,
         a_definition_record_is_no_task_and_a_replay_keeps_it,
@@ -3518,6 +3708,12 @@ mod tests {
         ) -> Result<Task, Error> {
             let by = self.by(id, holder).await;
             self.release(id, by, handoff).await
+        }
+
+        /// How many events of one kind a task has.
+        async fn payloads_of_kind(&self, id: &str, kind: &str) -> usize {
+            let payloads = on_backend!(&self.backend, db => db.payloads_of(id, kind));
+            payloads.unwrap().len()
         }
 
         /// `holder` under the claim in force, for a test that is about something else.
@@ -3963,6 +4159,373 @@ mod tests {
             assert!(outside.contains(&(plain.id.as_str(), false)), "{after}");
             l.rebuild().await.unwrap();
         }
+    }
+
+    /// The generation of the `claims`th claim of a task in claim epoch `epoch`.
+    fn in_epoch(epoch: u64, claims: u64) -> u64 {
+        (epoch << 32) | claims
+    }
+
+    async fn an_epoch_ends_every_claim_made_before_it(b: &Site) {
+        let (mut l, now) = b.ledger().await;
+        let t = admitted(&mut l, spec("Long job")).await;
+        // filed a second later, so the queue's order between the two is by time
+        *now.lock().unwrap() = T0 + Duration::seconds(1);
+        let other = admitted(&mut l, spec("Other job")).await;
+        let first = claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        claim(&mut l, &other.id, "s2", mins(30)).await.unwrap();
+        assert_eq!(first.generation, 1);
+        let mut reopened = l.begin_epoch(1).await.unwrap();
+        reopened.sort();
+        let mut both = vec![t.id.clone(), other.id.clone()];
+        both.sort();
+        assert_eq!(reopened, both);
+        the_task_is_open_and_its_holder_is_fenced(&mut l, &t.id).await;
+        the_next_claim_is_in_the_epoch_and_the_old_one_stays_over(&mut l, &t.id).await;
+    }
+
+    /// The lease of the claim is still live by the clock, and its holder has the name.
+    async fn the_task_is_open_and_its_holder_is_fenced(l: &mut Ledger, id: &str) {
+        let stale = held("s1", 1);
+        let now_at = in_epoch(1, 1);
+        assert!(is_fenced(
+            &l.heartbeat(id, stale, mins(30)).await,
+            1,
+            now_at
+        ));
+        let after = l.get(id).await.unwrap();
+        assert_eq!(
+            (after.status, after.holder.clone(), after.lease_until),
+            (Status::Open, None, None)
+        );
+    }
+
+    /// A holder of the same name claims the task again.
+    async fn the_next_claim_is_in_the_epoch_and_the_old_one_stays_over(l: &mut Ledger, id: &str) {
+        let again = next(l, "s1", mins(30)).await.unwrap();
+        let now_at = in_epoch(1, 2);
+        assert_eq!(
+            (
+                again.task.id.as_str(),
+                again.generation >> 32,
+                again.generation
+            ),
+            (id, 1, now_at)
+        );
+        let stale = held("s1", 1);
+        assert!(is_fenced(
+            &l.heartbeat(id, stale, mins(30)).await,
+            1,
+            now_at
+        ));
+        assert!(is_fenced(&l.release(id, stale, None).await, 1, now_at));
+        assert!(is_fenced(
+            &l.complete(id, stale, "mem-a-h").await,
+            1,
+            now_at
+        ));
+        let done = l.complete(id, held("s1", now_at), "mem-a-h").await;
+        assert_eq!(done.unwrap().status, Status::Done);
+    }
+
+    async fn an_epoch_moves_only_a_claimed_task_and_a_new_task_starts_in_it(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let before = a_task_in_each_state(&mut l).await;
+        let mut waits = spec("Waits");
+        waits.depends_on = vec![before[1].id.clone()];
+        let waits = admitted(&mut l, waits).await;
+        assert_eq!(waits.status, Status::Blocked);
+        let reopened = l.begin_epoch(1).await.unwrap();
+        assert_eq!(reopened, std::slice::from_ref(&before[2].id));
+        let ids: Vec<&str> = before.iter().map(|t| t.id.as_str()).collect();
+        let after = get_all(&l, &ids).await;
+        let states: Vec<Status> = after.iter().map(|t| t.status).collect();
+        assert_eq!(
+            states,
+            [
+                Status::Proposed,
+                Status::Open,
+                Status::Open,
+                Status::Done,
+                Status::Invalidated
+            ]
+        );
+        assert_eq!(l.get(&waits.id).await.unwrap().status, Status::Blocked);
+        // each generation keeps its count of claims below the epoch
+        let generations: Vec<u64> = after.iter().map(|t| t.generation).collect();
+        let counts: Vec<u64> = before.iter().map(|t| in_epoch(1, t.generation)).collect();
+        assert_eq!(generations, counts);
+        // the done task keeps who closed it
+        assert_eq!(after[3].holder.as_deref(), Some("s2"));
+        a_task_filed_after_the_epoch_starts_in_it(&mut l).await;
+    }
+
+    async fn a_task_filed_after_the_epoch_starts_in_it(l: &mut Ledger) {
+        let new = admitted(l, spec("Filed after")).await;
+        assert_eq!(new.generation, in_epoch(1, 0));
+        let c = claim(l, &new.id, "s3", mins(30)).await.unwrap();
+        assert_eq!(c.generation, in_epoch(1, 1));
+        // a task of a domain that files its first task after the epoch is in it too
+        let elsewhere = admitted(l, in_domain("dom-late", "Late", &[])).await;
+        assert_eq!(elsewhere.generation, in_epoch(1, 0));
+    }
+
+    fn is_not_later<T>(r: &Result<T, Error>, given: u64, current: u64) -> bool {
+        matches!(r, Err(Error::EpochNotLater { given: g, current: c }) if *g == given && *c == current)
+    }
+
+    async fn an_epoch_is_begun_only_when_it_is_later_than_the_one_in_force(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = the_first_epoch_is_above_zero_on_a_ledger_with_no_task(&mut l).await;
+        an_epoch_that_is_not_later_is_refused_and_moves_nothing(&mut l, &t.id).await;
+        let reopened = l.begin_epoch(5).await.unwrap();
+        assert_eq!(reopened, std::slice::from_ref(&t.id));
+        assert_eq!(l.epoch().await.unwrap(), 5);
+        // another connection reads the same epoch
+        assert_eq!(b.open().await.epoch().await.unwrap(), 5);
+    }
+
+    /// Begins epoch 2 on a ledger with no task, and then files and claims a task.
+    async fn the_first_epoch_is_above_zero_on_a_ledger_with_no_task(l: &mut Ledger) -> Task {
+        assert_eq!(l.epoch().await.unwrap(), 0);
+        assert!(is_not_later(&l.begin_epoch(0).await, 0, 0));
+        assert!(l.begin_epoch(2).await.unwrap().is_empty());
+        let t = admitted(l, spec("Job")).await;
+        claim(l, &t.id, "s1", mins(30)).await.unwrap();
+        t
+    }
+
+    /// The ledger is in epoch 2, and `id` is claimed.
+    async fn an_epoch_that_is_not_later_is_refused_and_moves_nothing(l: &mut Ledger, id: &str) {
+        assert!(is_not_later(&l.begin_epoch(2).await, 2, 2));
+        assert!(is_not_later(&l.begin_epoch(1).await, 1, 2));
+        assert!(is_not_later(&l.begin_epoch(1 << 31).await, 1 << 31, 2));
+        let held_still = l.get(id).await.unwrap();
+        assert_eq!(
+            (held_still.status, held_still.generation),
+            (Status::Claimed, in_epoch(2, 1))
+        );
+        assert_eq!(l.epoch().await.unwrap(), 2);
+    }
+
+    async fn a_replay_after_an_epoch_gives_the_same_tasks(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let tasks = tasks_across_two_epochs(&mut l).await;
+        let ids: Vec<&str> = tasks.iter().map(|t| t.id.as_str()).collect();
+        let before = get_all(&l, &ids).await;
+        assert_eq!(before[2].generation, in_epoch(3, 2), "{:?}", before[2]);
+        assert_eq!(
+            before[1].status,
+            Status::Open,
+            "the second epoch reopened it"
+        );
+        l.rebuild().await.unwrap();
+        assert_eq!(get_all(&l, &ids).await, before);
+        assert_eq!(l.epoch().await.unwrap(), 3);
+        the_events_given_name_no_epoch(&l).await;
+    }
+
+    /// A task in each state and one in another domain; an epoch; a claim and a task
+    /// after it; a second epoch; and a claim and a task after that.
+    async fn tasks_across_two_epochs(l: &mut Ledger) -> Vec<Task> {
+        let mut tasks = a_task_in_each_state(l).await;
+        tasks.push(admitted(l, in_domain("dom-b", "In b", &[])).await);
+        l.begin_epoch(1).await.unwrap();
+        claim(l, &tasks[1].id, "s4", mins(30)).await.unwrap();
+        tasks.push(admitted(l, spec("Filed after")).await);
+        l.begin_epoch(3).await.unwrap();
+        claim(l, &tasks[2].id, "s5", mins(30)).await.unwrap();
+        tasks.push(admitted(l, spec("Filed last")).await);
+        tasks
+    }
+
+    /// The log of a domain copies no epoch.
+    async fn the_events_given_name_no_epoch(l: &Ledger) {
+        for domain in ["dom-a", "dom-b"] {
+            let got = l.events_after(domain, 0).await.unwrap();
+            assert!(!got.is_empty());
+            assert!(got.iter().all(|e| e.op != "epoch"), "{got:?}");
+        }
+    }
+
+    async fn a_key_used_before_an_epoch_makes_a_new_claim_after_it(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Only")).await;
+        let c = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        assert_eq!((c.task.id.as_str(), c.generation), (t.id.as_str(), 1));
+        l.begin_epoch(1).await.unwrap();
+        let new = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        assert_eq!(
+            (new.task.id.as_str(), new.generation),
+            (t.id.as_str(), in_epoch(1, 2)),
+            "a new claim, in the epoch"
+        );
+        // and asked again, it is that claim
+        let again = next_once(&mut l, "s1", "key-1").await.unwrap().unwrap();
+        assert_eq!(again.generation, in_epoch(1, 2));
+        assert_eq!(l.payloads_of_kind(&t.id, "claimed").await, 2);
+    }
+
+    async fn a_late_handoff_is_taken_from_the_holder_of_a_claim_before_the_epoch(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = admitted(&mut l, spec("Long job")).await;
+        claim(&mut l, &t.id, "s1", mins(30)).await.unwrap();
+        l.begin_epoch(1).await.unwrap();
+        // nobody else, and not that holder under a generation the ledger never gave it
+        for other in [held("s2", 1), held("s1", in_epoch(1, 1)), held("s1", 2)] {
+            let refused = l.handoff_after(&t.id, other, "mem-a-late").await;
+            assert!(is_not_holder(&refused), "{other:?}");
+        }
+        let after = l
+            .handoff_after(&t.id, held("s1", 1), "mem-a-late")
+            .await
+            .unwrap();
+        assert_eq!((after.status, after.handoff.clone()), (Status::Open, None));
+        let late = l.late_handoffs(&t.id).await.unwrap();
+        assert_eq!(
+            late,
+            [LateHandoff {
+                holder: "s1".into(),
+                generation: 1,
+                handoff: "mem-a-late".into()
+            }]
+        );
+        // the claim after the epoch is the second claim event, of its own generation
+        claim(&mut l, &t.id, "s2", mins(30)).await.unwrap();
+        let wrong_epoch = l.handoff_after(&t.id, held("s2", 2), "mem-a-x").await;
+        assert!(is_not_holder(&wrong_epoch));
+    }
+
+    async fn the_last_claimant_of_a_task_is_named_after_an_epoch_too(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let id = a_task_that_s2_claimed_last_and_waits(&mut l).await;
+        l.begin_epoch(1).await.unwrap();
+        let after = l.get(&id).await.unwrap();
+        assert_eq!(after.generation, in_epoch(1, 2));
+        // no claim event holds the generation that the epoch gave the task
+        assert_eq!(l.claimant(&id, after.generation).await.unwrap(), None);
+        assert_eq!(l.last_claimant(&id).await.unwrap().as_deref(), Some("s2"));
+    }
+
+    /// A task that `s1` claimed and released, and that `s2` then claimed and gave up to
+    /// wait for an event: its id.
+    async fn a_task_that_s2_claimed_last_and_waits(l: &mut Ledger) -> String {
+        let t = admitted(l, spec("Long job")).await;
+        assert_eq!(l.last_claimant(&t.id).await.unwrap(), None);
+        let first = claim(l, &t.id, "s1", mins(30)).await.unwrap();
+        l.release(&t.id, held("s1", first.generation), None)
+            .await
+            .unwrap();
+        let second = claim(l, &t.id, "s2", mins(30)).await.unwrap();
+        l.wait_for(&t.id, held("s2", second.generation), "check:42", None)
+            .await
+            .unwrap();
+        assert_eq!(l.last_claimant(&t.id).await.unwrap().as_deref(), Some("s2"));
+        t.id
+    }
+
+    /// A ledger with tasks in two domains, a promotion, an epoch and a claim after it.
+    async fn a_ledger_worth_a_checkpoint(l: &mut Ledger) -> Vec<String> {
+        let mut ids: Vec<String> = a_task_in_each_state(l)
+            .await
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        ids.push(admitted(l, in_domain("dom-b", "In b", &[])).await.id);
+        l.record_promotion(&promotion("mem-a-1", "d1"))
+            .await
+            .unwrap();
+        l.begin_epoch(1).await.unwrap();
+        claim(l, &ids[1], "s4", mins(30)).await.unwrap();
+        ids
+    }
+
+    async fn seqs(l: &Ledger, domain: &str) -> Vec<u64> {
+        let events = l.events_after(domain, 0).await.unwrap();
+        events.iter().map(|e| e.seq).collect()
+    }
+
+    async fn a_checkpoint_restores_into_an_empty_ledger_with_its_numbers(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let ids = a_ledger_worth_a_checkpoint(&mut l).await;
+        let ids: Vec<&str> = ids.iter().map(String::as_str).collect();
+        let Some(elsewhere) = b.another().await else {
+            return;
+        };
+        let (mut restored, _) = elsewhere.ledger().await;
+        let checkpoint = l.checkpoint().await.unwrap();
+        let n = restored.restore(&checkpoint).await.unwrap();
+        assert_eq!(n, l.event_count().await.unwrap());
+        assert_eq!(get_all(&restored, &ids).await, get_all(&l, &ids).await);
+        the_promotions_and_the_epoch_are_restored(&l, &restored).await;
+        the_numbers_are_kept_and_the_next_are_above_them(&l, &mut restored).await;
+    }
+
+    async fn the_promotions_and_the_epoch_are_restored(l: &Ledger, restored: &Ledger) {
+        assert_eq!(
+            restored.promotions("dom-a", "mem-a-1").await.unwrap(),
+            l.promotions("dom-a", "mem-a-1").await.unwrap()
+        );
+        assert_eq!(restored.epoch().await.unwrap(), 1);
+        assert_eq!(
+            restored.checkpoint().await.unwrap(),
+            l.checkpoint().await.unwrap()
+        );
+    }
+
+    async fn the_numbers_are_kept_and_the_next_are_above_them(l: &Ledger, restored: &mut Ledger) {
+        for domain in ["dom-a", "dom-b"] {
+            let kept = seqs(restored, domain).await;
+            assert!(!kept.is_empty());
+            assert_eq!(kept, seqs(l, domain).await, "{domain}");
+            // the next events of the domain get numbers above every one restored
+            let highest = kept.into_iter().max().unwrap();
+            admitted(restored, in_domain(domain, "Filed after", &[])).await;
+            let now = seqs(restored, domain).await;
+            assert_eq!(now.iter().filter(|s| **s > highest).count(), 2, "{domain}");
+        }
+    }
+
+    /// A checkpoint whose numbers have a gap: a restore that numbered the events again
+    /// would close it, and the cursor of a log would then name another event.
+    async fn a_restore_keeps_a_number_that_the_checkpoint_does_not_use(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let checkpoint = a_checkpoint_with_a_gap(&mut l).await;
+        let Some(elsewhere) = b.another().await else {
+            return;
+        };
+        let (mut restored, _) = elsewhere.ledger().await;
+        restored.restore(&checkpoint).await.unwrap();
+        assert_eq!(restored.checkpoint().await.unwrap(), checkpoint);
+        assert_eq!(
+            seqs(&restored, "dom-a").await,
+            checkpoint.iter().map(|e| e.seq).collect::<Vec<_>>()
+        );
+    }
+
+    /// The checkpoint of a ledger without its refused claim: an event that moves
+    /// nothing, so the rest replays without it. Events come after the one removed.
+    async fn a_checkpoint_with_a_gap(l: &mut Ledger) -> Vec<Checkpointed> {
+        let t = admitted(l, spec("Job")).await;
+        claim(l, &t.id, "s1", mins(30)).await.unwrap();
+        assert!(is_wrong_state(&claim(l, &t.id, "s2", mins(30)).await));
+        l.heartbeat(&t.id, held("s1", 1), mins(30)).await.unwrap();
+        let mut checkpoint = l.checkpoint().await.unwrap();
+        let refused = checkpoint.iter().position(|e| e.kind == "claim_refused");
+        let gap = checkpoint.remove(refused.unwrap()).seq;
+        assert!(checkpoint.iter().any(|e| e.seq > gap), "{checkpoint:?}");
+        checkpoint
+    }
+
+    async fn a_checkpoint_is_not_restored_into_a_ledger_that_holds_an_event(b: &Site) {
+        let (mut l, _) = b.ledger().await;
+        let t = l.create(spec("Here already")).await.unwrap().task;
+        let checkpoint = l.checkpoint().await.unwrap();
+        assert_eq!(checkpoint.len(), 1);
+        let again = l.restore(&checkpoint).await;
+        assert!(matches!(again, Err(Error::NotEmpty)), "{again:?}");
+        assert_eq!(l.event_count().await.unwrap(), 1);
+        assert_eq!(l.get(&t.id).await.unwrap().status, Status::Proposed);
     }
 
     /// A ledger file from before a task carried a definition: no `extra` column.

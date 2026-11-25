@@ -506,7 +506,8 @@ impl Memory {
                 answer.handoff
             )));
         }
-        if handoff.front.author == self.author {
+        // a person under an earlier identifier is the same person
+        if self.same_principal(&handoff.front.author, &self.author) {
             return Err(Error::Denied(format!(
                 "{} wrote {}: nobody grades its own work",
                 self.author, answer.handoff
@@ -1233,6 +1234,23 @@ mod tests {
             "{refused:?}"
         );
         assert_eq!(events(&f.owner).await, before, "nothing appended");
+    }
+
+    /// A person wrote a handoff under an identifier that the registry has replaced
+    /// since. Under the later identifier, to grade that handoff is to grade its own work.
+    #[tokio::test]
+    async fn a_person_under_a_later_identifier_does_not_grade_its_own_work() {
+        let was = "human:old,2019-05-01:me";
+        let dir = tempfile::tempdir().unwrap();
+        fixture(dir.path()).await;
+        let registry =
+            format!("[[assertions]]\nwas = \"{was}\"\nis = \"{OWNER}\"\nsince = 2026-11-01\n");
+        std::fs::write(dir.path().join(crate::REGISTRY_FILE), registry).unwrap();
+        let own = handoff(dir.path(), was, "The bird is BLUEBIRD-7.\n").await;
+        let owner = Memory::open(dir.path()).unwrap();
+        let answers = [answer("bird question", &own)];
+        let refused = owner.grade("tidy", Autonomy::Review, &answers).await;
+        assert!(denied(&refused, "grades its own work"), "{refused:?}");
     }
 
     /// Rule 8.

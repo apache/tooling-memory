@@ -126,6 +126,8 @@ impl Memory {
             ));
         }
         let domain = self.resolve_domain(domain)?;
+        // before the ledger changes: the tasks that wake are read after it
+        self.serving()?;
         let woken = self.ledger.lock().await.arrived(&domain, event).await?;
         self.read_tasks(woken)
     }

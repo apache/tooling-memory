@@ -25,6 +25,7 @@ use dm_policy::decide::{
     Action, Class, Decision, Filing, Input, ParentInput, Policy, Principal, PromoteInput,
     TaskInput, WriteInput,
 };
+use dm_policy::registry::Registry;
 use dm_policy::{scan, Grants, Session};
 use dm_store::Store;
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,7 @@ pub mod fetch;
 pub mod gates;
 pub mod held_out;
 mod holds;
+pub mod horizon;
 mod kept;
 pub mod limits;
 pub mod lineage;
@@ -61,6 +63,7 @@ pub mod mcp;
 pub mod measure;
 #[cfg(test)]
 mod narrow;
+pub mod outage;
 pub mod platform;
 pub mod positions;
 pub mod prefetch;
@@ -69,6 +72,8 @@ pub mod reach;
 pub mod read_metrics;
 pub mod reads;
 pub mod recall;
+pub mod recovery;
+pub mod registry;
 pub mod replay_state;
 pub mod rules;
 pub mod sources;
@@ -77,11 +82,15 @@ pub mod tape;
 mod taps;
 #[cfg(test)]
 pub(crate) mod testing;
+pub mod timescales;
 pub mod transcripts;
 pub mod withhold;
 
 /// The grants file, relative to the root.
 pub const GRANTS_FILE: &str = "grants.toml";
+/// The ownership registry, relative to the root: beside the grants, and absent in a root
+/// whose owner answers for each domain.
+pub const REGISTRY_FILE: &str = "registry.toml";
 /// The most bytes an entry may hold as the record keeps it, frontmatter and body
 /// together; a bundle's entry file holds no more. It keeps one entry well inside what a
 /// reply can carry; [`mcp::MAX_REPLY_BYTES`] bounds the reply itself.
@@ -162,6 +171,10 @@ pub enum Error {
     /// the session stops, and a new one starts under the grants as they are now.
     #[error("stopped: {0}")]
     Stale(String),
+    /// An outage is declared ([`Memory::declare_outage`]): the action waits until the
+    /// outage ends. The session is not stopped, and its grants are as they were.
+    #[error("outage: {0}")]
+    Outage(String),
     /// Not there, or not for this session to see. The two are deliberately the same.
     #[error("not found: {0}")]
     NotFound(String),
@@ -371,6 +384,10 @@ pub struct Memory {
     /// The digest of the grants file this session was opened from. The session is
     /// valid only while the file reads the same.
     grants_stamp: String,
+    /// The ownership registry this session opened under, and the stamp of its file:
+    /// [`Memory::fresh`] compares the stamp with the file as it is.
+    registry: Arc<Option<Registry>>,
+    registry_stamp: String,
     /// The policy stamp this session last loaded its policy at: what
     /// `state/policy.stamp` read then. Shared with the session's views.
     policy_seen: Arc<Mutex<String>>,
@@ -403,6 +420,9 @@ pub struct Memory {
     /// The domains this session has read: a send of the session goes into the log of
     /// each. Shared with the session's views.
     read_domains: Arc<Mutex<std::collections::BTreeSet<String>>>,
+    /// What this session works from in an outage: each T0 that it loaded, and the last
+    /// lease that the ledger confirmed ([`outage`]). Shared with the session's views.
+    offline: Arc<Mutex<outage::Offline>>,
 }
 
 /// The refusal of a demoted entry, for a fetch of its id and for a fetch of one of its
@@ -519,10 +539,19 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// A missing or bad grants file, or a store, index, or ledger that will not open.
+    /// A missing or bad grants file, or a store, index, or ledger that will not open;
+    /// [`Error::Denied`] for a root that a restore did not finish.
     pub fn open(root: &Path) -> Result<Memory, Error> {
+        recovery::refuse_unfinished(root)?;
+        Memory::open_unchecked(root)
+    }
+
+    /// [`Memory::open`] without the check for a restore that did not finish: for the
+    /// restore itself, which opens the root to finish it.
+    pub(crate) fn open_unchecked(root: &Path) -> Result<Memory, Error> {
         let grants_text = std::fs::read_to_string(root.join(GRANTS_FILE)).map_err(io(root))?;
         let grants = Grants::parse(&grants_text)?;
+        let (registry, registry_stamp) = registry::load(root)?;
         let policy_seen = policy_stamp(root);
         std::fs::create_dir_all(root.join("state")).map_err(io(root))?;
         let store = Store::open_dir(root)?;
@@ -563,6 +592,8 @@ impl Memory {
             claims: Arc::default(),
             scope: Mutex::new(None),
             grants_stamp: dm_core::digest(&grants_text),
+            registry: Arc::new(registry),
+            registry_stamp,
             policy_seen: Arc::new(Mutex::new(policy_seen)),
             contexts_kept: Arc::new(AtomicUsize::new(0)),
             tools: OnceLock::new(),
@@ -574,6 +605,7 @@ impl Memory {
             settings: OnceLock::new(),
             evaluation: OnceLock::new(),
             read_domains: Arc::default(),
+            offline: Arc::default(),
         })
     }
 
@@ -595,7 +627,8 @@ impl Memory {
     ///
     /// When the policy fails to give the read scope.
     pub fn for_request(&self) -> Result<Memory, Error> {
-        // without the chain: each read of the view lays the chain of that moment over it
+        // without the chain: each read of the view lays the chain of that moment over it.
+        // A view is no read, so an outage does not refuse it: each read of the view waits
         let scope = self.granted_filter()?;
         let version = self.scope_key(&self.policy());
         let mut session = self.grants.session();
@@ -623,6 +656,8 @@ impl Memory {
             claims: Arc::clone(&self.claims),
             scope: Mutex::new(Some((version, scope))),
             grants_stamp: self.grants_stamp.clone(),
+            registry: Arc::clone(&self.registry),
+            registry_stamp: self.registry_stamp.clone(),
             policy_seen: Arc::clone(&self.policy_seen),
             contexts_kept: Arc::clone(&self.contexts_kept),
             tools: self.tools.clone(),
@@ -634,6 +669,7 @@ impl Memory {
             settings: self.settings.clone(),
             evaluation: self.evaluation.clone(),
             read_domains: Arc::clone(&self.read_domains),
+            offline: Arc::clone(&self.offline),
         })
     }
 
@@ -647,9 +683,17 @@ impl Memory {
     }
 
     /// The granted filter with the task chain of this moment laid over it, before the
-    /// session's settings. The reads that the settings do not govern start from it. This
-    /// function never asks the ledger: its callers can hold the ledger.
+    /// session's settings. The reads that the settings do not govern start from it. Each
+    /// read passes here, so this is where a read waits in an outage. This function never
+    /// asks the ledger: its callers can hold the ledger.
     fn chained_filter(&self) -> Result<ReadFilter, Error> {
+        self.serving()?;
+        self.chained_scope()
+    }
+
+    /// [`Memory::chained_filter`] with no check for an outage: for a caller that reads
+    /// nothing with the filter.
+    fn chained_scope(&self) -> Result<ReadFilter, Error> {
         Ok(self.over_chain(self.granted_filter()?))
     }
 
@@ -665,6 +709,7 @@ impl Memory {
     /// away here from every session that does not read it ([`Memory::reads_held_out`]):
     /// every read filter starts from this one, so this is the one place that keeps the
     /// suites from a session.
+    /// It has no check for an outage: a caller that reads nothing with it can use it.
     fn granted_filter(&self) -> Result<ReadFilter, Error> {
         self.fresh()?;
         // a session in a position reads under the envelope of the version in force,
@@ -767,6 +812,7 @@ impl Memory {
                     .into(),
             ));
         }
+        self.registry_fresh()?;
         let stamp = policy_stamp(&self.root);
         let mut seen = lock(&self.policy_seen);
         if *seen != stamp {
@@ -777,6 +823,26 @@ impl Memory {
                 ))
             })?;
             *seen = stamp;
+        }
+        Ok(())
+    }
+
+    /// Show that the ownership registry reads as it did when the session opened. A
+    /// registry that was written, changed or removed since stops the session: who
+    /// answers for a domain, and whose a personal domain is, are part of its authority.
+    fn registry_fresh(&self) -> Result<(), Error> {
+        let now = registry::stamp(&self.root).map_err(|e| {
+            Error::Stale(format!(
+                "the ownership registry cannot be read ({e}), so this session's access \
+                 cannot be shown"
+            ))
+        })?;
+        if now != self.registry_stamp {
+            return Err(Error::Stale(
+                "the ownership registry changed after this session started. A session \
+                 keeps no registry that was changed under it: start a new session"
+                    .into(),
+            ));
         }
         Ok(())
     }
@@ -873,6 +939,7 @@ impl Memory {
     /// Ask the policy, and log the decision under the record's state: every allow and
     /// deny, with the policy version that produced it, as the paper has decision logs.
     fn decide(&self, input: &Input) -> Result<Decision, Error> {
+        self.serving()?;
         self.fresh()?;
         let mut input = input.clone();
         input.held_task = self.held_task();
@@ -889,7 +956,9 @@ impl Memory {
         if d.denials.is_empty() {
             return Ok(());
         }
-        let filter = self.policy_filter()?;
+        // nothing is read with this filter: it says which rule texts the refusal names.
+        // So it has no check for an outage: a spend that is refused in an outage is told why
+        let filter = self.policy_scope()?;
         let p = self.policy();
         let above = |id: &str| {
             p.entries().iter().any(|e| {
@@ -1037,6 +1106,8 @@ impl Memory {
     pub fn adopt_claims(&self, from: &Memory) {
         let theirs = lock(&from.claims).clone();
         lock(&self.claims).extend(theirs);
+        let confirmed = lock(&from.offline).lease;
+        self.confirm_lease(confirmed);
     }
 
     /// The capabilities this session's manifest carries, matched against task
@@ -1594,6 +1665,9 @@ impl Memory {
     /// [`Error::Denied`] when a raw write with tap reach would replace an entry with
     /// other readers. The log takes nothing of a write that those two refuse.
     pub async fn write(&self, req: WriteRequest) -> Result<Written, Error> {
+        if let Some(outage) = self.outage() {
+            return Err(self.write_in_outage(req, &outage));
+        }
         let mut entry = self.entry_to_write(req).await?;
         // the ledger's events so far come before the write in the log of its domain. A
         // copy that fails is late, not lost: the next one starts where this one stopped
@@ -2444,6 +2518,8 @@ impl Memory {
                 .quarantine(entry.clone(), offered, &decision, &findings)
                 .await);
         }
+        // the policy allowed it: in a personal domain, only the person writes
+        self.hold_proposal(entry, offered).await?;
         Ok(old)
     }
 
@@ -2466,6 +2542,20 @@ impl Memory {
             _ if findings.is_empty() => "blast-radius",
             _ => "injection",
         };
+        self.hold(entry, offered, kind, &decision.reason, findings)
+            .await
+    }
+
+    /// Hold a write outside the record for the gate `kind`, with the task for the owner.
+    /// The error returned says why and where the write is held.
+    async fn hold(
+        &self,
+        entry: Entry,
+        offered: u64,
+        kind: &str,
+        reason: &str,
+        findings: &[scan::Finding],
+    ) -> Error {
         if let Err(e) = self.log_quarantined(&entry, offered, kind, scan::kinds(findings)) {
             return e;
         }
@@ -2480,8 +2570,8 @@ impl Memory {
             };
         }
         let mut body = format!(
-            "{}\n\nThe entry is held as `state/quarantine/{id}.md`, written by `{}` in session `{}`, not in the record and not served. `amem quarantine show {id}` prints it; `amem quarantine release {id}` writes it into the record as it was; `amem quarantine drop {id}` discards it. `amem lineage {id} --back` names the entries its session had read before it wrote this.",
-            decision.reason, entry.front.author, self.session_id
+            "{reason}\n\nThe entry is held as `state/quarantine/{id}.md`, written by `{}` in session `{}`, not in the record and not served. `amem quarantine show {id}` prints it; `amem quarantine release {id}` writes it into the record as it was; `amem quarantine drop {id}` discards it. `amem lineage {id} --back` names the entries its session had read before it wrote this.",
+            entry.front.author, self.session_id
         );
         if !findings.is_empty() {
             body.push_str("\n\nWhat the scan found:\n");
@@ -2509,8 +2599,8 @@ impl Memory {
             .await;
         match filed {
             Ok(c) => Error::Denied(format!(
-                "{} Quarantined as {id}; task {} for the owner.",
-                decision.reason, c.task.id
+                "{reason} Quarantined as {id}; task {} for the owner.",
+                c.task.id
             )),
             Err(e) => e,
         }
@@ -2571,6 +2661,7 @@ impl Memory {
         id: &str,
         keep: bool,
     ) -> Result<Option<Written>, Error> {
+        self.serving()?;
         if self.author != self.grants.owner {
             return Err(Error::Denied(format!(
                 "only the owner {} releases from quarantine",
@@ -2603,6 +2694,8 @@ impl Memory {
             source: e,
         })?;
         let _ = std::fs::remove_file(path.with_extension("review.json"));
+        // the mark of a proposal to a personal domain goes with the entry
+        let _ = std::fs::remove_file(path.with_extension("personal"));
         Ok(written)
     }
 
@@ -2630,8 +2723,12 @@ impl Memory {
     pub async fn t0(&self, domain: Option<&str>) -> Result<String, Error> {
         let domain = self.resolve_domain(domain)?;
         let contents = self.settings().t0_served();
+        // the one line reads nothing, so it does not wait in an outage
         if contents == arms::T0Contents::Off {
             return Ok(arms::T0_OFF.to_string());
+        }
+        if let Some(outage) = self.outage() {
+            return self.t0_in_outage(&domain, &outage, OffsetDateTime::now_utc());
         }
         // under the settings' bounds and never closed: T0 is what the depth T0 serves
         let f = self.t0_filter(&domain)?;
@@ -2679,6 +2776,7 @@ impl Memory {
             digest_only,
         });
         self.reads.text("t0", &text);
+        self.keep_t0(&domain, &text);
         Ok(text)
     }
 
@@ -2856,6 +2954,7 @@ impl Memory {
     /// that this session may not read; the ledger's not-found for an origin that names
     /// a task that the session may not read.
     pub async fn create_task(&self, spec: TaskSpec) -> Result<Created, Error> {
+        self.serving()?;
         // a task from this origin is an approval task: approve reads its event as the
         // version proposed and its filer as the proposer, so one filed here would be a
         // proposal nobody made
@@ -2920,6 +3019,7 @@ impl Memory {
     ///
     /// As [`Memory::create_task`].
     pub async fn file_own(&self, spec: TaskSpec) -> Result<Created, Error> {
+        self.serving()?;
         let mut l = self.ledger.lock().await;
         self.file_in(&mut l, spec, Filing::Own, None).await
     }
@@ -3579,6 +3679,7 @@ impl Memory {
         if let Some(c) = &claim {
             self.observe_task(&c.task);
             lock(&self.claims).insert(c.task.id.clone(), c.generation);
+            self.confirm_lease(Some(c.lease_until));
         }
         Ok(claim)
     }
@@ -3628,6 +3729,7 @@ impl Memory {
         let c = l.claim_by(id, who, lease).await?;
         self.observe_task(&c.task);
         lock(&self.claims).insert(c.task.id.clone(), c.generation);
+        self.confirm_lease(Some(c.lease_until));
         Ok(c)
     }
 
@@ -3642,10 +3744,14 @@ impl Memory {
         generation: Option<u64>,
         lease: Duration,
     ) -> Result<Task, Error> {
+        if let Some(outage) = self.outage() {
+            return Err(self.heartbeat_in_outage(id, generation, lease, &outage));
+        }
         let mut l = self.ledger.lock().await;
         self.check_task(&l.get(id).await?)?;
         let by = self.under(self.claim_of(id, generation)?);
         let t = l.heartbeat(id, by, lease).await?;
+        self.confirm_lease(t.lease_until);
         self.observe_task(&t);
         Ok(t)
     }
@@ -4001,6 +4107,8 @@ impl Memory {
     /// holds is [`dm_index::Error::Held`], and the erasure is finished by running it
     /// again.
     pub async fn erase(&self, id: &str, reason: Reason) -> Result<Receipt, Error> {
+        // an erasure waits in an outage, and nothing changes before this check
+        self.serving()?;
         let (domain, entry) = self.find(id).await?;
         self.erasure_approved(&domain, &entry).await?;
         let stubbed = entry.front.status == Some(Status::Erased);
@@ -4134,6 +4242,10 @@ impl Memory {
         receipt.promotion_whys_removed = scrubbed.records;
         close_receipt(&mut receipt, missed);
         receipt.unresolved.extend(scrubbed.beyond_reach);
+        // a recovery bundle under the root keeps the body: the receipt names each one
+        receipt
+            .unresolved
+            .extend(recovery::copies_under_root(&self.root, domain, id));
         self.store.put_receipt(&receipt).await?;
         self.refresh_projection_after_erasure().await;
         Ok(receipt)
@@ -4343,6 +4455,7 @@ impl Memory {
         src: &Path,
         into_domain: Option<&str>,
     ) -> Result<bundle::Imported, Error> {
+        self.serving()?;
         self.fresh()?;
         let domain = self.resolve_domain(into_domain)?;
         self.may_write_into(&domain, "write")?;
@@ -7740,6 +7853,33 @@ mod tests {
             "{t0}"
         );
         an_exception_lets_one_task_through(dir.path(), &owner, &agent, &d2).await;
+    }
+
+    /// The egress asks before each model call, and an outage does not stop the model of
+    /// a session. So a spend that a rule refuses is refused with its reason in an outage
+    /// too, and the answer is not that the spend waits.
+    #[tokio::test]
+    async fn a_spend_that_a_rule_refuses_is_refused_with_its_reason_in_an_outage() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = mem(dir.path());
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let on_supersede =
+            "input.principal.class == \"agent\"\n\tinput.write.supersedes_type == \"decision\"";
+        let text = RULE.replace(on_supersede, "input.action == \"spend\"");
+        assert_ne!(text, RULE);
+        let rule = policy_entry(&owner, &text).await;
+        verify(&owner, &agent, &rule).await;
+        let agent = Memory::open(dir.path()).unwrap().with_author("agent:a");
+        let spend = || dm_policy::decide::SpendInput {
+            destination: "gateway".into(),
+            ..dm_policy::decide::SpendInput::default()
+        };
+        let live = agent.check_spend(spend()).unwrap();
+        assert!(!live.allow, "{live:?}");
+        assert!(live.reason.contains("pol-L2-031"), "{live:?}");
+        owner.declare_outage("the ledger does not answer").unwrap();
+        let during = agent.check_spend(spend()).unwrap();
+        assert_eq!((during.allow, during.reason), (false, live.reason));
     }
 
     /// A rule whose block says enforced, with a module that gives a code and a remedy.

@@ -35,6 +35,8 @@ impl Memory {
     /// As [`Memory::export`]; a name that cannot be a directory; a link where a directory
     /// of the exports must be.
     pub async fn export_kept(&self, domain: Option<&str>, max_label: Label) -> Result<Kept, Error> {
+        // before the bundle of an earlier call is removed: an export waits in an outage
+        self.serving()?;
         let domain = self.resolve_domain(domain)?;
         let kept_at = bundle::kept_at(&self.session_id, &domain, max_label)?;
         let exports = self.root.join(EXPORTS_DIR);

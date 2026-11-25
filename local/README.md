@@ -1258,6 +1258,213 @@ Some commands of the owner and of the launcher do not do the check: for example
 `amem transcript`, `amem tape`, `amem source`, `amem quarantine`,
 `amem policy lint` and `amem policy reset`. No memory tool is in this group.
 
+## Long timescales: the registry, recovery and an outage
+
+These commands are for what changes over years: the people, the units, and the machines
+that hold a root.
+
+| Command | Memory tool | What it does |
+|---|---|---|
+| `amem registry check [--file] [--today D]` | `registry_check` | Checks the registry against the grants. With `--file`, it files a task for each flag |
+| `amem registry resolve <id>` | `resolve_identity` | Reads an identifier of a person, and follows the assertions |
+| `amem proposal list` | `proposals` | Lists the proposals to personal domains. Only the owner |
+| `amem proposal admit <id>`, `refuse <id>` | `answer_proposal` | Admits or refuses a proposal. Only the owner, at the command line or in `amem serve --person`. The memory tool is refused in a session that a harness reaches |
+| `amem proposal expire [--today D]` | none | Removes each proposal that waited longer than `proposal_days` |
+| `amem recover bundle <dest>` | `recovery_bundle` | Makes a recovery bundle. The memory tool makes it under `state/recovery/`. The memory tool is refused in a session that a harness reaches |
+| `amem recover journal <dest>` | none | Copies the erasure journal, the refusal journal and the drift windows to a directory |
+| `amem recover drill <bundle> [--scratch DIR]` | `recovery_drill` | Runs a restore drill. The memory tool takes the name of a bundle under `state/recovery/`. The memory tool is refused in a session that a harness reaches |
+| `amem --root <new root> recover restore <bundle> --grants F --epoch-authority F [--registry F] [--journal DIR]` | none | Restores a recovery bundle into a new root |
+| `amem outage status` | `outage_status` | Gives the declared outage |
+| `amem outage declare --reason TEXT`, `amem outage end` | none | Declares an outage, and ends it. Only the owner |
+| `amem horizon schedule [--today D]` | `horizon_schedule` | Files the evidence task and the review task of each unit. Only a person |
+
+Each command and each memory tool calls the same library function. No memory tool
+restores into another root, and none declares or ends an outage. The reason: the memory
+server of a session has access only inside its root.
+
+### The registry
+
+`registry.toml` is a file beside `grants.toml`. You edit it by hand. A root with no such
+file has no registry: the owner of the grants answers for each domain, and the check
+flags nothing. A change to the file stops each open session, as a change to the grants
+does.
+
+```toml
+[units.unit-7f3a]                 # a key that does not change
+name = "Infrastructure"           # a name that can change
+domains = ["dom-demo"]
+horizon_scanner = "human:demo,2026-11-01:check"
+horizon_cadence_days = 30
+
+[[units.unit-7f3a.owners]]
+id = "human:demo,2026-11-01:check"
+until = 2027-01-01                # the last day on which this person answers
+
+[[assertions]]
+was = "human:demo:check"
+is = "human:demo,2026-11-01:check"
+since = 2026-11-01
+```
+
+The registry names each person by a dated identifier:
+`human:<authority>,<YYYY-MM-DD>:<user-id>`. An entry keeps the identifier that its author
+had. For a new identifier, add an assertion. `amem registry resolve` follows the
+assertions:
+
+```sh
+amem registry resolve human:demo:check     # "is": "human:demo,2026-11-01:check"
+amem registry check                        # the flags, and nothing filed
+amem registry check --file                 # one task for a person for each flag
+```
+
+The check gives these flags:
+
+- `ownerless`: no owner of a unit answers for the domain today.
+- `not-in-registry`: no unit lists a domain that the grants hold.
+- `personal-not-holder`: the person of a personal domain does not hold the grants.
+- `no-scanner`: a unit names no horizon scanner.
+
+`amem init` with no `--owner` makes the owner `human:local,<today>:<user>`. `--owner`
+takes a dated identifier or the form without a date.
+
+### A personal domain
+
+A domain is a personal domain when the registry names a `person` for it. That person
+must hold the grants of the root.
+
+```toml
+[domains.dom-me]
+person = "human:demo,2026-11-01:check"
+proposal_days = 30
+```
+
+Only that person writes to the domain. A write by another author is a proposal. The
+policy screens it first. Then the quarantine holds it, and the owner gets a task.
+
+```sh
+amem proposal list
+amem quarantine show <id>        # the text of the proposal
+amem proposal admit <id>         # into the record, with its author
+amem proposal refuse <id>        # removed, and not held again
+amem proposal expire             # removes each proposal older than proposal_days
+```
+
+A refusal keeps a digest of the origin of the proposal in `state/refused/<domain>.txt`,
+and no text. An expired proposal keeps nothing, so the author can offer it again.
+
+### A recovery bundle and a restore drill
+
+A copy of the record alone loses the tasks that were not finished. A recovery bundle
+holds the record, the event logs with their cursors, the events of the ledger, the
+quarantine, the drift windows and the configuration. It does not hold the index. Keep five things apart
+from each bundle, because a restore must not roll them back:
+
+- the grants that are in force now
+- the erasure journal: the receipts of the erasures, of entries and of transcripts
+- the drift windows that are in force now. `amem recover journal` puts them in the same
+  directory as the erasure journal
+- the refusal journal: the key of each refused proposal to a personal domain. `amem
+  recover journal` puts it in the same directory as the erasure journal
+- the claim epoch file, `<root>/claim-epoch` by default
+
+```sh
+amem recover bundle /backup/2026-11-25
+amem recover journal /backup/journal
+amem recover drill /backup/2026-11-25
+```
+
+The restore drill restores the bundle into a scratch root, which is a new directory
+under `state/recovery/` if you give no `--scratch`. It reports five cases as `recovered`,
+`absent` or `failed`:
+
+- `unfinished-task`: each task is in the restored ledger, and none is under a claim. The
+  ledger refuses a heartbeat under a claim from before the restore.
+- `erasure-after-backup`: an entry that was erased after the bundle is a stub.
+- `write-awaiting-materialisation`: a version that the index did not hold is in the
+  index.
+- `uncertain-external-action`: an effect that nobody had settled is still on its task,
+  and the restored ledger holds that task back from every claim.
+- `cross-domain-dependency`: always `absent`, because coordination across domains is
+  not built.
+
+A case is `recovered` only when the bundle held it. The drill does not write the record
+or the ledger of the root. It moves only the claim epoch file. Remove the scratch root
+when you have read the report.
+
+An erasure does not change a recovery bundle. A bundle or a scratch root under
+`state/recovery/` can hold the erased entry with its body. The receipt of the erasure
+names each such directory in `unresolved`. Delete each directory that the receipt names,
+and make a new bundle. These items are open:
+
+- The restore drill restores into a file ledger, which numbers the events of all domains
+  together. A PostgreSQL ledger numbers the events of each domain apart. Thus the drill
+  of a root with a PostgreSQL ledger is refused when two domains hold an event with the
+  same number.
+- A write appends to the event log, and then puts the version in the record. A bundle
+  that is made between those two steps holds an event for a version that its record does
+  not hold. The drill then reports `write-awaiting-materialisation` as `failed`. Make the
+  bundle again.
+
+A restore makes a new root. `--root` names a directory that is empty or not there:
+
+```sh
+amem --root /srv/memory-new recover restore /backup/2026-11-25 \
+  --grants /srv/config/grants.toml --journal /backup/journal \
+  --epoch-authority /srv/config/claim-epoch
+```
+
+The restore begins the next claim epoch on the ledger. Thus each task that was claimed
+is open again, and the ledger refuses each claim from before the restore. The restore
+then erases each entry and each transcript that the erasure journal names. It adds the
+drift windows of the journal to those of the bundle. It removes each proposal that
+the refusal journal names, and the refusal record takes each key. The grants of the bundle go to
+`restored-config/`, and nothing loads them. While a restore runs, the root holds
+`state/restoring`, and `amem` refuses to open it.
+
+### An outage
+
+Declare an outage when nothing can check a read or a change:
+
+```sh
+amem outage declare --reason "the host of the ledger moves"
+amem outage status
+amem outage end
+```
+
+In an outage, each read and each change waits: the answer says that an outage is
+declared. A session is not stopped, and its model calls continue. Three things do not
+wait:
+
+- `t0` gives the T0 that the session loaded before the outage, with a line that says
+  so. A session that holds a task gets it only until the last lease that the ledger
+  confirmed.
+- A write of a handoff goes on a queue, `state/outage/queue.jsonl`.
+- A heartbeat goes on the same queue. It confirms no lease.
+
+The owner can also copy the journals (`amem recover journal`) and run a restore drill in
+an outage. A restore into another root takes the journals, and the drill writes only a
+scratch root and the claim epoch file.
+
+`amem outage end` replays the queue in order. A handoff goes through the ordinary write
+as its author, so the policy screens it. A heartbeat goes to the ledger, and the clock of
+the ledger decides: a lease that ran out in the outage stays lost. The `outage_status`
+memory tool also names the domains whose T0 the session loaded, and its last confirmed
+lease.
+
+The replay of a handoff reads no higher than the session did when it queued the handoff.
+Thus a handoff cannot replace an entry that its session could not read. A handoff that
+the record does not take is not lost: `amem outage end` names it in `failed`, and keeps
+the queued line in `state/outage/failed.jsonl`. No command reads that file. The owner
+reads it, and gives the text to a session or removes the file.
+
+### The horizon scanner
+
+The horizon scanner of a unit is a person, whom the registry names. For each period of
+`horizon_cadence_days`, `amem horizon schedule` files two tasks: an evidence task that an
+agent can claim, and a review task that requires a person and waits for the evidence
+task. Each curation cycle (`amem curate`) does the same, and also files the flags of the
+registry check. The tasks of one period are filed once.
+
 ## The states of a task, and its claim: `amem task`
 
 A task has one of six states, with the names that the paper gives:

@@ -191,6 +191,8 @@ impl Memory {
     /// counts and what the session holds; it reads no entry, logs no read and leaves the
     /// session's label where it is. The counts are of every label, so the manifest is
     /// kept only where the owner alone reads it: on a decision context and on a tape.
+    /// It does not wait in an outage: the model of a session works in an outage, and
+    /// each decision context that the egress records then still gets its manifest.
     ///
     /// # Errors
     ///

@@ -299,6 +299,8 @@ impl Memory {
         life: Duration,
     ) -> Result<ApprovalRecord, Error> {
         self.in_person("raises a limit")?;
+        // a raise is a change of the ledger: it waits in an outage
+        self.serving()?;
         let of_queue = match limit {
             Limit::Landing(queue) => self.grants.landing.get(queue).map(|q| q.domain.as_str()),
             _ => None,
