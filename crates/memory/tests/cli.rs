@@ -2399,9 +2399,11 @@ fn export_without_a_destination_keeps_the_bundle_under_the_root() {
         "exported 2 entries from dom-me, highest label internal"
     );
     let kept = Path::new(at);
-    let under = kept.strip_prefix(d.root.join("state/exports")).expect(at);
+    // the command prints the path as the system resolves it, so resolve the root too
+    let exports = d.root.join("state/exports").canonicalize().unwrap();
+    let under = kept.strip_prefix(&exports).expect(at);
     assert_eq!(under.components().count(), 2, "{at}");
-    assert!(at.ends_with("/dom-me-internal"), "{at}");
+    assert!(under.ends_with("dom-me-internal"), "{at}");
     assert!(kept.join("manifest.yaml").is_file(), "{at}");
 }
 
