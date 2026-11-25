@@ -41,6 +41,7 @@ pub mod address;
 pub mod approvals;
 pub mod arms;
 pub mod autonomy;
+pub mod brief;
 pub mod bundle;
 pub mod contexts;
 pub mod drift_windows;
@@ -50,6 +51,7 @@ pub mod fetch;
 pub mod gates;
 pub mod held_out;
 mod holds;
+mod kept;
 pub mod limits;
 pub mod lineage;
 pub mod log;
@@ -3972,7 +3974,8 @@ impl Memory {
     }
 
     /// The steps of an erasure after the record's: the entries downstream, the index,
-    /// the served bundles, every render, and the ledger's whys and approval tasks; then
+    /// the served bundles and the bundles that sessions keep under the root, every
+    /// render, and the ledger's whys and approval tasks; then
     /// the receipt, closed. The index takes the stub through the feed, from the `erased`
     /// event of the entry in the log.
     async fn finish_erasure(
@@ -4006,6 +4009,7 @@ impl Memory {
         self.index.lock().await.vacuum()?;
         self.forget_pushed(id);
         self.drop_bundles(domain)?;
+        self.drop_kept(domain)?;
         // every session's render, before the receipt says the erasure is done; what it
         // could not reach is said on the receipt
         let missed = self.erase_from_projections(domain, id);

@@ -42,6 +42,11 @@ pub struct Read {
     /// How a recall was served: `brief`, or `pack:sections` and `pack:summaries`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
+    /// How a recall was sized from what its caller said:
+    /// `<kind>/context=<n or none>/brief=<n>/pack=<n>`. Absent for a recall whose caller
+    /// said nothing, and in lines written before this was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub choice: Option<String>,
     /// How long the server took to answer, in milliseconds: kept for a search. Absent
     /// in lines written before this was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -247,10 +252,18 @@ impl ReadLog {
         via: Option<&str>,
         ids: &[String],
     ) {
-        self.record(tool, query, (hits, tokens), cached, via, ids, None);
+        self.record(tool, query, (hits, tokens), cached, (via, None), ids, None);
     }
 
-    /// Append one read, and trace it. `size` is the hits and the tokens served.
+    /// A recall answered: `size` is the hits and the tokens served, `via` is its regime,
+    /// and `choice` is how it was sized, for a recall whose caller said what it needs.
+    pub fn recalled(&self, question: &str, size: (usize, usize), via: &str, choice: Option<&str>) {
+        let how = (Some(via), choice);
+        self.record("recall", Some(question), size, false, how, &[], None);
+    }
+
+    /// Append one read, and trace it. `size` is the hits and the tokens served. `how` is
+    /// the regime of a recall and how it was sized.
     #[allow(clippy::too_many_arguments)] // one per thing a read is
     fn record(
         &self,
@@ -258,7 +271,7 @@ impl ReadLog {
         query: Option<&str>,
         size: (usize, usize),
         cached: bool,
-        via: Option<&str>,
+        how: (Option<&str>, Option<&str>),
         ids: &[String],
         ms: Option<u64>,
     ) {
@@ -285,7 +298,8 @@ impl ReadLog {
             tokens: size.1,
             cached,
             ids: ids.to_vec(),
-            via: via.map(str::to_string),
+            via: how.0.map(str::to_string),
+            choice: how.1.map(str::to_string),
             ms,
         };
         trace(&read);
@@ -311,7 +325,15 @@ impl ReadLog {
     pub fn searched(&self, query: &str, hits: &[Hit], ms: u64) {
         let ids: Vec<String> = hits.iter().map(|h| h.id.clone()).collect();
         let size = (hits.len(), hits_tokens(hits));
-        self.record("search", Some(query), size, false, None, &ids, Some(ms));
+        self.record(
+            "search",
+            Some(query),
+            size,
+            false,
+            (None, None),
+            &ids,
+            Some(ms),
+        );
     }
 
     /// A list or search answered with these hits.
@@ -371,6 +393,9 @@ fn trace(read: &Read) {
     }
     if let Some(v) = &read.via {
         attrs.push(("memory.via", v.as_str().into()));
+    }
+    if let Some(c) = &read.choice {
+        attrs.push(("memory.choice", c.as_str().into()));
     }
     if let Some(ms) = read.ms {
         attrs.push(("memory.ms", ms.into()));
@@ -495,6 +520,7 @@ mod tests {
         let reads = all(dir.path()).unwrap();
         assert_eq!(reads.len(), 3, "the old line parses: {reads:?}");
         assert_eq!((reads[0].session.as_str(), reads[0].ms), ("s-old", None));
+        assert_eq!(reads[0].choice, None);
         assert_eq!(reads[0].ids, ["mem-a", "mem-b"]);
         assert_eq!((reads[1].tool.as_str(), reads[1].ms), ("search", Some(7)));
         assert_eq!(reads[2].ms, None, "only a search is timed");
@@ -506,6 +532,41 @@ mod tests {
             "an untimed read has no ms: {}",
             lines[2]
         );
+    }
+
+    #[test]
+    fn a_recall_line_keeps_its_regime_and_its_choice_and_an_older_line_still_parses() {
+        let dir = tempfile::tempdir().unwrap();
+        let old = r#"{"at":"2026-10-10T00:00:00Z","session":"s-old","tool":"recall","query":"import","hits":2,"tokens":40,"via":"pack:sections"}"#;
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        std::fs::write(path(dir.path()), format!("{old}\n")).unwrap();
+        let log = ReadLog::new(dir.path(), "sess-new");
+        log.served_via("recall", Some("import"), 2, 40, false, Some("brief"));
+        log.recalled("import", (2, 40), "brief", None);
+        let choice = "fact/context=none/brief=150/pack=1500";
+        log.recalled("import", (3, 70), "pack:summaries", Some(choice));
+        let reads = all(dir.path()).unwrap();
+        assert_eq!(reads.len(), 4, "the old line parses: {reads:?}");
+        assert_eq!(reads[0].via.as_deref(), Some("pack:sections"));
+        assert_eq!(reads[0].choice, None);
+        let same = |r: &Read| {
+            (
+                r.tool.clone(),
+                r.query.clone(),
+                r.hits,
+                r.tokens,
+                r.via.clone(),
+            )
+        };
+        assert_eq!(same(&reads[1]), same(&reads[2]), "a recall with no choice");
+        assert_eq!(reads[3].via.as_deref(), Some("pack:summaries"));
+        assert_eq!(reads[3].choice.as_deref(), Some(choice));
+        assert_eq!((reads[3].hits, reads[3].tokens), (3, 70));
+        let text = std::fs::read_to_string(path(dir.path())).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        let keys = |l: &str| l.replace(|c: char| c.is_ascii_digit(), "");
+        assert_eq!(keys(lines[1]), keys(lines[2]), "the same keys");
+        assert!(!lines[2].contains("choice"), "{}", lines[2]);
     }
 
     #[test]

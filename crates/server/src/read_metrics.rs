@@ -321,6 +321,7 @@ mod tests {
             cached: false,
             ids: ids.iter().map(|i| (*i).to_string()).collect(),
             via: None,
+            choice: None,
             ms: None,
         }
     }

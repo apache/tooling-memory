@@ -275,6 +275,61 @@ pub fn bundle_dir(root: &Path, domain: &str, label: Label) -> PathBuf {
     root.join(BUNDLES_DIR).join(format!("{domain}-{label}"))
 }
 
+/// Where the memory server keeps the bundles that its sessions export, under the root's
+/// state: one directory for each session, so a session replaces only its own bundle. It
+/// is apart from [`BUNDLES_DIR`], which the web pages serve and refresh as the owner.
+pub const EXPORTS_DIR: &str = "state/exports";
+
+/// What a session gets for a bundle that the memory server kept under the root: counts,
+/// labels, a digest and a place. It holds no id, title or summary of an entry, so the
+/// answer shows the session nothing of what the bundle holds.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct Kept {
+    /// The domain that was exported.
+    pub domain: String,
+    /// The bound that the export was asked for.
+    pub max_label: Label,
+    /// The highest classification inside the bundle, as its manifest says.
+    pub highest_label: Label,
+    /// How many entries the bundle holds.
+    pub entries: usize,
+    /// The digest of the manifest: the one that the send event of the log names.
+    pub manifest_digest: String,
+    /// Where the bundle is, relative to the root:
+    /// `state/exports/<session id>/<domain>-<label>`.
+    pub kept_at: String,
+}
+
+/// Whether `name` can be one component of a path under [`EXPORTS_DIR`]: ASCII letters,
+/// digits, `.`, `_` and `-` only, not empty, and no dot first, so it is no parent
+/// directory and no hidden file.
+#[must_use]
+pub fn is_kept_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('.')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+}
+
+/// Where the bundle of `session` for `domain` at `label` is kept, relative to the root.
+/// Each name is checked before it becomes a part of the path.
+///
+/// # Errors
+///
+/// [`Error::Invalid`] for a session id or a domain that [`is_kept_name`] refuses.
+pub fn kept_at(session: &str, domain: &str, label: Label) -> Result<String, Error> {
+    let last = format!("{domain}-{label}");
+    for (what, name) in [("session", session), ("domain", domain), ("bundle", &last)] {
+        if !is_kept_name(name) {
+            return Err(Error::Invalid(format!(
+                "the {what} name {name:?} cannot be a directory of an export"
+            )));
+        }
+    }
+    Ok(format!("{EXPORTS_DIR}/{session}/{last}"))
+}
+
 /// What an export reads: `filter` narrowed to `domain`, bounded at `max_label`, with
 /// tombstones and every tier, since a bundle carries the domain whole. Fails if the
 /// filter does not cover the domain.

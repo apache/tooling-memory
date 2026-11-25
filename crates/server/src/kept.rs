@@ -1,0 +1,457 @@
+//! An export that the memory server keeps under the root. A session that a harness
+//! reaches gives no path: the place is made from the root, the session id, the domain and
+//! the label, and from nothing else. The answer holds counts, labels and a digest, so
+//! the session learns nothing of an entry from it and its label does not rise.
+
+use crate::bundle::{self, Kept, EXPORTS_DIR};
+use crate::{io, Error, Memory};
+use dm_core::Label;
+use std::path::Path;
+
+/// Refuse `path` when it is there and is not a directory of its own: a link there would
+/// carry the bundle out of the root.
+fn not_a_link(path: &Path) -> Result<(), Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => Err(Error::Denied(format!(
+            "{} is not a directory of the exports",
+            path.display()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+impl Memory {
+    /// Export a domain at or below a label into a bundle that stays under the root, at
+    /// `state/exports/<session id>/<domain>-<label>`. The bundle is the one that
+    /// [`Memory::export`] writes, under the same checks: the read filter of the session,
+    /// the bound, and the two events in the log of the domain. A bundle that an earlier
+    /// call of this session left at that place is removed first. A call that fails
+    /// leaves no bundle there.
+    ///
+    /// # Errors
+    ///
+    /// As [`Memory::export`]; a name that cannot be a directory; a link where a directory
+    /// of the exports must be.
+    pub async fn export_kept(&self, domain: Option<&str>, max_label: Label) -> Result<Kept, Error> {
+        let domain = self.resolve_domain(domain)?;
+        let kept_at = bundle::kept_at(&self.session_id, &domain, max_label)?;
+        let exports = self.root.join(EXPORTS_DIR);
+        not_a_link(&exports)?;
+        not_a_link(&exports.join(&self.session_id))?;
+        let dir = self.root.join(&kept_at);
+        if std::fs::symlink_metadata(&dir).is_ok() {
+            std::fs::remove_dir_all(&dir).map_err(io(&dir))?;
+        }
+        let exported = match self.export(Some(&domain), max_label, &dir).await {
+            Ok(exported) => exported,
+            Err(e) => {
+                // a part of a bundle is no bundle
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        };
+        let manifest = exported.manifest;
+        Ok(Kept {
+            domain,
+            max_label,
+            highest_label: manifest.highest_label,
+            entries: manifest.entries.len(),
+            manifest_digest: dm_core::digest(&manifest.to_yaml()),
+            kept_at,
+        })
+    }
+
+    /// Remove the bundles of a domain that the sessions of this root keep, at every
+    /// label: a kept bundle holds bodies as they were, and an erasure reaches them.
+    pub(crate) fn drop_kept(&self, domain: &str) -> Result<(), Error> {
+        let exports = self.root.join(EXPORTS_DIR);
+        let Ok(sessions) = std::fs::read_dir(&exports) else {
+            return Ok(());
+        };
+        for session in sessions.flatten() {
+            for label in [Label::Public, Label::Internal, Label::Restricted] {
+                let dir = session.path().join(format!("{domain}-{label}"));
+                if std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+                    std::fs::remove_dir_all(&dir).map_err(io(&dir))?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::log::{self, Change};
+    use crate::testing::{as_author, held_out_root};
+    use crate::WriteRequest;
+    use dm_core::manifest::Manifest;
+    use dm_core::{EntryType, TrustTier};
+    use dm_ledger::TaskSpec;
+
+    const TITLE: &str = "Harbour crane";
+    const WORD: &str = "gantry";
+
+    async fn wrote(m: &Memory, kind: EntryType, label: Label, domain: Option<&str>) -> String {
+        m.write(WriteRequest {
+            title: Some(TITLE.into()),
+            body: format!("The {WORD} lifts at {label}.\n"),
+            entry_type: kind,
+            classification: Some(label),
+            domain: domain.map(str::to_string),
+            ..WriteRequest::default()
+        })
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// The entries of [`shelf`], by what each one is.
+    struct Shelf {
+        owner: Memory,
+        /// A public fact of the owner in `dom-me`.
+        open: String,
+        /// An internal fact of the owner in `dom-me`.
+        inner: String,
+        /// A restricted fact of the owner in `dom-me`.
+        secret: String,
+        /// A public convention in the held-out domain, which no agent reads.
+        held: String,
+        /// A public handoff of `agent:a`, raw, with tap reach: it names a task of a tap.
+        note: String,
+    }
+
+    /// A root with entries inside and outside what an agent with no task reads.
+    async fn shelf(dir: &Path) -> Shelf {
+        let owner = held_out_root(dir);
+        let me = Some("dom-me");
+        let open = wrote(&owner, EntryType::Fact, Label::Public, me).await;
+        let inner = wrote(&owner, EntryType::Fact, Label::Internal, me).await;
+        let secret = wrote(&owner, EntryType::Fact, Label::Restricted, me).await;
+        let held = wrote(
+            &owner,
+            EntryType::Convention,
+            Label::Public,
+            Some("dom-held"),
+        )
+        .await;
+        let spec = TaskSpec {
+            title: "From the tracker".into(),
+            body: "Do it.\n".into(),
+            domain: "dom-me".into(),
+            ..TaskSpec::default()
+        };
+        let filed = as_author(dir, "tap:issues").create_task(spec).await;
+        let task = owner.admit(&filed.unwrap().task.id).await.unwrap();
+        let a = as_author(dir, "agent:a");
+        a.hold_task(&task.id).await.unwrap();
+        let note = wrote(&a, EntryType::Handoff, Label::Public, me).await;
+        let front = owner.get(&note).await.unwrap().front;
+        assert_eq!(
+            (front.trust_tier, front.reach),
+            (TrustTier::Raw, dm_core::Reach::Tap)
+        );
+        let owner = Memory::open(dir).unwrap();
+        Shelf {
+            owner,
+            open,
+            inner,
+            secret,
+            held,
+            note,
+        }
+    }
+
+    fn manifest_at(root: &Path, kept: &Kept) -> (String, Manifest) {
+        let text = std::fs::read_to_string(root.join(&kept.kept_at).join("manifest.yaml")).unwrap();
+        let manifest = Manifest::from_yaml(&text).unwrap();
+        (text, manifest)
+    }
+
+    fn ids(manifest: &Manifest) -> Vec<&str> {
+        let mut ids: Vec<&str> = manifest.entries.iter().map(|e| e.id.as_str()).collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    fn sorted(mut ids: Vec<&str>) -> Vec<&str> {
+        ids.sort_unstable();
+        ids
+    }
+
+    #[test]
+    fn a_name_is_checked_before_it_is_a_directory_of_an_export() {
+        assert_eq!(
+            bundle::kept_at("sess-1a", "dom-me", Label::Internal).unwrap(),
+            "state/exports/sess-1a/dom-me-internal"
+        );
+        for bad in [
+            "", "..", ".", ".hidden", "a/b", "a\\b", "../x", "a b", "dom:me", "é",
+        ] {
+            assert!(!bundle::is_kept_name(bad), "{bad:?}");
+            let as_session = bundle::kept_at(bad, "dom-me", Label::Public);
+            assert!(as_session.is_err(), "session {bad:?}: {as_session:?}");
+            if !bad.is_empty() {
+                let as_domain = bundle::kept_at("sess-1a", bad, Label::Public);
+                assert!(as_domain.is_err(), "domain {bad:?}: {as_domain:?}");
+            }
+        }
+        for good in ["sess-1a", "dom_me", "v1.2", "A-9"] {
+            assert!(bundle::is_kept_name(good), "{good}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_export_above_the_handling_of_the_session_is_refused_and_makes_no_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = shelf(dir.path()).await;
+        drop(s);
+        let capped = as_author(dir.path(), "agent:b").with_handling_cap(Label::Internal);
+        let refused = capped.export_kept(Some("dom-me"), Label::Restricted).await;
+        assert!(
+            matches!(&refused, Err(Error::Denied(why)) if why.contains("exceeds handling")),
+            "{refused:?}"
+        );
+        // a domain that the session does not read, and no domain where several are granted
+        assert!(capped
+            .export_kept(Some("dom-held"), Label::Public)
+            .await
+            .is_err());
+        assert!(capped
+            .export_kept(Some("dom-none"), Label::Public)
+            .await
+            .is_err());
+        assert!(capped.export_kept(None, Label::Public).await.is_err());
+        assert!(
+            !dir.path().join(EXPORTS_DIR).exists(),
+            "a refused export makes no directory"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_bundle_of_an_agent_holds_only_what_its_read_filter_admits_under_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = shelf(dir.path()).await;
+        let b = as_author(dir.path(), "agent:b");
+        let before = b.label();
+        let at = log::read(dir.path(), "dom-me", 0).unwrap().len() as u64;
+        let kept = b
+            .export_kept(Some("dom-me"), Label::Internal)
+            .await
+            .unwrap();
+        let (text, manifest) = manifest_at(dir.path(), &kept);
+        assert_eq!(
+            ids(&manifest),
+            sorted(vec![&s.open, &s.inner]),
+            "not the restricted entry {}, not the entry {} of the held-out domain, and not \
+             the raw note {} of a task chain that the session is not in",
+            s.secret,
+            s.held,
+            s.note
+        );
+        assert_eq!(
+            kept.kept_at,
+            format!("state/exports/{}/dom-me-internal", b.session_id())
+        );
+        assert_eq!(
+            (kept.domain.as_str(), kept.max_label),
+            ("dom-me", Label::Internal)
+        );
+        assert_eq!(kept.entries, 2);
+        assert_eq!(kept.highest_label, Label::Internal);
+        assert_eq!(kept.highest_label, manifest.highest_label);
+        assert_eq!(kept.manifest_digest, dm_core::digest(&text));
+
+        // the answer names no entry, and the session read none
+        let answer = serde_json::to_string(&kept).unwrap();
+        for hidden in [&*s.open, &*s.inner, TITLE, WORD] {
+            assert!(!answer.contains(hidden), "{hidden} in {answer}");
+        }
+        let keys: Vec<String> = serde_json::to_value(&kept)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            keys,
+            [
+                "domain",
+                "entries",
+                "highest_label",
+                "kept_at",
+                "manifest_digest",
+                "max_label"
+            ]
+        );
+        assert_eq!(b.label(), before, "the label of the session did not rise");
+
+        // the log of the domain: the read of what the bundle carries, then the send
+        let events = log::read(dir.path(), "dom-me", at + 1).unwrap();
+        let own: Vec<_> = events
+            .iter()
+            .filter(|e| e.session.as_deref() == Some(b.session_id()))
+            .collect();
+        assert_eq!(own.len(), 2, "{own:?}");
+        let carried: Vec<String> = manifest.entries.iter().map(|e| e.id.clone()).collect();
+        assert_eq!(own[0].change, Change::Read { ids: carried });
+        assert_eq!(own[0].label, Some(Label::Internal));
+        let sent = Change::Send {
+            to: "export:internal".into(),
+            digest: kept.manifest_digest.clone(),
+        };
+        assert_eq!(own[1].change, sent);
+
+        // a lower bound: the public entry alone, and the highest label is the bundle's
+        let public = b.export_kept(Some("dom-me"), Label::Public).await.unwrap();
+        let (_, manifest) = manifest_at(dir.path(), &public);
+        assert_eq!(ids(&manifest), [s.open.as_str()]);
+        assert_eq!((public.entries, public.highest_label), (1, Label::Public));
+        // the owner reads the note and the restricted entry; an agent does not
+        let all = s.owner.export_kept(Some("dom-me"), Label::Restricted).await;
+        let (_, manifest) = manifest_at(dir.path(), &all.unwrap());
+        assert_eq!(
+            ids(&manifest),
+            sorted(vec![&s.open, &s.inner, &s.secret, &s.note])
+        );
+    }
+
+    #[tokio::test]
+    async fn the_highest_label_is_of_the_entries_and_not_of_the_bound() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        wrote(&owner, EntryType::Fact, Label::Public, None).await;
+        wrote(&owner, EntryType::Fact, Label::Internal, None).await;
+        let kept = owner.export_kept(None, Label::Restricted).await.unwrap();
+        assert_eq!(kept.max_label, Label::Restricted);
+        assert_eq!(kept.highest_label, Label::Internal);
+        let (_, manifest) = manifest_at(dir.path(), &kept);
+        let highest = manifest.entries.iter().map(|e| e.classification).max();
+        assert_eq!(Some(kept.highest_label), highest);
+    }
+
+    #[tokio::test]
+    async fn a_second_call_replaces_the_bundle_of_the_session_and_no_other() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = shelf(dir.path()).await;
+        let b = as_author(dir.path(), "agent:b");
+        let other = as_author(dir.path(), "agent:c");
+        let first = b
+            .export_kept(Some("dom-me"), Label::Internal)
+            .await
+            .unwrap();
+        let theirs = other
+            .export_kept(Some("dom-me"), Label::Internal)
+            .await
+            .unwrap();
+        assert_ne!(
+            first.kept_at, theirs.kept_at,
+            "one directory for each session"
+        );
+        let mine = dir.path().join(&first.kept_at);
+        let file = |id: &str| mine.join(format!("{id}.md"));
+        assert!(file(&s.open).is_file() && file(&s.inner).is_file());
+
+        // the agents of the root now read no raw entry outside a task chain
+        crate::testing::agents_read(dir.path(), "\"raw_reach\": \"chain\"");
+        let second = b
+            .export_kept(Some("dom-me"), Label::Internal)
+            .await
+            .unwrap();
+        assert_eq!(second.kept_at, first.kept_at);
+        assert_eq!(second.entries, 0, "{second:?}");
+        assert_ne!(second.manifest_digest, first.manifest_digest);
+        assert!(
+            !file(&s.open).exists() && !file(&s.inner).exists(),
+            "the files of the first bundle are gone"
+        );
+        let (_, manifest) = manifest_at(dir.path(), &second);
+        assert!(manifest.entries.is_empty());
+        let (_, manifest) = manifest_at(dir.path(), &theirs);
+        assert_eq!(ids(&manifest), sorted(vec![&s.open, &s.inner]));
+        assert!(dir
+            .path()
+            .join(&theirs.kept_at)
+            .join(format!("{}.md", s.open))
+            .is_file());
+    }
+
+    #[tokio::test]
+    async fn a_kept_bundle_imports_into_a_second_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = shelf(dir.path()).await;
+        let b = as_author(dir.path(), "agent:b");
+        let kept = b
+            .export_kept(Some("dom-me"), Label::Internal)
+            .await
+            .unwrap();
+        let there = tempfile::tempdir().unwrap();
+        let other = Memory::init(there.path(), "human:test:you", "dom-you").unwrap();
+        let landed = other
+            .import(&dir.path().join(&kept.kept_at), None)
+            .await
+            .unwrap();
+        assert_eq!(landed.written.len(), kept.entries, "{landed:?}");
+        let found = other.search(WORD, None, 10).await.unwrap();
+        assert_eq!(found.len(), 2, "{found:?}");
+        assert!(other
+            .search("restricted", None, 10)
+            .await
+            .unwrap()
+            .is_empty());
+        drop(s);
+    }
+
+    #[tokio::test]
+    async fn an_erasure_removes_the_kept_bundles_of_the_domain() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = shelf(dir.path()).await;
+        let b = as_author(dir.path(), "agent:b");
+        let kept = b
+            .export_kept(Some("dom-me"), Label::Internal)
+            .await
+            .unwrap();
+        let held = s.owner.export_kept(Some("dom-held"), Label::Internal).await;
+        let held = held.unwrap();
+        let body = dir
+            .path()
+            .join(&kept.kept_at)
+            .join(format!("{}.md", s.open));
+        assert!(std::fs::read_to_string(&body).unwrap().contains(WORD));
+        s.owner
+            .erase(&s.open, dm_core::erasure::Reason::Requested)
+            .await
+            .unwrap();
+        assert!(!body.exists(), "the body left the kept bundle");
+        assert!(!dir.path().join(&kept.kept_at).exists());
+        assert!(
+            dir.path()
+                .join(&held.kept_at)
+                .join("manifest.yaml")
+                .is_file(),
+            "the bundle of another domain stays"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_link_where_the_exports_are_kept_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        wrote(&owner, EntryType::Fact, Label::Public, None).await;
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(EXPORTS_DIR)).unwrap();
+        let refused = owner.export_kept(None, Label::Public).await;
+        assert!(matches!(refused, Err(Error::Denied(_))), "{refused:?}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        std::fs::remove_file(dir.path().join(EXPORTS_DIR)).unwrap();
+        std::fs::create_dir_all(dir.path().join(EXPORTS_DIR)).unwrap();
+        let session = dir.path().join(EXPORTS_DIR).join(owner.session_id());
+        std::os::unix::fs::symlink(outside.path(), &session).unwrap();
+        let refused = owner.export_kept(None, Label::Public).await;
+        assert!(matches!(refused, Err(Error::Denied(_))), "{refused:?}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+}
