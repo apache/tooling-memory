@@ -491,6 +491,15 @@ async fn settle(
             );
             Ok(0)
         }
+        "blocked" if awaits_verdict(&now) => {
+            eprintln!(
+                "amem: {id} handed in with handoff {handoff}, and it waits for a verdict: \
+                 `amem task verdict {id} --accept` or `--reject`",
+                id = task.id,
+                handoff = now.handoff.as_deref().unwrap_or("-")
+            );
+            Ok(0)
+        }
         "claimed" if completes_with_report(task, &now, code, &output) => {
             let handoff = client
                 .write_handoff(
@@ -512,44 +521,55 @@ async fn settle(
             );
             Ok(0)
         }
-        "claimed" => {
-            let tail = tail_of(&output, 6000);
-            let held = unsettled(&now)
-                .map(|action| {
-                    format!(
-                        " External action `{action}` of the task is not settled: nobody can \
-                         claim the task until a person or a tap settles it \
-                         (`amem task effect-settle`)."
-                    )
-                })
-                .unwrap_or_default();
-            let body = format!(
-                "# {title}\n\n`{harness}` stopped without completing task {id} (exit {code}). \
-                 The task is back in the pool; what follows is what it printed, so the next \
-                 claimant can start from here.{held}\n\n## Output\n\n{tail}\n",
-                title = task.title,
-                harness = harness.binary(),
-                id = task.id,
-            );
-            let handoff = client
-                .write_handoff(
-                    &format!("Task {} stopped: {}", task.id, task.title),
-                    &body,
-                    Some(&task.domain),
-                )
-                .await?;
-            client.release(&task.id, Some(&handoff)).await?;
-            eprintln!(
-                "amem: {} released; its output is filed as handoff {handoff}",
-                task.id
-            );
-            Ok(STOPPED)
-        }
+        "claimed" => give_back(harness, client, task, &now, code, &output).await,
         other => {
             eprintln!("amem: {} is now {other}", task.id);
             Ok(if code == 0 { STOPPED } else { code })
         }
     }
+}
+
+/// A task that its run still holds goes back to the pool, with what the harness
+/// printed filed as a handoff for the next claimant.
+async fn give_back(
+    harness: Harness,
+    client: &MemoryClient,
+    task: &Task,
+    now: &Task,
+    code: i32,
+    output: &str,
+) -> Fallible<i32> {
+    let tail = tail_of(output, 6000);
+    let held = unsettled(now)
+        .map(|action| {
+            format!(
+                " External action `{action}` of the task is not settled: nobody can \
+                 claim the task until a person or a tap settles it \
+                 (`amem task effect-settle`)."
+            )
+        })
+        .unwrap_or_default();
+    let body = format!(
+        "# {title}\n\n`{harness}` stopped without completing task {id} (exit {code}). \
+         The task is back in the pool; what follows is what it printed, so the next \
+         claimant can start from here.{held}\n\n## Output\n\n{tail}\n",
+        title = task.title,
+        harness = harness.binary(),
+        id = task.id,
+    );
+    let handoff = client
+        .write_handoff(
+            &format!("Task {} stopped: {}", task.id, task.title),
+            &body,
+            Some(&task.domain),
+        )
+        .await?;
+    client.release(&task.id, Some(&handoff)).await?;
+    eprintln!(
+        "amem: {} released; its output is filed as handoff {handoff}",
+        task.id
+    );
+    Ok(STOPPED)
 }
 
 /// Whether a run's output is a delegated task's report: a task the board filed for a
@@ -571,6 +591,16 @@ fn delegated_report(task: &Task, code: i32, output: &str) -> bool {
 /// has settled.
 fn completes_with_report(task: &Task, now: &Task, code: i32, output: &str) -> bool {
     delegated_report(task, code, output) && unsettled(now).is_none()
+}
+
+/// Whether a task waits for the verdict on its own work, as the ledger tells it: the
+/// event that it waits on is `verdict:<its id>`.
+fn awaits_verdict(now: &Task) -> bool {
+    let event = dm_server::autonomy::verdict_event(&now.id);
+    now.raw
+        .get("waiting_on")
+        .and_then(serde_json::Value::as_str)
+        == Some(event.as_str())
 }
 
 /// The first external action of a task that nobody has settled, when there is one. The
@@ -891,6 +921,27 @@ mod tests {
             "only delegated tasks"
         );
         assert!(!delegated_report(&task(None), 0, "done"));
+    }
+
+    /// The launcher reads what a task waits on from the task as the memory server
+    /// gives it. Only the task's own verdict counts.
+    #[test]
+    fn a_task_awaits_its_verdict_when_it_waits_on_the_verdict_event_of_its_own_id() {
+        let task = |waiting_on: serde_json::Value| Task {
+            id: "task-a-1".into(),
+            title: "t".into(),
+            body: "b".into(),
+            domain: "dom-a".into(),
+            status: "blocked".into(),
+            depends_on: Vec::new(),
+            requirements: Vec::new(),
+            handoff: Some("handoff-a-1".into()),
+            raw: serde_json::json!({ "waiting_on": waiting_on }),
+        };
+        assert!(awaits_verdict(&task("verdict:task-a-1".into())));
+        assert!(!awaits_verdict(&task("verdict:task-a-2".into())));
+        assert!(!awaits_verdict(&task("check:fixtures-42".into())));
+        assert!(!awaits_verdict(&task(serde_json::Value::Null)));
     }
 
     #[test]

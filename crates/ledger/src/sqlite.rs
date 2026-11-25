@@ -4,9 +4,9 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, ApprovalRecord, Claimer, Error, Event, Held,
-    PromotionRecord, PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken,
-    Task, TaskSpec, LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
+    PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
@@ -295,26 +295,20 @@ impl Db {
         Ok(true)
     }
 
-    /// Append an approval's event, in one transaction. It projects nothing.
-    pub(crate) fn record_approval(&mut self, record: &ApprovalRecord) -> Result<(), Error> {
-        let mut conn = self.conn();
-        let tx = conn.transaction()?;
-        let key = crate::approval_key(&record.spec.target);
-        let event = Event::Approved(Box::new(record.clone()));
-        apply(&tx, &key, record.at, &event)?;
-        tx.commit()?;
-        Ok(())
-    }
-
-    /// The payloads of the approval events, oldest first: those under `key` when it is
-    /// given, else all of them, whatever their domain.
-    pub(crate) fn approval_payloads(&self, key: Option<&str>) -> Result<Vec<String>, Error> {
+    /// The payloads of the events of one kind that are records and no task's, such as
+    /// approvals, oldest first: those under `key` when it is given, else all of them,
+    /// whatever their domain.
+    pub(crate) fn record_payloads(
+        &self,
+        kind: &str,
+        key: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(
             "SELECT payload FROM events
-             WHERE kind = 'approved' AND (?1 IS NULL OR task_id = ?1) ORDER BY seq",
+             WHERE kind = ?1 AND (?2 IS NULL OR task_id = ?2) ORDER BY seq",
         )?;
-        let rows = stmt.query_map(params![key], |r| r.get(0))?;
+        let rows = stmt.query_map(params![kind, key], |r| r.get(0))?;
         Ok(rows.collect::<Result<_, _>>()?)
     }
 
@@ -563,9 +557,9 @@ impl Db {
 
     /// The rows of `domain` after sequence number `after`, in order, and before them the
     /// rows that say who held the tasks those are of. The events table is one for all
-    /// domains: a task's row names its domain, and a promotion or an approval names its
-    /// own in its payload, so each of those after `after` is given and the caller keeps
-    /// its own.
+    /// domains: a task's row names its domain, and a promotion, an approval or a record of
+    /// a task definition names its own in its payload, so each of those after `after` is
+    /// given and the caller keeps its own.
     pub(crate) fn events_after(&self, domain: &str, after: u64) -> Result<Vec<RawEvent>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -573,7 +567,7 @@ impl Db {
              FROM events e LEFT JOIN tasks t ON t.id = e.task_id
              WHERE (e.seq > ?1 OR (e.kind IN ({LEASE_KINDS})
                     AND e.task_id IN (SELECT task_id FROM events WHERE seq > ?1)))
-               AND (t.domain = ?2 OR e.kind IN ('promoted', 'approved'))
+               AND (t.domain = ?2 OR e.kind IN ('promoted', 'approved', 'definition'))
              ORDER BY e.seq"
         ))?;
         let after = i64::try_from(after).unwrap_or(i64::MAX);
@@ -935,8 +929,8 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
             "UPDATE tasks SET extra = json_remove(extra, '$.position', '$.pin_reason')
              WHERE id = ?1 AND extra IS NOT NULL AND extra != ''"
         }
-        // the record that someone tried, or spoke after its claim, or approved an action:
-        // no task moves
+        // the record that someone tried, or spoke after its claim, or approved an action,
+        // or of what a task definition earned: no task moves
         _ => return Ok(()),
     };
     conn.execute(sql, params![id])?;
@@ -985,7 +979,8 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         | Event::Unpinned { .. }
         | Event::ClaimRefused { .. }
         | Event::LateHandoff { .. }
-        | Event::Approved(_) => project_waiting(conn, id, event)?,
+        | Event::Approved(_)
+        | Event::Definition(_) => project_waiting(conn, id, event)?,
         Event::Claimed { holder, until, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'claimed', holder = ?2, lease_until = ?3,

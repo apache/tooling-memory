@@ -80,6 +80,7 @@ pub async fn telemetry(
     completed(memory, &domain, &mut t).await?;
     rates(&mut t);
     inflation(memory.root(), &mut t);
+    probing(memory.root(), &mut t);
     channels(memory.root(), &mut t);
     Ok(t)
 }
@@ -248,6 +249,25 @@ fn inflation(root: &Path, t: &mut Telemetry) {
     }
 }
 
+/// Probing, from the decision log: an agent that the policy refused many times in one
+/// clock hour. The text names the principal, the threshold and the hour, and not the
+/// count so far, so that one hour of one principal files one task however often the
+/// telemetry runs in it.
+fn probing(root: &Path, t: &mut Telemetry) {
+    for p in dm_server::fabric::probing(root) {
+        t.alarms.push(Alarm {
+            kind: "probing".into(),
+            why: format!(
+                "the policy refused {} at least {} times in the clock hour {}; repeated refusals are how an agent finds where a boundary is",
+                p.who,
+                dm_server::fabric::PROBING_DENIALS,
+                p.hour
+            ),
+            who: p.who,
+        });
+    }
+}
+
 fn rates(t: &mut Telemetry) {
     for (who, s) in &t.by_author {
         if s.curations >= 5 && s.body_changed * 2 > s.curations {
@@ -273,6 +293,12 @@ fn rates(t: &mut Telemetry) {
     }
 }
 
+/// The origin of the task that an alarm files. The server shows a task of the origin
+/// of a probing alarm only to a person in person.
+fn origin_of(a: &Alarm) -> String {
+    format!("telemetry:{}", a.kind)
+}
+
 /// File each alarm as a task for the owner, once per alarm.
 ///
 /// # Errors
@@ -294,7 +320,7 @@ pub async fn file_alarms(
                 ),
                 requirements: vec!["human".into()],
                 depends_on: Vec::new(),
-                origin: Some(format!("telemetry:{}", a.kind)),
+                origin: Some(origin_of(a)),
                 upstream_event: Some(dm_core::digest(&a.why)[..16].to_string()),
                 created_by: String::new(),
                 classification: dm_core::Label::Public,
@@ -362,6 +388,48 @@ pub fn log_cycle(root: &Path, cycle: &Cycle) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decision log in which the policy refused `who` `count` times in one clock
+    /// hour: the alarms that the telemetry raises from it.
+    fn probing_alarms(who: &str, count: usize) -> Vec<Alarm> {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("state")).unwrap();
+        let lines: Vec<String> = (0..count)
+            .map(|minute| {
+                serde_json::json!({
+                    "at": format!("2026-11-15T14:{minute:02}:07Z"), "principal": who,
+                    "class": "agent", "action": "promote", "allow": false,
+                })
+                .to_string()
+            })
+            .collect();
+        std::fs::write(dir.path().join("state/decisions.jsonl"), lines.join("\n")).unwrap();
+        let mut t = Telemetry::default();
+        probing(dir.path(), &mut t);
+        t.alarms
+    }
+
+    /// `file_alarms` files one task for each distinct `why`. The text of a probing
+    /// alarm is the same at five refusals and at nine, so one hour files one task.
+    #[test]
+    fn a_probing_alarm_names_the_principal_and_the_hour_and_not_the_count_so_far() {
+        assert!(probing_alarms("agent:a", 4).is_empty());
+        let at_five = probing_alarms("agent:a", 5);
+        let [alarm] = &at_five[..] else {
+            panic!("one alarm: {at_five:?}")
+        };
+        assert_eq!(alarm.kind, "probing");
+        // the origin that the server hides from the agent that the alarm names
+        assert_eq!(origin_of(alarm), dm_server::fabric::PROBING_ORIGIN);
+        assert_eq!(alarm.who, "agent:a");
+        assert_eq!(
+            alarm.why,
+            "the policy refused agent:a at least 5 times in the clock hour 2026-11-15T14; repeated refusals are how an agent finds where a boundary is"
+        );
+        let at_nine = probing_alarms("agent:a", 9);
+        assert_eq!(at_nine.len(), 1);
+        assert_eq!(at_nine[0].why, alarm.why);
+    }
 
     #[test]
     fn body_change_is_word_overlap() {

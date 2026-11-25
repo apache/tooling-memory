@@ -122,7 +122,8 @@ fn own_dir(path: &Path) -> Result<(), Error> {
 }
 
 impl Memory {
-    /// Render every granted domain under `dir`: `<dir>/<domain>/README.md` and one file
+    /// Render every granted domain under `dir`, except the held-out domain for a session
+    /// that does not read it: `<dir>/<domain>/README.md` and one file
     /// per active entry the session's filter lists, as the record holds it now: an entry
     /// the index lists but the record has since demoted or raised above the session's
     /// handling is left out, as `get` would refuse it. A file whose text is already
@@ -147,7 +148,13 @@ impl Memory {
     /// write refreshes.
     async fn render(&self, dir: &Path) -> Result<Projected, Error> {
         let mut done = Projected::default();
-        for domain in self.domains() {
+        // the held-out domain has no directory in the projection of a session that does
+        // not read it
+        let read = self
+            .domains()
+            .into_iter()
+            .filter(|d| !self.keeps_from_session(d));
+        for domain in read {
             if domain == RECALLS {
                 // a domain by that name would sit where the recall pages do
                 eprintln!(

@@ -345,6 +345,7 @@ impl Memory {
     /// An ungranted domain, or a store error.
     pub async fn keep_transcript(&self, keep: Keep) -> Result<Kept, Error> {
         let domain = self.resolve_domain(keep.domain.as_deref())?;
+        self.may_write_into(&domain, "write")?;
         let grant = self
             .grants
             .domains

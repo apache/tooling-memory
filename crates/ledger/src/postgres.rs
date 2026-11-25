@@ -23,9 +23,9 @@
 //! reader has seen, and a reader that asks for the events after a number misses none.
 
 use crate::{
-    check_holder, claimable, parse_time, ApprovalRecord, Claimer, Error, Event, Held,
-    PromotionRecord, PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken,
-    Task, TaskSpec, LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
+    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
+    PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
+    LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -516,24 +516,31 @@ impl Db {
         Ok(true)
     }
 
-    /// Append an approval's event, in one transaction. It projects nothing. The domain's
-    /// schema is made if this is the first thing the domain records.
-    pub(crate) async fn record_approval(&mut self, record: &ApprovalRecord) -> Result<(), Error> {
+    /// Append an event that is a record and no task's, such as an approval, under `key`
+    /// in one transaction. The domain's schema is made if this is the first thing the
+    /// domain records.
+    pub(crate) async fn append_record(
+        &mut self,
+        domain: &str,
+        key: &str,
+        at: OffsetDateTime,
+        event: &Event,
+    ) -> Result<(), Error> {
         let tx = self.client.transaction().await?;
-        let s = ensure_domain(&tx, &record.spec.domain).await?;
-        let key = crate::approval_key(&record.spec.target);
-        let event = Event::Approved(Box::new(record.clone()));
-        apply(&tx, &s, &key, record.at, &event).await?;
+        let s = ensure_domain(&tx, domain).await?;
+        apply(&tx, &s, key, at, event).await?;
         tx.commit().await?;
-        self.remember(&record.spec.domain, &s);
+        self.remember(domain, &s);
         Ok(())
     }
 
-    /// The payloads of a domain's approval events, oldest first: those under `key` when
-    /// it is given, else all of them. A domain that has recorded nothing has none.
-    pub(crate) async fn approval_payloads(
+    /// The payloads of a domain's events of one kind that are records and no task's,
+    /// oldest first: those under `key` when it is given, else all of them. A domain that
+    /// has recorded nothing has none.
+    pub(crate) async fn record_payloads(
         &self,
         domain: &str,
+        kind: &str,
         key: Option<&str>,
     ) -> Result<Vec<String>, Error> {
         let Some(s) = self.schema(domain).await? else {
@@ -544,9 +551,9 @@ impl Db {
             .query(
                 &format!(
                     "SELECT payload FROM {s}.events
-                     WHERE kind = 'approved' AND ($1::text IS NULL OR task_id = $1) ORDER BY seq"
+                     WHERE kind = $1 AND ($2::text IS NULL OR task_id = $2) ORDER BY seq"
                 ),
-                &[&key],
+                &[&kind, &key],
             )
             .await?;
         rows.iter().map(|r| Ok(r.try_get(0)?)).collect()
@@ -1521,11 +1528,12 @@ async fn project<C: GenericClient>(
              WHERE id = $1 AND extra IS NOT NULL AND extra <> ''",
             vec![&id],
         ),
-        // the record that someone tried, or spoke after its claim, or approved an action:
-        // no task moves
-        Event::ClaimRefused { .. } | Event::LateHandoff { .. } | Event::Approved(_) => {
-            return Ok(())
-        }
+        // the record that someone tried, or spoke after its claim, or approved an action,
+        // or of what a task definition earned: no task moves
+        Event::ClaimRefused { .. }
+        | Event::LateHandoff { .. }
+        | Event::Approved(_)
+        | Event::Definition(_) => return Ok(()),
         Event::Claimed { holder, .. } => (
             "SET status = 'claimed', holder = $2, lease_until = $3,
                 attempts = attempts + 1 WHERE id = $1",

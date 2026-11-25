@@ -134,12 +134,10 @@ two weeks. It is also the reason that none of it is the production shape.
   other session. These parts are not built: an attempt key for the other operations, a
   connector that makes external actions in sequence and settles them, and taps that
   report the events. The generation does not prove who the caller is.
-- **Task definitions, in part, and autonomy levels.** A task can name a task definition.
+- **Task definitions, in part.** A task can name a task definition.
   It then takes the checks of the definition, and its holder can call only the tools that
   the definition declares. Triage requires a definition only when the grants say so,
-  because the tasks that the system files name none. No suite gates a version of a
-  definition, and the data scope is not enforced. The autonomy level has no effect, and
-  there is no held-out suite and no evaluator.
+  because the tasks that the system files name none. The data scope is not enforced.
 - **Positions, in part.** A verified entry of type `position` gives a standing role a
   charter and an authority envelope, and a task can be pinned to that position. Only a
   session that fills the position claims a pinned task, and that session gets the
@@ -249,9 +247,44 @@ two weeks. It is also the reason that none of it is the production shape.
   and each of its memory calls and model calls is refused. A read that waits does not
   check again before it gives its answer. Some commands of the owner do not do the
   check. A grant has no expiry of its own.
-- **The improvement loop.** The only gate on a platform artifact is that a person
-  verifies it. There is no performance gate, no safety gate, and no check that a change
-  adds no permission.
+- **Autonomy and the improvement loop, in part.** Each version of a task definition
+  earns an autonomy level on a held-out suite, and a reverted or rejected task lowers the
+  level. A candidate version passes a safety gate and a performance gate, and repeated
+  refusals of one agent raise a probing alarm (demo act 7). These parts are open:
+  - The evaluator's check is a substring test. No model grades.
+  - `amem` does not run the scenarios. Nothing checks that a graded handoff was written
+    under the graded version.
+  - The level `review` compares principals. The server does not know the model or the
+    vendor of a session.
+  - A task that names no definition has no level.
+  - A reverted task stays `done`, and its dependents are not sent back.
+  - A work outcome comes from a person, not from a tap.
+  - A prompt, an agent definition and a harness setting have the review of a person
+    only, with no suite of their own. A ranking or rubric change has no canary.
+  - The safety gate compares tools, scope and declared autonomy. It runs no red-team
+    suite.
+  - Every session that reads the platform domain reads its raw entries.
+  - Probing counts refusals for each principal and clock hour against a fixed number. It
+    counts neither a lineage of several principals nor queries that walk the index.
+  - The owner at the command line reads the held-out suites and writes into every
+    domain.
+  - The server does not log a task that it hides as a refusal, so probing does not count
+    it.
+  - Two processes on one ledger can each make a check and then append. A raise can then
+    follow an outcome that it did not read, two outcomes can lower the level one step,
+    and a verdict can complete a task that was rejected in the same moment.
+  - The event log of the platform domain takes a copy of each definition record: the
+    version, who recorded it and the time, at the highest label. The level, the run and
+    the work outcome stay in the event of the ledger.
+  - The copy of a raise to the level `review` names nobody. The ledger does not record
+    who raised.
+  - The event of a completion on a verdict names nobody. No record says who accepted
+    the work.
+  - The definition records are not in a bundle.
+  - A lineage answer leaves out the event log of the held-out domain for a session that
+    does not read that domain. The answer does not say so.
+  - The sign-off for the highest level is a field of the ledger record, not an approval
+    event.
 - **Measurement, in part.** `amem` computes four read metrics, cost and usage. The paper
   names 21 metrics. Upkeep share, induced work and the landing queue are not built. The
   only limit is a spend limit in tokens.
@@ -549,6 +582,7 @@ describes re-enactment, the platform domain and the Gofannon bridge.
 | Sources and replay | Transcripts, kept in the record, reached by citation and swept on a clock. Frozen-context replay on the recorded decision contexts. Re-enactment of a session at its commit, against the tape of its memory tool calls. The tapes use the transcripts' clock unless they are pinned. A replay manifest on each decision context and tape, and the replay state of a tape | `transcript`, `replay`, `reenact run, report, state, tapes, show, pin, unpin` |
 | The event log | Each write, read and send goes into the append-only log of its domain, with a label, and with ids and digests only. The log feeds the index, against a bound of 60 seconds. A materializer builds the index again from the log and replays the ledger's events. Lineage reads the log back and forward. An erasure withholds the entries that are one step forward. The log marks each event of a session that read outside content | `log show, feed, freshness, materialize, outside`, `lineage`, `withheld list, release`; MCP `log`, `lineage`, `outside_readers` |
 | The platform | Agent definitions, templates, eval suites and harness defaults as artifacts in a platform domain. They load only after a person verifies them | `platform list, show`, `golden --platform` |
+| Autonomy levels | Each version of a task definition has a level: `person`, `review` or `checks`. Work that is handed in below `checks` waits for a verdict. The evaluator grades handoffs on a held-out suite, and a passed run lets the level go up one step. A work outcome puts it down one step. A candidate version passes a safety gate and a performance gate. Repeated refusals of one agent are a probing alarm of the curator | `task verdict, outcome`, `platform level, grade, raise, gates`, `curator --telemetry`; MCP `verdict`, `autonomy`, `grade`, `raise_autonomy`, `candidate_gates` |
 | Vendor drift | A pinned probe set per model, checked against a baseline, detector by detector. Confirmed drift opens a drift window, and nothing that an agent wrote inside a window is promoted | `drift probe`, `drift check`, `drift window open, close, list` |
 | Measurement | The read-path claims on this record, a golden recall suite, and the evaluation with memory against without memory | `savings`, `golden`, `scripts/eval.py` |
 | Evaluation | The five arms as session settings that the launcher gives. A plan with a margin and seeds, runs paired with a baseline arm, the replay traps, and a scorecard kept in the platform domain | `eval arms, plan, score, scorecards`, `launch --arm --as-of --eval-plan --eval-task --eval-seed`, `serve --arm --as-of`, `scripts/eval.py`; MCP `settings`, `scorecards`, `score_evaluation` |

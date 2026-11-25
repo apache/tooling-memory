@@ -38,11 +38,14 @@ use tokio::sync::Mutex as AsyncMutex;
 
 pub mod approvals;
 pub mod arms;
+pub mod autonomy;
 pub mod bundle;
 pub mod contexts;
 pub mod drift_windows;
 pub mod evaluation;
 pub mod fabric;
+pub mod gates;
+pub mod held_out;
 mod holds;
 pub mod lineage;
 pub mod log;
@@ -60,6 +63,8 @@ pub mod sources;
 pub mod t0;
 pub mod tape;
 mod taps;
+#[cfg(test)]
+pub(crate) mod testing;
 pub mod transcripts;
 pub mod withhold;
 
@@ -632,7 +637,10 @@ impl Memory {
     /// changed. The session's handling is capped at the filter as well. The decision
     /// is logged like any other. The cache holds this filter, not the one under the
     /// settings and not the one over the task chain: T0 and the writes that read on the
-    /// session's behalf start from it. It has no task chain.
+    /// session's behalf start from it. It has no task chain. The held-out domain is taken
+    /// away here from every session that does not read it ([`Memory::reads_held_out`]):
+    /// every read filter starts from this one, so this is the one place that keeps the
+    /// suites from a session.
     fn granted_filter(&self) -> Result<ReadFilter, Error> {
         self.fresh()?;
         // a session in a position reads under the envelope of the version in force,
@@ -642,7 +650,9 @@ impl Memory {
         let key = self.scope_key(&policy);
         if let Some((cached, f)) = lock(&self.scope).as_ref() {
             if *cached == key {
-                return Ok(f.clone());
+                // again on the kept scope: a session that the memory server serves from
+                // now on reads the held-out domain no longer
+                return Ok(self.without_held_out(f.clone()));
             }
         }
         let input = Input {
@@ -665,6 +675,7 @@ impl Memory {
         if let Some((_, envelope)) = self.seat_scope() {
             f.handling = f.handling.min(envelope);
         }
+        let f = self.without_held_out(f);
         {
             // from the grants each time, so a filter that widens again widens the
             // session's handling with it
@@ -1090,17 +1101,41 @@ impl Memory {
     /// [`Error::Denied`] for an ungranted domain, or when none is named and several are
     /// granted.
     pub fn resolve_domain(&self, domain: Option<&str>) -> Result<String, Error> {
-        match domain {
-            Some(d) if self.grants.may_write(d) => Ok(d.to_string()),
-            Some(d) => Err(Error::Denied(format!("domain {d} is not granted"))),
+        let domain = match domain {
+            Some(d) if self.grants.may_write(d) => d.to_string(),
+            Some(d) => return Err(Error::Denied(format!("domain {d} is not granted"))),
             None => {
                 let mut keys = self.grants.domains.keys();
                 match (keys.next(), keys.next()) {
-                    (Some(only), None) => Ok(only.clone()),
-                    _ => Err(Error::Denied("name a domain; several are granted".into())),
+                    (Some(only), None) => only.clone(),
+                    _ => return Err(Error::Denied("name a domain; several are granted".into())),
                 }
             }
-        }
+        };
+        self.may_name(&domain, "domain")?;
+        Ok(domain)
+    }
+
+    /// A refusal that the policy's modules do not make: a line of the decision log, as
+    /// a refusal of the policy is, so that repeated ones count as probing
+    /// ([`fabric::probing`]). The error says `reason`.
+    pub(crate) fn refusal(&self, action: &str, domain: &str, reason: String) -> Error {
+        let who = self.principal();
+        let line = serde_json::json!({
+            "at": OffsetDateTime::now_utc().format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+            "session": self.session_id,
+            "action": action,
+            "principal": who.id,
+            "class": who.class,
+            "domain": domain,
+            "allow": false,
+            "admit": false,
+            "reason": reason,
+            "policy": self.policy().version().to_string(),
+            "held_task": self.held_task(),
+        });
+        reads::append_line(&self.root.join("state/decisions.jsonl"), &line.to_string());
+        Error::Denied(reason)
     }
 
     fn filter_for(&self, domain: Option<&str>) -> Result<ReadFilter, Error> {
@@ -1433,7 +1468,8 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// An ungranted domain, an empty body, an entry over the size bound, a write the
+    /// An ungranted domain, the held-out domain for a session that does not read it, an
+    /// empty body, an entry over the size bound, a write the
     /// gates refuse, or a store or index error. [`Error::NotFound`] when `supersedes`
     /// names an entry that the read filter of the session does not admit, and
     /// [`Error::Denied`] when a raw write with tap reach would replace an entry with
@@ -1483,6 +1519,7 @@ impl Memory {
     /// Nothing is logged or stored yet.
     async fn entry_to_write(&self, req: WriteRequest) -> Result<Entry, Error> {
         let domain = self.resolve_domain(req.domain.as_deref())?;
+        self.may_write_into(&domain, "write")?;
         if req.body.trim().is_empty() {
             return Err(Error::Denied("an entry needs a body".into()));
         }
@@ -1647,6 +1684,9 @@ impl Memory {
                 "{id} is {} already",
                 entry.front.trust_tier
             )));
+        }
+        if to == TrustTier::Verified {
+            self.platform_gates(&entry, "propose", &self.author).await?;
         }
         let phase = if to == TrustTier::Verified {
             "propose"
@@ -1882,6 +1922,8 @@ impl Memory {
         let task = self.ledger.lock().await.get(task_id).await?;
         self.check_task(&task)?;
         let (id, entry) = self.proposal_entry(&task).await?;
+        self.platform_gates(&entry, "approve", &task.spec.created_by)
+            .await?;
         let d = self.decide_promotion(
             &entry,
             TrustTier::Verified,
@@ -2172,7 +2214,12 @@ impl Memory {
         proposer: &str,
     ) -> Result<Decision, Error> {
         self.refuse_frozen(entry)?;
-        self.decide(&Input {
+        self.decide(&self.promotion_input(entry, to, phase, proposer))
+    }
+
+    /// What the policy is asked about a promotion of `entry` to `to`.
+    fn promotion_input(&self, entry: &Entry, to: TrustTier, phase: &str, proposer: &str) -> Input {
+        Input {
             action: Action::Promote,
             principal: self.principal(),
             domain: entry.front.domain.clone(),
@@ -2190,7 +2237,7 @@ impl Memory {
             spend: None,
             fetch: None,
             approval: None,
-        })
+        }
     }
 
     /// A new version of the entry at the tier.
@@ -2566,11 +2613,18 @@ impl Memory {
         Ok(lock(&self.session).handling)
     }
 
-    /// Whether this session may see a task: one in a granted domain, classified within
-    /// `handling`. A task it may not see is left out of every result and every count, as
-    /// an entry above its handling is.
+    /// Whether this session may see a task: one in a granted domain that the session
+    /// reads, classified within `handling`. A task of the held-out domain is seen only
+    /// by a session that reads that domain, as an entry of it is. A probing alarm names
+    /// the agent that it is about, so only a person in person sees it. A task it may
+    /// not see is left out of every result and every count, as an entry above its
+    /// handling is.
     fn sees(&self, task: &Task, handling: Label) -> bool {
-        self.grants.may_write(&task.spec.domain) && task.spec.classification <= handling
+        let alarm = task.spec.origin.as_deref() == Some(fabric::PROBING_ORIGIN);
+        self.grants.may_write(&task.spec.domain)
+            && !self.keeps_from_session(&task.spec.domain)
+            && task.spec.classification <= handling
+            && (!alarm || self.is_in_person())
     }
 
     /// Whether this session may act on a named task. A task it may not see gets the
@@ -2752,6 +2806,7 @@ impl Memory {
                 .filter(|d| !d.is_empty())
                 .map(String::as_str),
         )?;
+        self.may_write_into(&spec.domain, "file_task")?;
         spec.created_by = self.author.clone();
         spec.classification = spec.classification.max(self.label());
         // a caller cannot clear it: a task of a tap, or of a session that read outside
@@ -3290,7 +3345,7 @@ impl Memory {
     ///
     /// # Errors
     ///
-    /// An ungranted domain, or a ledger error.
+    /// An ungranted domain, [`Error::Denied`] for the evaluator, or a ledger error.
     pub async fn claim_next(
         &self,
         domain: Option<&str>,
@@ -3311,6 +3366,7 @@ impl Memory {
         lease: Duration,
         attempt: Option<&str>,
     ) -> Result<Option<Claim>, Error> {
+        self.claims_work()?;
         let domain = self.resolve_domain(domain)?;
         let handling = self.handling()?;
         let can = self.capabilities()?;
@@ -3358,8 +3414,10 @@ impl Memory {
     /// A ledger error, including a task outside the grants or above the handling, and
     /// a task pinned to a position this session does not fill; [`Error::Stale`] when
     /// the position this session fills changed; [`Error::Denied`] for a task outside
-    /// the domain of that position.
+    /// the domain of that position, and for the evaluator, which grades work and claims
+    /// none.
     pub async fn claim(&self, id: &str, lease: Duration) -> Result<Claim, Error> {
+        self.claims_work()?;
         let seat = self.seat_in_force()?;
         let mut l = self.ledger.lock().await;
         let task = l.get(id).await?;
@@ -3399,6 +3457,11 @@ impl Memory {
 
     /// Complete a task with the handoff entry that records what happened. The handoff
     /// must exist in the task's domain.
+    ///
+    /// A task that names a task definition is done only when its completion has what
+    /// the autonomy level of that definition asks ([`autonomy`]). Below the highest
+    /// level the task is not closed here: it comes back `blocked`, with the handoff on
+    /// it, and waits for its verdict ([`Memory::verdict`]).
     ///
     /// # Errors
     ///
@@ -3445,7 +3508,15 @@ impl Memory {
             self.observe_task(&same);
             return Ok(same);
         }
+        // the same completion asked again while the task waits for its verdict
+        if self.handed_in_before(&l, &task, handoff).await? {
+            self.observe_task(&task);
+            return Ok(task);
+        }
         let by = self.under(self.claim_of(id, generation)?);
+        if self.needs_verdict(&l, &task).await? {
+            return self.park_for_verdict(&mut l, &task, by, handoff).await;
+        }
         let done = match &kept {
             Some(key) => Self::in_own_words(l.complete_once(id, by, handoff, key).await, attempt)?,
             None => l.complete(id, by, handoff).await?,
@@ -4039,6 +4110,7 @@ impl Memory {
     ) -> Result<bundle::Imported, Error> {
         self.fresh()?;
         let domain = self.resolve_domain(into_domain)?;
+        self.may_write_into(&domain, "write")?;
         let default = self
             .grants
             .domains
