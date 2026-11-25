@@ -203,6 +203,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: Some(fetch),
+            approval: None,
         })
     }
 
@@ -221,18 +222,13 @@ impl Memory {
         // a stored source is released under the same check as a search
         self.fresh()?;
         self.definition_allows(tool).await?;
+        self.seat_allows(tool)?;
         let (grant, label) = self.tool_grant(tool)?;
         let id = source_id(tool, &args);
         let now = OffsetDateTime::now_utc();
-        if let Some(s) = self.source(&grant.domain, &id).await? {
-            if !s.held
-                && !grant.fresh
-                && s.retain_until > now
-                && lock(&self.session).observe(s.classification)
-            {
-                self.serve_source(&s)?;
-                return Ok(served(&s, true));
-            }
+        let kept = self.live_source(&grant.domain, &id, now, grant.fresh);
+        if let Some(kept) = kept.await? {
+            return Ok(kept);
         }
         let runner = self
             .tools
@@ -297,6 +293,27 @@ impl Memory {
         }
         self.serve_source(&s)?;
         Ok(served(&s, false))
+    }
+
+    /// The answer that the source `id` keeps, served to this session, when the source
+    /// is not held, is still retained, and has a label that the session may handle. A
+    /// tool whose grant says `fresh` is always called, so its source is not served.
+    async fn live_source(
+        &self,
+        domain: &str,
+        id: &str,
+        now: OffsetDateTime,
+        fresh: bool,
+    ) -> Result<Option<Value>, Error> {
+        let Some(s) = self.source(domain, id).await? else {
+            return Ok(None);
+        };
+        let live = !s.held && !fresh && s.retain_until > now;
+        if !live || !lock(&self.session).observe(s.classification) {
+            return Ok(None);
+        }
+        self.serve_source(&s)?;
+        Ok(Some(served(&s, true)))
     }
 
     /// An answer of a tool goes to the agent: the session has read content from authors

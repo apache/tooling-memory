@@ -28,6 +28,10 @@ editor. Thus:
 Ids are stable and permanent, and they have no meaning. `id::new_entry_id` makes them.
 Nothing parses meaning out of an id, except the `mem-` and `task-` prefixes.
 
+Some entries must be in the record only one time for a key, whichever session writes
+them. `id::entry_id_for` makes the id of such an entry from a hash of the key. That id has
+the same shape as each other id, and it has no meaning either.
+
 ## Digests
 
 `digest` is the SHA-256 of the rendered text, in hex. Manifests and stubs carry it. A

@@ -7,6 +7,12 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
+ignore = [
+    # chrono is unmaintained, and the advisory names no vulnerability. rmcp needs it
+    # unconditionally, up to its newest release (3.11.0), so no upgrade removes it. This
+    # code does not call chrono itself. Remove this entry when rmcp drops chrono.
+    { id = "RUSTSEC-2026-0543", reason = "rmcp needs chrono unconditionally; no release of rmcp is without it" },
+]
 
 [licenses]
 version = 2

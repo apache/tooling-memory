@@ -426,7 +426,10 @@ impl Writer {
 
     /// Sync what was appended without a sync of its own.
     fn sync(&self) -> Result<(), Error> {
-        std::fs::File::open(&self.log)
+        // opened for writing: Windows refuses to flush a handle that can only read
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&self.log)
             .and_then(|f| f.sync_data())
             .map_err(crate::io(&self.log))
     }
@@ -475,6 +478,24 @@ pub fn append_with(
     let mut writer = Writer::open(root, domain)?;
     let change = make(writer.last + 1)?;
     writer.append(by, actor, label, sync, change)
+}
+
+/// The offset of `domain`'s log: the sequence number of its last event that names a
+/// version, a `put` or an `erased`, and 0 for a log with no such event. With an entry's
+/// id, an offset names the version the entry had then: the last version the log put at
+/// or before it. A read, a send, an offered or refused write and an event of the ledger
+/// change no version, so the offset stays where it is after each of them.
+///
+/// # Errors
+///
+/// A domain that is not a name, or the file system.
+pub fn offset(root: &Path, domain: &str) -> Result<u64, Error> {
+    let events = read(root, domain, 0)?;
+    let last = events
+        .iter()
+        .rev()
+        .find(|e| matches!(e.change, Change::Put { .. } | Change::Erased { .. }));
+    Ok(last.map_or(0, |e| e.seq))
 }
 
 /// A domain's log from `from` on, in order. A line that does not parse is skipped: a
@@ -813,6 +834,27 @@ impl Memory {
             )?;
         }
         Ok(())
+    }
+
+    /// Write an entry that the record holds once, through its domain's log: the change
+    /// is appended first, then the record takes the entry only when it holds none with
+    /// this id. When this call wrote it, gives the sequence number of its `put` event:
+    /// where a feed of the index starts to take it ([`Memory::feed_from`]). The text of
+    /// such an entry follows from its id alone, so the version that the log names is the
+    /// version that the record holds, whichever call wrote it.
+    pub(crate) async fn create_logged(&self, entry: &Entry) -> Result<Option<u64>, Error> {
+        let put = append(
+            &self.root,
+            &entry.front.domain,
+            &self.author,
+            Change::Put {
+                id: entry.front.id.clone(),
+                digest: dm_core::digest(&entry.render()),
+                active: entry.is_active(),
+            },
+        )?
+        .seq;
+        Ok(self.store.create(entry).await?.then_some(put))
     }
 
     /// Copy the ledger's events of `domain` that its log does not hold yet into the log,
@@ -1199,8 +1241,9 @@ mod tests {
         m.store.put(&early).await.unwrap();
         assert!(m.search("steps", None, 10).await.unwrap().is_empty());
         let done = m.materialize(None).await.unwrap();
-        // three writes offered, the five events above, and no read: nothing was served
-        assert_eq!((done.events, done.live), (8, 2), "{done:?}");
+        // three writes offered, the five events above, and the copy of the approval that
+        // the owner's own erasure is; no read: nothing was served
+        assert_eq!((done.events, done.live), (9, 2), "{done:?}");
         assert!(done.behind.is_empty(), "{done:?}");
         let hits = m.search("steps", None, 10).await.unwrap();
         assert_eq!(

@@ -27,7 +27,7 @@
 use crate::log::{self, Change};
 use crate::{reach, withhold, Error, Memory};
 use dm_core::{Entry, EntryType, Label, Status, TrustTier};
-use dm_ledger::{Outcome, OutcomeKind, TaskSpec};
+use dm_ledger::{OutcomeEvent, OutcomeKind, TaskSpec};
 use dm_policy::decide::Class;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -103,7 +103,7 @@ pub struct Dead {
 enum Alive {
     /// It is not in the active set.
     Inactive,
-    /// A handoff, a policy entry or a canary: demotion is not how these end.
+    /// A handoff, a policy entry, a position or a canary: demotion is not how these end.
     Kind,
     /// It is verified.
     Verified,
@@ -119,7 +119,7 @@ impl Alive {
     fn why(self) -> &'static str {
         match self {
             Alive::Inactive => "it is not an active entry",
-            Alive::Kind => "it is a handoff, a policy entry or a canary",
+            Alive::Kind => "it is a handoff, a policy entry, a position or a canary",
             Alive::Verified => "it is verified",
             Alive::Young => "it was written inside the window",
             Alive::Read => "it was read inside the window",
@@ -181,7 +181,11 @@ fn alive(
     if !entry.is_active() {
         return Some(Alive::Inactive);
     }
-    if matches!(front.entry_type, EntryType::Handoff | EntryType::Policy) || is_canary(entry) {
+    let own_end = matches!(
+        front.entry_type,
+        EntryType::Handoff | EntryType::Policy | EntryType::Position
+    );
+    if own_end || is_canary(entry) {
         return Some(Alive::Kind);
     }
     if front.trust_tier == TrustTier::Verified {
@@ -203,7 +207,7 @@ fn alive(
 /// is true:
 ///
 /// - It is active.
-/// - It is not a handoff, not a policy entry and not a canary.
+/// - It is not a handoff, not a policy entry, not a position and not a canary.
 /// - It is not verified.
 /// - It was written more than `window` before `now`.
 /// - No `read` event among `events` that served its body to a reader names it with a
@@ -473,8 +477,9 @@ impl Memory {
     /// A person demotes each live entry that the person reads, for either reason. An
     /// agent demotes only on a task of a curator or of the auditor, only for the reason
     /// `dead`, never a verified entry, and only an entry that is dead inside
-    /// [`DEAD_WINDOW_DAYS`]. A handoff and a policy entry are not demoted: a handoff
-    /// ends with its task, and a rule is retired through its lifecycle.
+    /// [`DEAD_WINDOW_DAYS`]. A handoff, a policy entry and a position are not demoted: a
+    /// handoff ends with its task, a rule is retired through its lifecycle, and the
+    /// owner retires a position, which takes the pin off each task pinned to it.
     ///
     /// # Errors
     ///
@@ -486,7 +491,7 @@ impl Memory {
     pub async fn demote(&self, id: &str, reason: DemoteReason) -> Result<Demotion, Error> {
         let f = self.session_filter()?;
         if self.index.lock().await.meta(id, &f)?.is_none() {
-            return Err(self.not_served(id, None).await);
+            return Err(self.not_served(id, None, &f).await);
         }
         let (domain, mut entry) = self.find(id).await?;
         // the index can lag the record: the record says whether the entry is live
@@ -502,6 +507,11 @@ impl Memory {
             EntryType::Policy => {
                 return Err(Error::Denied(format!(
                     "{id} is a policy entry: a rule is retired through its lifecycle, and is not demoted"
+                )));
+            }
+            EntryType::Position => {
+                return Err(Error::Denied(format!(
+                    "{id} is a position: the owner retires a position, and it is not demoted"
                 )));
             }
             _ => {}
@@ -751,7 +761,7 @@ pub struct Correction {
     /// The title of the task.
     pub title: String,
     /// Each outcome event of the task, oldest first.
-    pub outcomes: Vec<Outcome>,
+    pub outcomes: Vec<OutcomeEvent>,
     /// Whether one person accepted the result and another person did not.
     pub disputed: bool,
     /// The classification of the task.
@@ -760,8 +770,8 @@ pub struct Correction {
 
 /// Whether the people who judged a result disagree: one person accepted it, and
 /// another person corrected, rejected or reverted it.
-fn disputed(outcomes: &[Outcome]) -> bool {
-    let (accepted, other): (Vec<&Outcome>, Vec<&Outcome>) = outcomes
+fn disputed(outcomes: &[OutcomeEvent]) -> bool {
+    let (accepted, other): (Vec<&OutcomeEvent>, Vec<&OutcomeEvent>) = outcomes
         .iter()
         .partition(|o| o.outcome == OutcomeKind::Accepted);
     accepted.iter().any(|a| other.iter().any(|o| o.by != a.by))
@@ -833,12 +843,12 @@ impl Memory {
     /// [`Error::Denied`] for an agent, for a note longer than [`OUTCOME_NOTE_MAX`]
     /// characters, and for a session above the task; the not-found of the ledger for a
     /// task that this session cannot see.
-    pub async fn record_outcome(
+    pub async fn record_outcome_event(
         &self,
         task: &str,
         outcome: OutcomeKind,
         note: &str,
-    ) -> Result<Vec<Outcome>, Error> {
+    ) -> Result<Vec<OutcomeEvent>, Error> {
         if !self.of_a_person() {
             return Err(Error::Denied(
                 "only a person records the outcome of a task".into(),
@@ -872,7 +882,7 @@ impl Memory {
     /// # Errors
     ///
     /// The not-found of the ledger for a task that this session cannot see.
-    pub async fn outcomes(&self, task: &str) -> Result<Vec<Outcome>, Error> {
+    pub async fn outcomes(&self, task: &str) -> Result<Vec<OutcomeEvent>, Error> {
         self.get_task(task).await?;
         Ok(self.ledger.lock().await.outcomes(task).await?)
     }
@@ -1355,6 +1365,24 @@ mod tests {
         }
     }
 
+    /// A demoted position would leave each task pinned to it with no session to go to:
+    /// a retirement takes the pins off, and a demotion does not.
+    #[tokio::test]
+    async fn a_position_is_not_dead_and_is_not_demoted() {
+        let dir = tempfile::tempdir().unwrap();
+        let o = owner(dir.path());
+        let seat = old("mem-me-seat001", "position", "");
+        let now = OffsetDateTime::now_utc();
+        let dead = dead_among(std::slice::from_ref(&seat), &[], now, Duration::days(90));
+        assert_eq!(dead, [], "a position is not dead");
+        planted(&o, &[seat]).await;
+        assert_eq!(o.dead(None, DEAD_WINDOW_DAYS).await.unwrap(), []);
+        let why = denied(o.demote("mem-me-seat001", DemoteReason::Dead).await);
+        assert!(why.contains("the owner retires a position"), "{why}");
+        let kept = o.store.get("dom-me", "mem-me-seat001").await.unwrap();
+        assert_eq!(kept.unwrap().front.status, None);
+    }
+
     #[tokio::test]
     async fn an_agent_demotes_only_on_a_task_of_a_curator_or_of_the_auditor() {
         let dir = tempfile::tempdir().unwrap();
@@ -1799,8 +1827,8 @@ mod tests {
         who: &str,
         kind: OutcomeKind,
         note: &str,
-    ) -> Result<Vec<Outcome>, Error> {
-        agent(dir, who).record_outcome(task, kind, note).await
+    ) -> Result<Vec<OutcomeEvent>, Error> {
+        agent(dir, who).record_outcome_event(task, kind, note).await
     }
 
     fn why_denied<T: std::fmt::Debug>(r: Result<T, Error>) -> String {
@@ -1823,7 +1851,7 @@ mod tests {
             .await
             .unwrap();
         let said = o
-            .record_outcome(&t, OutcomeKind::Accepted, "Fine.")
+            .record_outcome_event(&t, OutcomeKind::Accepted, "Fine.")
             .await
             .unwrap();
         let by: Vec<(&str, OutcomeKind, &str)> = said
@@ -1858,7 +1886,7 @@ mod tests {
         reader.get(&secret).await.unwrap();
         assert_eq!(reader.label(), Label::Restricted);
         let r = reader
-            .record_outcome(&t, OutcomeKind::Rejected, "No.")
+            .record_outcome_event(&t, OutcomeKind::Rejected, "No.")
             .await;
         assert!(why_denied(r).contains("has read above the classification"));
         assert!(o.outcomes(&t).await.unwrap().is_empty());
@@ -1873,7 +1901,7 @@ mod tests {
         let high = o.file_own(high).await.unwrap().task.id;
         let low = agent(dir.path(), OTHER).with_handling_cap(Label::Internal);
         let r = low
-            .record_outcome(&high, OutcomeKind::Rejected, "No.")
+            .record_outcome_event(&high, OutcomeKind::Rejected, "No.")
             .await;
         assert!(
             matches!(r, Err(Error::Ledger(dm_ledger::Error::NotFound(_)))),
@@ -1892,14 +1920,18 @@ mod tests {
         let o = owner(dir.path());
         let t = task(&o, "Count the stock", None, 0).await;
         let long = "é".repeat(OUTCOME_NOTE_MAX + 1);
-        let r = o.record_outcome(&t, OutcomeKind::Rejected, &long).await;
+        let r = o
+            .record_outcome_event(&t, OutcomeKind::Rejected, &long)
+            .await;
         assert_eq!(
             why_denied(r),
             "the note of an outcome has at most 2000 characters"
         );
         assert!(o.outcomes(&t).await.unwrap().is_empty());
         let fits = "é".repeat(OUTCOME_NOTE_MAX);
-        let said = o.record_outcome(&t, OutcomeKind::Rejected, &fits).await;
+        let said = o
+            .record_outcome_event(&t, OutcomeKind::Rejected, &fits)
+            .await;
         assert_eq!(said.unwrap().len(), 1);
     }
 
@@ -1930,8 +1962,8 @@ mod tests {
         assert!(!text.contains("Undone."), "the log holds no note");
     }
 
-    fn outcome(kind: OutcomeKind, by: &str) -> Outcome {
-        Outcome {
+    fn outcome(kind: OutcomeKind, by: &str) -> OutcomeEvent {
+        OutcomeEvent {
             outcome: kind,
             by: by.into(),
             note: String::new(),

@@ -394,6 +394,9 @@ impl Memory {
     /// every serving of a log. `depth` bounds the steps; without one the query runs
     /// until it reaches nothing new.
     ///
+    /// A session that does not read the held-out domain gets no event of that domain's
+    /// log, as it gets no entry of the domain.
+    ///
     /// # Errors
     ///
     /// [`Error::Denied`] for an author outside the security role, or for a send asked
@@ -416,7 +419,10 @@ impl Memory {
             ));
         }
         let mut logs = BTreeMap::new();
-        for domain in self.domains() {
+        // the log of the held-out domain is no read of a session that does not read
+        // that domain: the answer leaves its events out
+        let read = self.domains().into_iter();
+        for domain in read.filter(|d| !self.keeps_from_session(d)) {
             self.ledger_into_log(&domain).await?;
             let events = self.log(Some(&domain), 0)?;
             logs.insert(domain, events);

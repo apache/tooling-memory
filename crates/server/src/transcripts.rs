@@ -345,6 +345,7 @@ impl Memory {
     /// An ungranted domain, or a store error.
     pub async fn keep_transcript(&self, keep: Keep) -> Result<Kept, Error> {
         let domain = self.resolve_domain(keep.domain.as_deref())?;
+        self.may_write_into(&domain, "write")?;
         let grant = self
             .grants
             .domains
@@ -463,7 +464,11 @@ impl Memory {
         Ok(id)
     }
 
-    async fn put_transcript(&self, t: &Transcript, raw: Option<&str>) -> Result<(), Error> {
+    pub(crate) async fn put_transcript(
+        &self,
+        t: &Transcript,
+        raw: Option<&str>,
+    ) -> Result<(), Error> {
         let text = serde_json::to_string_pretty(t).map_err(|e| bad(&t.session, &e))?;
         if let Some(raw) = raw {
             self.store
@@ -487,7 +492,7 @@ impl Memory {
     }
 
     /// Every transcript header kept in a domain, whatever its state.
-    async fn transcripts_in(&self, domain: &str) -> Result<Vec<Transcript>, Error> {
+    pub(crate) async fn transcripts_in(&self, domain: &str) -> Result<Vec<Transcript>, Error> {
         let mut out = Vec::new();
         for name in self
             .store
@@ -609,6 +614,7 @@ impl Memory {
     ) -> Result<Transcript, Error> {
         let t = self.find_transcript(session).await?;
         if !f.admits(&t.domain, t.classification, TrustTier::Raw, true)
+            || !f.admits_at(t.kept_at)
             || !lock(&self.session).observe(t.classification)
         {
             return Err(Error::NotFound(session.to_string()));
@@ -645,7 +651,7 @@ impl Memory {
         turn: usize,
         f: &ReadFilter,
     ) -> Result<Option<TurnRead>, Error> {
-        if !f.admits(&t.domain, t.classification, TrustTier::Raw, true) {
+        if !f.admits(&t.domain, t.classification, TrustTier::Raw, true) || !f.admits_at(t.kept_at) {
             return Ok(None);
         }
         let Some(found) = t.turns.iter().find(|x| x.turn == turn) else {
@@ -737,12 +743,14 @@ impl Memory {
                     continue;
                 };
                 let front = &e.front;
-                if !f.admits(
+                let admitted = f.admits(
                     &domain,
                     front.classification,
                     front.trust_tier,
                     e.is_active(),
-                ) {
+                );
+                // the record is read here, not the index: the snapshot is asked too
+                if !admitted || !f.admits_at(front.created) {
                     continue;
                 }
                 add_citations(&mut out, &e, &domain);
@@ -872,6 +880,7 @@ impl Memory {
             held_task: None,
             spend: None,
             fetch: None,
+            approval: None,
         })?;
         if !d.allow || self.author != self.grants.owner {
             return Err(Error::Denied(format!(

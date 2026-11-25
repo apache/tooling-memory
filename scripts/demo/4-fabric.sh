@@ -54,6 +54,100 @@ a task late-handoff "$fenced" "$note" --generation "$first" >/dev/null
 echo "  refused. Its handoff is left on the task for the holder now: late-handoff, generation $first"
 a task release "$fenced" --generation "$second" >/dev/null
 a task invalidate "$fenced" --reason "obsolete: shown" >/dev/null
+say "Waiting, and an effect nobody has settled" "A session does not wait for an outside event. It gives the task up until the event comes, and the tap's event puts the task back on offer. A holder records an external action before it makes it. When its lease then runs out, nobody knows if the destination holds the effect, so the ledger gives the task to nobody until a person settles it."
+# claim the next task and say whether it is $1; anything else goes back to the queue
+offer() {
+  got=$(a task claim-next --domain dom-demo --lease-seconds "${2:-600}")
+  gid=$(printf '%s' "$got" | j "d['id'] if d else ''")
+  ggen=$(printf '%s' "$got" | j "d['generation'] if d else ''")
+  if [ "$gid" = "$1" ]; then
+    echo "  claim-next gave the task, at generation $ggen"
+  elif [ -n "$gid" ]; then
+    a task release "$gid" --generation "$ggen" >/dev/null
+    echo "  claim-next gave another task, not this one, though it ranks first"
+  else
+    echo "  claim-next gave nothing"
+  fi
+}
+waits=$(a task create "Land the fixture change" --domain dom-demo --priority 60 --reversibility irreversible --touches "fixtures/**" --body "Open the change, then wait for its check." | j "d['id']")
+a task admit "$waits" >/dev/null
+offer "$waits"
+a task wait "$waits" check:fixtures-42 --generation "$ggen" | j "f\"  given up by its holder: {d['status']}, waiting on {d['waiting_on']}\""
+offer "$waits"
+a task arrived check:fixtures-42 --domain dom-demo | j "f\"  the event check:fixtures-42 came: {len(d)} task is {d[0]['status']} again\""
+offer "$waits" 1
+a task effect-begin "$waits" push-fixtures-1 --generation "$ggen" | j "f\"  the holder records the action before it makes it: effects {d['effects']}\""
+sleep 2
+echo "  the lease of one second ran out, and the holder never said what became of the push"
+offer "$waits"
+a task effect-settle "$waits" push-fixtures-1 not_applied | j "f\"  a person looked at the destination and settled it as not applied: effects {d.get('effects', [])}\""
+offer "$waits"
+a task release "$waits" --generation "$ggen" >/dev/null
+a task invalidate "$waits" --reason "obsolete: shown" >/dev/null
+say "A position" "A standing role is a record: a charter, an authority envelope, and the work pinned to it. A person verifies it. A pinned task goes only to a session that fills the position, and a fresh session in the position starts from the position's handoff cache, not from an earlier session's transcript."
+position=pos-demo-release
+# a tool call as an agent whose session a launcher put in the position
+seated() { MEMORY_POSITION=$position python3 "$here/scripts/demo/mcp.py" "$memory" "$root" "$@"; }
+charter=$(sed "s/@AGENT@/$WORKER_HARNESS/" <<'POS' | a write --kind position --domain dom-demo --title "The release coordinator" | j "d['id']"
+# The release coordinator
+
+```position pos-demo-release
+[charter]
+orders = "Announce each release to the list after the mirrors carry it. One voice writes the announcements."
+covers = []
+agent = "@AGENT@"
+
+[envelope]
+tools = []
+handling = "internal"
+```
+POS
+)
+a approve "$(agent agent:curator promote "{\"id\": \"$charter\", \"to\": \"verified\", \"why\": \"the release manager agreed the charter\"}" | j "d['task']['id']")" >/dev/null
+echo "  $position is verified and in force; its charter names the agent definition $WORKER_HARNESS"
+pinned=$(a task create "Announce release 1.4" --domain dom-demo --priority 60 --body "Tell the list that 1.4 is out, once the three mirrors carry it." --position "$position" --pin-reason continuity | j "d['id']")
+a task admit "$pinned" >/dev/null
+echo "  filed and admitted: Announce release 1.4, pinned to $position for continuity"
+echo "  a session that fills no position asks for the task by name:"
+agent agent:worker claim "{\"id\": \"$pinned\", \"lease_seconds\": 600}" 2>&1 | sed 's/^/    /' || true
+positions() {
+  a position list --domain dom-demo | j "'\n'.join(f\"  {p['name']}  {p['state']:<8} agent definition {p['agent']}; pinned {p['pinned']}, waiting {len(p['waiting'])}, live sessions {len(p['sessions'])}, wake {str(p['wake']).lower()}\" for p in d if p['name'] == '$position' and p['state'] != 'none')"
+}
+positions
+worked=$(seated "agent:$WORKER_HARNESS" steps "[
+  {\"tool\": \"claim_next\", \"arguments\": {\"domain\": \"dom-demo\", \"lease_seconds\": 600}},
+  {\"tool\": \"write\", \"arguments\": {\"entry_type\": \"handoff\", \"domain\": \"dom-demo\", \"title\": \"Handoff: release 1.4, the mirrors\", \"body\": \"Mirrors 1 and 2 checked; the third is next.\"}}]")
+claim=$(printf '%s\n' "$worked" | sed -n 1p)
+generation=$(printf '%s\n' "$claim" | j "d['result']['generation']")
+note=$(printf '%s\n' "$worked" | sed -n 2p | j "d['result']['id']")
+printf '%s\n' "$claim" | j "f\"  a session of agent:$WORKER_HARNESS that fills $position asks for the next task: {d['result']['task']['title']}, generation {d['result']['generation']}\""
+seated "agent:$WORKER_HARNESS" release "{\"id\": \"$pinned\", \"generation\": $generation, \"handoff\": \"$note\"}" >/dev/null 2>&1
+echo "  it wrote the handoff $note, which the memory server cited to $position, and released the task with it"
+echo "  a fresh session fills $position and loads T0; the position's section comes first:"
+seated "agent:$WORKER_HARNESS" t0 '{"domain": "dom-demo"}' 2>/dev/null | awk '/^## Position /{on=1; print; next} /^## /{on=0} on' | sed 's/^/    /'
+
+say "Secondment, waking and retirement" "A session under another agent definition than the charter's is seconded: it reads what the position holds and does its task, and it does not write the position's history. A launcher reads which positions wait and starts a session in each. The owner retires a position: its tasks return to matching, and its history stays."
+seated agent:substitute steps "[
+  {\"tool\": \"position\", \"arguments\": {\"name\": \"$position\", \"domain\": \"dom-demo\"}},
+  {\"tool\": \"write\", \"arguments\": {\"domain\": \"dom-demo\", \"title\": \"A note for the coordinator\", \"body\": \"The third mirror answered at noon.\", \"cites\": [\"$position\"]}}]" \
+  | python3 -c "
+import json, sys
+seen, wrote = (json.loads(line) for line in sys.stdin)
+view = seen['result']
+print(f\"  agent:substitute fills $position: seconded {str(view['seat']['seconded']).lower()}; it reads {len(view['commitments'])} open commitment and {len(view['handoffs'])} handoff in the cache\")
+print('  its write that cites the position: ' + ('refused: ' + wrote['refused'] if not wrote['ok'] else 'allowed, which is a defect'))"
+positions
+if gateway; then
+  echo "  the launcher wakes the position: $WORKER_HARNESS on $WORKER_MODEL, under the agent definition the charter names"
+  ( cd "$(mktemp -d)" && a work --harness "$WORKER_HARNESS" --auth gateway --model "$WORKER_MODEL" --backend namespaces --wake --lease-seconds 900 2>&1 | grep -E '^amem: (woke|claimed|task|nothing)' ) || true
+  a task get "$pinned" | j "f\"  {d['id']}  {d['status']:<8} {d['title']}\""
+else
+  echo "  skipped: no gateway key, so no session was started by 'amem work --wake'; the task still waits"
+fi
+a position retire "$position" --domain dom-demo --why "shown" | j "f\"  retired by {d['retired_by']}; the pin was taken off: {', '.join(d['unpinned']) or 'no open task'}\""
+a task get "$pinned" | j "f\"  {d['id']}  {d['status']:<8} pinned to {d.get('position') or 'no position'}\""
+positions
+if [ "$(a task get "$pinned" | j "d['status']")" = open ]; then a task invalidate "$pinned" --reason "obsolete: shown" >/dev/null; fi
 say "The rescore" "Each cycle the queue is ranked again; every move is a ledger event with its reason, and curation's share of the work is held to its floor."
 a task rescore | j "f\"  rubric {d['rubric']}; curation's share of the completed work {d['maintenance_share']:.0%} against a floor of {d['floor']:.0%}\n\" + '\n'.join(f\"  {c['from']:>3} -> {c['to']:<3} {c['title']:<40} {c['why']}\" for c in d['changed'])"
 

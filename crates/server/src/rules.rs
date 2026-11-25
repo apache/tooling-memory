@@ -120,6 +120,14 @@ fn is_person(author: &str, owner: &str) -> bool {
     matches!(Class::of(author, owner), Class::Owner | Class::Human)
 }
 
+/// Whether `words` are words on one line: no line break, no code fence and no markup.
+/// A task or an entry shows such text to a person, and to the agents that read the task.
+pub(crate) fn words_on_one_line(words: &str) -> bool {
+    !["```", "~~~", "\n", "\r", "<"]
+        .iter()
+        .any(|mark| words.contains(mark))
+}
+
 fn live(status: Status) -> bool {
     matches!(status, Status::Enforced | Status::Advisory)
 }
@@ -144,7 +152,7 @@ impl Memory {
         // the policy entries this session may read; its label rises only to the rules
         // whose text it is given
         let readable = {
-            let f = self.filter_for(None)?;
+            let f = self.policy_filter()?;
             let ix = self.index.lock().await;
             ix.list_every(&f, Some(EntryType::Policy))?
         };
@@ -240,11 +248,10 @@ impl Memory {
     /// no code fence, an expiry that is a time to come, and a task to hold for. Gives
     /// the task and the time of the check.
     fn exception_asked(&self, ask: &ExceptionRequest) -> Result<(String, OffsetDateTime), Error> {
-        if [&ask.scope, &ask.justification].iter().any(|words| {
-            ["```", "~~~", "\n", "\r", "<"]
-                .iter()
-                .any(|mark| words.contains(mark))
-        }) {
+        if ![&ask.scope, &ask.justification]
+            .iter()
+            .all(|words| words_on_one_line(words))
+        {
             return Err(Error::Denied(
                 "the scope and the justification of an exception are words on one line, with \
                  no code fence and no markup"
@@ -806,8 +813,9 @@ impl Memory {
     /// Two rules overlap when both are in force (advisory or enforced), both are in one
     /// layer, and the words of their rule sentences have a Jaccard overlap of 0.8 or
     /// more. An exception, a proposed rule and a retired rule overlap nothing. A rule
-    /// above the handling of this session is not compared. One of the two rules is a
-    /// rule of the domain.
+    /// above the handling of this session is not compared, and neither is a rule whose
+    /// text [`Memory::check_policy`] withholds from this session. One of the two rules
+    /// is a rule of the domain.
     ///
     /// Work is repeated when [`REPEATED_MIN`] done tasks of the domain or more have one
     /// title, after the title is put in lowercase and its digits are removed, and none
@@ -819,6 +827,12 @@ impl Memory {
     pub async fn policy_curation(&self, domain: Option<&str>) -> Result<PolicyCuration, Error> {
         let domain = self.resolve_domain(domain)?;
         let handling = self.handling()?;
+        // the policy entries whose text this session reads, as `check_policy` reads them
+        let readable = {
+            let f = self.policy_filter()?;
+            let ix = self.index.lock().await;
+            ix.list_every(&f, Some(EntryType::Policy))?
+        };
         let p = self.policy();
         let mut in_force: BTreeMap<&str, &record::Entry> = BTreeMap::new();
         for e in p.entries() {
@@ -826,6 +840,7 @@ impl Memory {
             if !e.meta.is_exception()
                 && matches!(state, Status::Advisory | Status::Enforced)
                 && e.classification <= handling
+                && readable.iter().any(|h| h.id == e.entry_id)
             {
                 in_force.entry(e.meta.id.as_str()).or_insert(e);
             }
@@ -946,6 +961,8 @@ mod tests {
             reason: None,
             superseded_by: None,
             posted_to: None,
+            waiting_on: None,
+            effects: Vec::new(),
         }
     }
 
@@ -1059,6 +1076,27 @@ mod tests {
         let after = Memory::open(root).unwrap().with_author("agent:curator");
         let after = after.check_policy("supersede a decision", None).await;
         assert_eq!(after.unwrap(), before);
+    }
+
+    /// The rules are compared from their text. A session whose settings leave memory
+    /// out is given the text of no rule, so it finds no overlap.
+    #[tokio::test]
+    async fn a_session_that_is_given_the_text_of_no_rule_finds_no_overlap() {
+        let dir = tempfile::tempdir().unwrap();
+        Memory::init(dir.path(), OWNER, "dom-me").unwrap();
+        let root = dir.path();
+        let near = "Decisions are superseded by a person, not an agent, always.";
+        rule(root, "pol-L2-101", 2, SENTENCE, "status = \"enforced\"\n").await;
+        rule(root, "pol-L2-102", 2, near, "status = \"advisory\"\n").await;
+        let on = Memory::open(root).unwrap().with_author("agent:curator");
+        assert_eq!(on.policy_curation(None).await.unwrap().overlaps.len(), 1);
+        let off = Memory::open(root).unwrap().with_author("agent:curator");
+        off.set_settings(crate::arms::Arm::NoMemory.settings())
+            .unwrap();
+        let rules = off.check_policy("supersede a decision", None).await;
+        assert!(rules.unwrap().iter().all(|r| r.withheld), "no text");
+        let found = off.policy_curation(None).await.unwrap();
+        assert_eq!(found.overlaps, [], "{found:?}");
     }
 
     /// File a task as `m`, do it and close it with a handoff.

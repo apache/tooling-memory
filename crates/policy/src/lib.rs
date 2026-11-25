@@ -132,6 +132,11 @@ pub struct DomainGrant {
     /// owner sets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_retention_days: Option<u32>,
+    /// The guard of the domain: the person whose approval lets an entry of the domain be
+    /// copied to a lower label. The owner when unset. A guard is a person, so the name
+    /// starts `human:`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guard: Option<String>,
 }
 
 /// How long a transcript is kept whole when the domain says nothing.
@@ -242,6 +247,15 @@ pub struct Grants {
     /// `human:<system>:<user-id>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security: Vec<String>,
+    /// The domain that holds the held-out suites: the scenarios that grade a task
+    /// definition. Only the evaluator and the owner in person read it, so it is never
+    /// the platform's domain, which every session reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_out: Option<String>,
+    /// The principal that grades work on the held-out suites, `agent:<name>`. It reads
+    /// the held-out domain and claims no task.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator: Option<String>,
     /// Domains the owner holds, by id.
     #[serde(default)]
     pub domains: BTreeMap<String, DomainGrant>,
@@ -292,6 +306,7 @@ impl Grants {
                 default_classification: Label::Internal,
                 admit_own: true,
                 transcript_retention_days: None,
+                guard: None,
             },
         );
         let mut destinations = BTreeMap::new();
@@ -320,6 +335,8 @@ impl Grants {
             handling: Label::Restricted,
             platform: None,
             security: Vec::new(),
+            held_out: None,
+            evaluator: None,
             domains,
             destinations,
             taps: BTreeMap::new(),
@@ -334,7 +351,9 @@ impl Grants {
     /// # Errors
     ///
     /// [`Error::Parse`] for bad TOML or a value outside the schema, [`Error::Invalid`] for
-    /// an empty owner or no domains.
+    /// an empty owner, no domains, a guard that is not a person, a platform or held-out
+    /// domain the owner does not hold, a held-out domain that is the platform's, or an
+    /// evaluator that is not an agent or has no held-out domain.
     pub fn parse(text: &str) -> Result<Grants, Error> {
         let g: Grants = toml::from_str(text)?;
         if g.owner.trim().is_empty() {
@@ -343,6 +362,7 @@ impl Grants {
         if g.domains.is_empty() {
             return Err(Error::Invalid("at least one domain is required".into()));
         }
+        g.guards_are_people()?;
         for (name, t) in &g.taps {
             if let Some(url) = &t.hosted {
                 let local = ["http://127.0.0.1", "http://localhost", "http://[::1]"]
@@ -379,7 +399,54 @@ impl Grants {
                 "platform = {p:?} names a domain the owner does not hold"
             )));
         }
+        g.held_out_is_apart()?;
         Ok(g)
+    }
+
+    /// The held-out domain is one the owner holds and is not the platform's, and the
+    /// evaluator is an agent that has a held-out domain to read.
+    fn held_out_is_apart(&self) -> Result<(), Error> {
+        if let Some(h) = self.held_out.as_deref() {
+            if !self.domains.contains_key(h) {
+                return Err(Error::Invalid(format!(
+                    "held_out = {h:?} names a domain the owner does not hold"
+                )));
+            }
+            if self.platform.as_deref() == Some(h) {
+                return Err(Error::Invalid(format!(
+                    "held_out = {h:?} is the platform's domain: every session reads the platform, and only the evaluator reads the held-out suites"
+                )));
+            }
+        }
+        let Some(evaluator) = self.evaluator.as_deref() else {
+            return Ok(());
+        };
+        let named = evaluator
+            .strip_prefix("agent:")
+            .is_some_and(|name| !name.trim().is_empty());
+        if !named {
+            return Err(Error::Invalid(format!(
+                "evaluator = {evaluator:?}: the evaluator is an agent, named `agent:<name>`"
+            )));
+        }
+        if self.held_out.is_none() {
+            return Err(Error::Invalid(format!(
+                "evaluator = {evaluator:?} needs held_out = \"<domain>\": the evaluator grades on the suites of that domain"
+            )));
+        }
+        Ok(())
+    }
+
+    /// A guard approves in person, so a grant that names one names a person.
+    fn guards_are_people(&self) -> Result<(), Error> {
+        for (name, d) in &self.domains {
+            if let Some(guard) = d.guard.as_deref().filter(|p| !p.starts_with("human:")) {
+                return Err(Error::Invalid(format!(
+                    "[domains.{name}] guard = {guard:?}: a guard is a person, named `human:<system>:<name>`"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Read and parse the file.
@@ -408,6 +475,14 @@ impl Grants {
     #[must_use]
     pub fn read_filter(&self) -> ReadFilter {
         ReadFilter::for_domains(self.domains.keys().cloned(), self.handling)
+    }
+
+    /// The guard of a domain: the person the domain's grant names, or the owner when it
+    /// names none. `None` when the domain is not granted.
+    #[must_use]
+    pub fn guard(&self, domain: &str) -> Option<&str> {
+        let d = self.domains.get(domain)?;
+        Some(d.guard.as_deref().unwrap_or(&self.owner))
     }
 
     /// A tap's grant, if the file names it and its domain is one the owner holds.
@@ -721,6 +796,103 @@ ceiling = "public"
             assert_eq!(back.ceiling(d), Some(Label::Internal), "{d}");
         }
         assert_eq!(back.ceiling("qwen"), None, "no such destination");
+    }
+
+    #[test]
+    fn a_guard_is_a_person_and_the_owner_when_the_grant_names_none() {
+        let named = "owner = \"human:local:me\"\n[domains.dom-a]\nguard = \"human:local:guard\"\n[domains.dom-b]\n";
+        let g = Grants::parse(named).unwrap();
+        assert_eq!(g.guard("dom-a"), Some("human:local:guard"));
+        assert_eq!(g.guard("dom-b"), Some("human:local:me"), "the owner");
+        assert_eq!(g.guard("dom-else"), None, "not granted");
+        assert_eq!(Grants::parse(&g.render().unwrap()).unwrap(), g);
+        for not_a_person in ["agent:x", "tap:github-issues", "curation", ""] {
+            let text = format!(
+                "owner = \"human:local:me\"\n[domains.dom-a]\nguard = \"{not_a_person}\"\n"
+            );
+            assert!(
+                matches!(Grants::parse(&text), Err(Error::Invalid(_))),
+                "{not_a_person:?}"
+            );
+        }
+    }
+
+    const HELD_OUT: &str = "owner = \"human:local:me\"\nplatform = \"dom-plat\"\nheld_out = \"dom-held\"\nevaluator = \"agent:evaluator\"\n[domains.dom-me]\n[domains.dom-plat]\n[domains.dom-held]\n";
+
+    #[test]
+    fn a_held_out_domain_and_its_evaluator_round_trip() {
+        let g = Grants::parse(HELD_OUT).unwrap();
+        assert_eq!(g.held_out.as_deref(), Some("dom-held"));
+        assert_eq!(g.evaluator.as_deref(), Some("agent:evaluator"));
+        let text = g.render().unwrap();
+        assert_eq!(Grants::parse(&text).unwrap(), g);
+        // a held-out domain with no evaluator is the owner's alone
+        let alone = HELD_OUT.replace("evaluator = \"agent:evaluator\"\n", "");
+        let g = Grants::parse(&alone).unwrap();
+        assert_eq!(
+            (g.held_out.as_deref(), &g.evaluator),
+            (Some("dom-held"), &None)
+        );
+        // a file without the keys renders without them
+        let starter = Grants::starter("human:local:me", "dom-me");
+        assert_eq!((&starter.held_out, &starter.evaluator), (&None, &None));
+        let text = starter.render().unwrap();
+        assert!(
+            !text.contains("held_out") && !text.contains("evaluator"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_held_out_domain_is_held_and_is_not_the_platform_s() {
+        for (domain, why) in [
+            ("dom-else", "names a domain the owner does not hold"),
+            ("dom-plat", "is the platform's domain"),
+        ] {
+            let text = HELD_OUT.replace(
+                "held_out = \"dom-held\"",
+                &format!("held_out = \"{domain}\""),
+            );
+            let refused = Grants::parse(&text);
+            assert!(
+                matches!(&refused, Err(Error::Invalid(said)) if said.contains(why)),
+                "{domain}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_evaluator_is_an_agent_and_needs_a_held_out_domain() {
+        let alone = HELD_OUT.replace("held_out = \"dom-held\"\n", "");
+        let refused = Grants::parse(&alone);
+        assert!(
+            matches!(&refused, Err(Error::Invalid(said)) if said.contains("needs held_out")),
+            "{refused:?}"
+        );
+        for not_an_agent in [
+            "human:local:me",
+            "human:local:grader",
+            "tap:grader",
+            "agent:",
+            "agent: ",
+            "evaluator",
+            "",
+        ] {
+            let text = HELD_OUT.replace("agent:evaluator", not_an_agent);
+            let refused = Grants::parse(&text);
+            assert!(
+                matches!(&refused, Err(Error::Invalid(said)) if said.contains("is an agent")),
+                "{not_an_agent:?}: {refused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_grants_file_without_a_guard_renders_without_the_key() {
+        let g = Grants::starter("human:local:me", "dom-me");
+        let text = g.render().unwrap();
+        assert!(!text.contains("guard"), "{text}");
+        assert_eq!(Grants::parse(&text).unwrap(), g);
     }
 
     #[test]

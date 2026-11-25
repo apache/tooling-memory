@@ -281,12 +281,19 @@ pub fn bundle_dir(root: &Path, domain: &str, label: Label) -> PathBuf {
 ///
 /// # Errors
 ///
-/// [`Error::Invalid`] for a domain the filter does not admit.
+/// [`Error::Invalid`] for a domain the filter does not admit, and for a
+/// filter that no tier passes: the settings of that session read no entry, and an
+/// export is a read.
 pub fn export_scope(
     filter: &ReadFilter,
     domain: &str,
     max_label: Label,
 ) -> Result<ReadFilter, Error> {
+    if filter.is_closed() {
+        return Err(Error::Invalid(
+            "the settings of this session read no entry, so it exports none".into(),
+        ));
+    }
     if !filter.domains.is_empty() && !filter.domains.iter().any(|d| d == domain) {
         return Err(Error::Invalid(format!(
             "domain {domain} is not readable here"

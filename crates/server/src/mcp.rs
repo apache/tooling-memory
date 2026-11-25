@@ -48,7 +48,9 @@ fn mcp_err(e: Error) -> McpError {
             | dm_ledger::Error::WrongState { .. }
             | dm_ledger::Error::NotHolder { .. }
             | dm_ledger::Error::Fenced { .. }
-            | dm_ledger::Error::AttemptSpent { .. },
+            | dm_ledger::Error::AttemptSpent { .. }
+            | dm_ledger::Error::BadPin(_)
+            | dm_ledger::Error::Pinned { .. },
         ) => McpError::invalid_params(e.to_string(), None),
         other => McpError::internal_error(other.to_string(), None),
     }
@@ -318,7 +320,7 @@ pub struct PromoteParams {
 pub struct WriteParams {
     /// The Markdown body. Required.
     pub body: String,
-    /// decision, fact, convention, method, or handoff. Default fact.
+    /// decision, fact, convention, method, handoff, policy, or position. Default fact.
     #[serde(default)]
     pub entry_type: Option<String>,
     /// A title; else the body's first heading.
@@ -426,7 +428,8 @@ pub struct ListParams {
     /// A granted domain. Omit for every granted domain.
     #[serde(default)]
     pub domain: Option<String>,
-    /// decision, fact, convention, method, or handoff. Omit for every kind.
+    /// decision, fact, convention, method, handoff, policy, or position. Omit for every
+    /// kind.
     #[serde(default)]
     pub kind: Option<String>,
     /// How many, 1 to 100. Default 10.
@@ -468,6 +471,122 @@ pub struct CreateTaskParams {
     /// Checks that say this task is done, in place of its definition's.
     #[serde(default)]
     pub acceptance: Vec<String>,
+    /// The task this one is split from, when it is not the task you hold.
+    #[serde(default)]
+    pub parent: Option<String>,
+    /// The decisions this task carries out, as entry ids.
+    #[serde(default)]
+    pub implements: Vec<String>,
+    /// Whether what the task does can be undone: `reversible` or `irreversible`.
+    #[serde(default)]
+    pub reversibility: Option<String>,
+    /// The owned paths the task changes, as globs.
+    #[serde(default)]
+    pub artifacts_touched: Vec<String>,
+    /// The position this task is pinned to, `pos-<name>`: only a session that fills
+    /// the position claims the task. Give `pin_reason` with it.
+    #[serde(default)]
+    pub position: Option<String>,
+    /// Why the task is pinned: continuity, relationship, or separation.
+    #[serde(default)]
+    pub pin_reason: Option<String>,
+}
+
+/// Parameters of `wait_for`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct WaitParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// The name of the outside event the task waits on, one token, as the tap that
+    /// reports it will name it.
+    pub on: String,
+    /// A handoff entry you wrote about what you did before waiting; the next claimant
+    /// starts from it. Optional.
+    #[serde(default)]
+    pub handoff: Option<String>,
+}
+
+/// Parameters of `effect_begun` and `effect_settled`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct EffectParams {
+    /// The task id.
+    pub id: String,
+    /// The generation of your claim. Optional in the session that made the claim.
+    #[serde(default)]
+    pub generation: Option<u64>,
+    /// A stable id for the external action, one token of at most 64 characters. A retry
+    /// of the action names the same id.
+    pub action: String,
+    /// For `effect_settled`: `applied` when the destination holds the effect,
+    /// `not_applied` when it does not.
+    #[serde(default)]
+    pub outcome: Option<String>,
+}
+
+/// Parameters of `position`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct PositionParams {
+    /// The position's name, `pos-<name>`.
+    pub name: String,
+    /// A granted domain; the one that holds the position when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters of `positions`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct PositionsParams {
+    /// A granted domain. Omit for every granted domain.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters of `retire_position`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct RetirePositionParams {
+    /// The position's name, `pos-<name>`.
+    pub name: String,
+    /// Why it is retired: words on one line. The retiring entry keeps them.
+    pub why: String,
+    /// A granted domain; the one that holds the position when omitted.
+    #[serde(default)]
+    pub domain: Option<String>,
+}
+
+/// Parameters of `scorecards`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ScorecardsParams {
+    /// The most scorecards to return, newest first. Ten when omitted.
+    #[serde(default)]
+    pub limit: Option<usize>,
+}
+
+/// One outcome of `score_evaluation`: what the runner says of one run.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct OutcomeParams {
+    /// The session of the run. Its tape gives the task, the seed and the arm.
+    pub session: String,
+    /// Whether the judge accepted the answer.
+    pub success: bool,
+    /// What the run cost, in tokens.
+    pub cost: u64,
+    /// The name of the judge that decided the success.
+    pub judge: String,
+}
+
+/// Parameters of `score_evaluation`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct ScoreEvaluationParams {
+    /// The plan: the TOML text of the evaluation set file, with its `[plan]` table.
+    pub plan: String,
+    /// One outcome for each run.
+    pub outcomes: Vec<OutcomeParams>,
+    /// Also keep the scorecard as an entry in the platform's domain.
+    #[serde(default)]
+    pub keep: bool,
 }
 
 /// Parameters that name a task.
@@ -571,6 +690,29 @@ pub struct ProposeAmendmentParams {
     pub evidence: String,
 }
 
+/// Parameters of `erase`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct EraseParams {
+    /// The entry id.
+    pub id: String,
+    /// Why, as a class: `requested`, `mistaken`, `sensitive` or `legal`. The receipt
+    /// keeps it.
+    pub reason: String,
+}
+
+/// Parameters of `declassify`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct DeclassifyParams {
+    /// The entry id.
+    pub id: String,
+    /// The label of the copy, lower than the label of the entry: `public` or
+    /// `internal`.
+    pub target_label: String,
+    /// Why the text may be read at the lower label, in words on one line. The guard
+    /// reads it.
+    pub justification: String,
+}
+
 /// Parameters of `claim`.
 #[derive(Deserialize, schemars::JsonSchema, Default)]
 pub struct LeaseParams {
@@ -609,6 +751,44 @@ pub struct CompleteParams {
     /// with the same key: the task is completed one time.
     #[serde(default)]
     pub attempt: Option<String>,
+}
+
+/// Parameters of `verdict`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct VerdictParams {
+    /// The id of the task whose work waits for a verdict.
+    pub id: String,
+    /// True to accept the work, false to reject it.
+    pub accept: bool,
+}
+
+/// Parameters that name a task definition.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct DefinitionParams {
+    /// The name of the task definition.
+    pub definition: String,
+}
+
+/// One answer in a graded run.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct GradeAnswer {
+    /// The name of a scenario of the held-out suite.
+    pub scenario: String,
+    /// The id of the handoff entry that answers the scenario.
+    pub handoff: String,
+}
+
+/// Parameters of `grade`.
+#[derive(Deserialize, schemars::JsonSchema, Default)]
+pub struct GradeParams {
+    /// The name of the task definition.
+    pub definition: String,
+    /// The level that the run is for: `person`, `review` or `checks`.
+    pub level: String,
+    /// One answer for each scenario that was worked. A scenario without an answer
+    /// fails.
+    #[serde(default)]
+    pub answers: Vec<GradeAnswer>,
 }
 
 /// Parameters of `invalidate_task`.
@@ -700,6 +880,10 @@ const READS: &[&str] = &[
     "task_tree",
     "get_task",
     "list_tasks",
+    "position",
+    "positions",
+    "settings",
+    "scorecards",
     "lineage",
     "log",
     "outside_readers",
@@ -707,6 +891,8 @@ const READS: &[&str] = &[
     "outcomes",
     "auditor_mode",
     "curation_case",
+    "autonomy",
+    "candidate_gates",
 ];
 
 /// The tools that reach outside, refused after a re-run diverges.
@@ -759,6 +945,8 @@ impl McpServer {
     /// session's tape, or answered from the tape the session re-enacts.
     #[must_use]
     pub fn new(memory: Arc<Memory>) -> Self {
+        // what a harness asks through this server, an agent may have asked
+        memory.mark_served();
         Self {
             memory,
             tool_router: Self::tool_router(),
@@ -980,7 +1168,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "The dead entries that you read: older than the window, not read inside it, named by no active entry, not verified, and not a handoff, a policy entry or a canary. Each is a candidate for `demote` with the reason `dead`. The list is not a read of the entries, but it raises your label to their classification."
+        description = "The dead entries that you read: older than the window, not read inside it, named by no active entry, not verified, and not a handoff, a policy entry, a position or a canary. Each is a candidate for `demote` with the reason `dead`. The list is not a read of the entries, but it raises your label to their classification."
     )]
     async fn dead(&self, p: Parameters<DeadParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -1029,7 +1217,7 @@ impl McpServer {
         })?;
         let said = self
             .memory
-            .record_outcome(&p.task, kind, p.note.as_deref().unwrap_or(""))
+            .record_outcome_event(&p.task, kind, p.note.as_deref().unwrap_or(""))
             .await
             .map_err(mcp_err)?;
         ok(json!({ "outcomes": said }))
@@ -1218,7 +1406,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "File a task on the ledger. It is born proposed and becomes claimable once the owner admits it."
+        description = "File a task on the ledger. It is born proposed and becomes claimable once the owner admits it. With `position` and `pin_reason` the task is pinned: only a session that fills that position claims it, and it stays proposed until a person or a session that fills the position under its charter's agent definition admits it."
     )]
     async fn create_task(
         &self,
@@ -1240,6 +1428,13 @@ impl McpServer {
             acceptance: p.acceptance,
             // the library sets it, from what the session read
             outside: false,
+            parent: p.parent,
+            implements: p.implements,
+            reversibility: parse("reversibility", p.reversibility)?,
+            artifacts_touched: p.artifacts_touched,
+            position: p.position,
+            pin_reason: parse("pin_reason", p.pin_reason)?,
+            ..dm_ledger::TaskSpec::default()
         };
         let c = self.memory.create_task(spec).await.map_err(mcp_err)?;
         // what a task that stays proposed lacks goes back to whoever filed it
@@ -1287,7 +1482,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Admit a proposed task so it can be claimed. On a laptop the owner is the triage."
+        description = "Admit a proposed task so it can be claimed. On a laptop the owner is the triage. A task pinned to a position is admitted by a person, or by a session that fills the position under the agent definition its charter names."
     )]
     async fn admit_task(&self, p: Parameters<TaskIdParams>) -> Result<CallToolResult, McpError> {
         let t = self.memory.admit(&p.0.id).await.map_err(mcp_err)?;
@@ -1339,7 +1534,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Complete a task with the handoff entry you wrote describing what happened. Write the handoff first with `write`, entry_type handoff."
+        description = "Complete a task with the handoff entry you wrote describing what happened. Write the handoff first with `write`, entry_type handoff. A task under a task definition can come back `blocked`, waiting on `verdict:<task>`: your work is handed in, and the task is done when a person or a reviewer accepts it. Do not complete it again."
     )]
     async fn complete(&self, p: Parameters<CompleteParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -1359,6 +1554,50 @@ impl McpServer {
         let t = self
             .memory
             .release(&p.id, p.generation, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Give a held task up until an outside event comes: a check that runs, a reply, a change that has not landed. Do not wait in the session. The task is blocked, and nobody may claim it, until a tap or a person reports the event; then it is offered again. Pass the id of a handoff you wrote so the next claimant starts where you stopped."
+    )]
+    async fn wait_for(&self, p: Parameters<WaitParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .wait_for(&p.id, p.generation, &p.on, p.handoff.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Record that you are about to make an external action under your claim, before you make it. Until the action is settled, the task goes to nobody else, even when your lease runs out. A retry of the action names the same action id."
+    )]
+    async fn effect_begun(&self, p: Parameters<EffectParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let t = self
+            .memory
+            .effect_begun(&p.id, p.generation, &p.action)
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "task": t }))
+    }
+
+    #[tool(
+        description = "Record what became of an external action you began: `applied` when the destination holds the effect, `not_applied` when it does not. Only while your claim is in force. After that a person reconciles it: you cannot tell a lost answer from an action that was not made."
+    )]
+    async fn effect_settled(
+        &self,
+        p: Parameters<EffectParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let outcome = parse::<dm_ledger::Outcome>("outcome", p.outcome)?
+            .ok_or_else(|| McpError::invalid_params("outcome: applied or not_applied", None))?;
+        let t = self
+            .memory
+            .effect_settled(&p.id, p.generation, &p.action, outcome)
             .await
             .map_err(mcp_err)?;
         ok(json!({ "task": t }))
@@ -1435,6 +1674,35 @@ impl McpServer {
     }
 
     #[tool(
+        description = "Erase an entry. It cannot be taken back: the text leaves every version and the index, and a stub and a receipt remain. It runs only under an approval of the owner for this version of the entry. Without one, the call is refused, and the refusal names the task that asks the owner for the approval. Call again after the approval. If the entry changed since, the approval is of another version, and a new task asks again."
+    )]
+    async fn erase(&self, p: Parameters<EraseParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let reason: dm_core::erasure::Reason = parse("reason", Some(p.reason))?
+            .ok_or_else(|| McpError::invalid_params("reason: a class of reason", None))?;
+        let receipt = self.memory.erase(&p.id, reason).await.map_err(mcp_err)?;
+        ok(serde_json::to_value(receipt).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Ask the guard of the domain for a copy of an entry at a lower label, with your reason in words on one line. `proposed` means that the guard has a task and that nothing exists at the lower label. Call again after the approval to land the copy: `declassified`, with the id of the copy. The copy cites the entry and the version it was made from. If the entry changed since, the approval is of another version, and a new task asks again."
+    )]
+    async fn declassify(
+        &self,
+        p: Parameters<DeclassifyParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let to: dm_core::Label = parse("target_label", Some(p.target_label))?
+            .ok_or_else(|| McpError::invalid_params("target_label: a label", None))?;
+        let answer = self
+            .memory
+            .declassify(&p.id, to, &p.justification)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(answer).unwrap_or_default())
+    }
+
+    #[tool(
         description = "Close a task without doing it: obsolete, invalid, or a duplicate of another."
     )]
     async fn invalidate_task(
@@ -1463,6 +1731,77 @@ impl McpServer {
         ok(json!({ "task": t, "late_handoffs": late, "refused_claims": refused }))
     }
 
+    #[tool(
+        description = "Give the verdict on the work of a task that is `blocked` and waits on `verdict:<task>`. Read its handoff first. To accept closes the task. To reject puts the task back on offer and lowers the autonomy level of its task definition one step. You cannot give the verdict on work that you handed in. While the definition is at the level `person`, only a person gives the verdict, at the command line."
+    )]
+    async fn verdict(&self, p: Parameters<VerdictParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let v = self
+            .memory
+            .verdict(&p.id, p.accept)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(v).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "The autonomy level of a task definition: `level` is what a completion under the version in force needs before it counts (`person`, `review` or `checks`), `ceiling` is the highest level that the text of the definition lets it earn, and `records` are its graded runs, raises and work outcomes."
+    )]
+    async fn autonomy(&self, p: Parameters<DefinitionParams>) -> Result<CallToolResult, McpError> {
+        let view = self
+            .memory
+            .autonomy(&p.0.definition)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(view).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Grade handoffs against the held-out suite of a task definition, for one level. Only the evaluator grades. Each answer names a scenario of the suite and the handoff that answers it. You cannot grade a handoff that you wrote. The run is recorded on the definition, passed or not."
+    )]
+    async fn grade(&self, p: Parameters<GradeParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let level: dm_ledger::Autonomy = parse("level", Some(p.level))?
+            .ok_or_else(|| McpError::invalid_params("level: a level", None))?;
+        let answers: Vec<crate::held_out::Answer> = p
+            .answers
+            .into_iter()
+            .map(|a| crate::held_out::Answer {
+                scenario: a.scenario,
+                handoff: a.handoff,
+            })
+            .collect();
+        let graded = self
+            .memory
+            .grade(&p.definition, level, &answers)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(graded).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "Raise the autonomy level of a task definition from `person` to `review`, on its newest graded run for `review`. The run must have passed on the suite in force, and no work outcome may be newer. Only the evaluator calls this. The step to `checks` is the sign-off of a person at the command line, and this tool refuses it."
+    )]
+    async fn raise_autonomy(
+        &self,
+        p: Parameters<DefinitionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let record = self.memory.raise(&p.0.definition).await.map_err(mcp_err)?;
+        ok(serde_json::to_value(record).unwrap_or_default())
+    }
+
+    #[tool(
+        description = "The gates that an entry of the platform needs before a person can verify it: `performance`, `safety` and `review`, each with `needed`, `met` and `why`, and `reach`, which says what the entry would change. Call it before you propose a candidate for verified."
+    )]
+    async fn candidate_gates(&self, p: Parameters<GetParams>) -> Result<CallToolResult, McpError> {
+        let gates = self
+            .memory
+            .candidate_gates(&p.0.id)
+            .await
+            .map_err(mcp_err)?;
+        ok(serde_json::to_value(gates).unwrap_or_default())
+    }
+
     #[tool(description = "Tasks in a domain with a status, ranked as the queue ranks them.")]
     async fn list_tasks(&self, p: Parameters<ListTasksParams>) -> Result<CallToolResult, McpError> {
         let p = p.0;
@@ -1473,6 +1812,96 @@ impl McpServer {
             .await
             .map_err(mcp_err)?;
         ok(json!({ "tasks": tasks }))
+    }
+
+    #[tool(
+        description = "One position: its charter and authority envelope, its open commitments (the open tasks pinned to it), its handoff cache, and the sessions that hold a task from it. `seat` is present when this session fills the position, and says whether it is seconded."
+    )]
+    async fn position(&self, p: Parameters<PositionParams>) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let view = self
+            .memory
+            .position(&p.name, p.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!(view))
+    }
+
+    #[tool(
+        description = "The positions of a domain, newest first: for each, whether it is active or retired, how many open tasks are pinned to it, which of them wait, the sessions live in it, and whether it needs a session started. An entry that is not in force says why."
+    )]
+    async fn positions(&self, p: Parameters<PositionsParams>) -> Result<CallToolResult, McpError> {
+        let listed = self
+            .memory
+            .positions(p.0.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!({ "positions": listed }))
+    }
+
+    #[tool(
+        description = "The settings of this session, which narrow what it reads: memory access, the disclosure depth, prefetch, the T0 contents, the highest trust tier, the snapshot, and transcript replay. `arm` names the evaluation arm with these settings, or is null. A launcher sets them once; no tool changes them."
+    )]
+    async fn settings(&self) -> Result<CallToolResult, McpError> {
+        let settings = self.memory.settings();
+        ok(json!({ "arm": crate::arms::Arm::of(&settings), "settings": settings }))
+    }
+
+    #[tool(
+        description = "The scorecards of evaluations that the record keeps, newest first. A scorecard compares the evaluation arms with a baseline arm: for each arm the paired differences in success and in cost, the verdict, the replay traps, and the drift window that the runs spanned. Served under this session's read filter."
+    )]
+    async fn scorecards(
+        &self,
+        p: Parameters<ScorecardsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let limit = p.0.limit.unwrap_or(10).clamp(1, MAX_LIMIT);
+        let kept = self.memory.scorecards(limit).await.map_err(mcp_err)?;
+        ok(json!({ "scorecards": kept }))
+    }
+
+    #[tool(
+        description = "Score an evaluation, as the owner of the record. `plan` is the TOML text of the plan that the runs started under. Each outcome names the session of one run and says whether the run succeeded, what it cost in tokens, and which judge decided. The task, the seed, the arm, the harness and the model come from the tape of the session. With `keep`, the scorecard is also written as a decision entry in the platform's domain."
+    )]
+    async fn score_evaluation(
+        &self,
+        p: Parameters<ScoreEvaluationParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let plan = crate::evaluation::Plan::parse(&p.plan).map_err(mcp_err)?;
+        let outcomes: Vec<crate::evaluation::Outcome> = p
+            .outcomes
+            .into_iter()
+            .map(|o| crate::evaluation::Outcome {
+                session: o.session,
+                success: o.success,
+                cost: o.cost,
+                judge: o.judge,
+            })
+            .collect();
+        let scorecard = self.memory.score(&plan, &outcomes).await.map_err(mcp_err)?;
+        let entry = if p.keep {
+            let kept = self.memory.keep_scorecard(&scorecard).await;
+            Some(kept.map_err(mcp_err)?.id)
+        } else {
+            None
+        };
+        ok(json!({ "scorecard": scorecard, "entry": entry }))
+    }
+
+    #[tool(
+        description = "Retire a position, as the owner of the record: its tasks lose their pin and return to matching, and its history stays under its name. `why` is words on one line."
+    )]
+    async fn retire_position(
+        &self,
+        p: Parameters<RetirePositionParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let p = p.0;
+        let retired = self
+            .memory
+            .retire_position(&p.name, &p.why, p.domain.as_deref())
+            .await
+            .map_err(mcp_err)?;
+        ok(json!(retired))
     }
 }
 
@@ -1486,7 +1915,9 @@ fn t0_uri(domain: &str) -> String {
 
 impl McpServer {
     /// One call through the router; a harness's call is kept on the session's tape, and in
-    /// a re-run answered from the tape first.
+    /// a re-run answered from the tape first. A harness's call is asked of the session's
+    /// settings before it is served; the launcher's own calls are not, and get the empty
+    /// answers the read filter gives.
     async fn routed(
         &self,
         request: CallToolRequestParams,
@@ -1524,11 +1955,9 @@ impl McpServer {
                 }
                 tape::Answer::Refused(why) => return Err(McpError::invalid_params(why, None)),
             }
-            let tcc = ToolCallContext::new(self, request, context);
-            return self.tool_router.call(tcc).await;
+            return self.admitted(&tool, request, context).await;
         }
-        let tcc = ToolCallContext::new(self, request, context);
-        let result = self.tool_router.call(tcc).await;
+        let result = self.admitted(&tool, request, context).await;
         let (value, is_error) = to_tape(&result);
         if let Err(e) = self
             .memory
@@ -1538,6 +1967,21 @@ impl McpServer {
             eprintln!("amem: {tool} was not kept on the tape: {e}");
         }
         result
+    }
+}
+
+impl McpServer {
+    /// A harness's call, served when the session's settings admit the tool. A refusal
+    /// names the setting, and is the call's result like any other error.
+    async fn admitted(
+        &self,
+        tool: &str,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResponse, McpError> {
+        self.memory.admits_tool(tool).map_err(mcp_err)?;
+        let tcc = ToolCallContext::new(self, request, context);
+        self.tool_router.call(tcc).await
     }
 }
 
@@ -1685,9 +2129,22 @@ mod tests {
             "task_tree",
             "retry_task",
             "promotions",
+            "erase",
+            "declassify",
+            "position",
+            "positions",
+            "retire_position",
+            "settings",
+            "scorecards",
+            "score_evaluation",
             "lineage",
             "log",
             "outside_readers",
+            "verdict",
+            "autonomy",
+            "grade",
+            "raise_autonomy",
+            "candidate_gates",
         ] {
             assert!(
                 names.contains(&expected),
@@ -1706,6 +2163,25 @@ mod tests {
                 t.name
             );
         }
+    }
+
+    /// An agent reaches every tool of the memory server, so the server has no tool that
+    /// approves: a person approves at the command line. The two gated actions are tools,
+    /// and a re-run captures them as it captures a write.
+    #[test]
+    fn the_gated_actions_are_tools_and_no_tool_approves() {
+        let router = McpServer::tool_router();
+        let tools = router.list_all();
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+        for gated in ["erase", "declassify"] {
+            assert!(names.contains(&gated), "missing tool {gated}: {names:?}");
+            assert_eq!(kind_of(gated), tape::Kind::Mutation, "{gated}");
+        }
+        let approving: Vec<&&str> = names
+            .iter()
+            .filter(|n| n.contains("approv") || n.contains("sign_off"))
+            .collect();
+        assert!(approving.is_empty(), "a tool that approves: {approving:?}");
     }
 
     #[test]
@@ -1888,7 +2364,10 @@ mod tests {
         else {
             panic!("proposed")
         };
-        s.memory.approve(&task.id).await.unwrap();
+        // a served session approves nothing: the owner approves in a session of its own
+        let owner = crate::Memory::open(s.memory.root()).unwrap();
+        owner.approve(&task.id).await.unwrap();
+        s.memory.reload_policy().await.unwrap();
         let rules = payload(
             &s.check_policy(Parameters(CheckPolicyParams {
                 action: "tag a release".into(),
@@ -1926,6 +2405,113 @@ mod tests {
         assert_eq!(filed["exception"]["task"]["requirements"][0], "human");
         let none = s.propose_amendment(Parameters(amend(""))).await;
         assert!(none.is_err());
+    }
+
+    const AGENT: &str = "agent:x";
+
+    /// A server over the session of an agent, and the owner in person on the same root.
+    fn agent_and_owner() -> (tempfile::TempDir, McpServer, Memory) {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = Memory::init(dir.path(), "human:test:me", "dom-me").unwrap();
+        let agent = Memory::open(dir.path()).unwrap().with_author(AGENT);
+        (dir, McpServer::new(Arc::new(agent)), owner)
+    }
+
+    /// An entry of the owner at a label.
+    async fn entry_at(owner: &Memory, label: dm_core::Label, body: &str) -> String {
+        let req = WriteRequest {
+            title: Some("Door code".into()),
+            body: body.into(),
+            classification: Some(label),
+            ..WriteRequest::default()
+        };
+        owner.write(req).await.unwrap().id
+    }
+
+    /// A refusal of a tool: its message, which is in the class of a bad request.
+    fn refusal_text(answer: Result<CallToolResult, McpError>) -> String {
+        let invalid = McpError::invalid_params("", None).code;
+        match answer {
+            Err(e) if e.code == invalid => e.message.to_string(),
+            other => panic!("expected a refusal: {other:?}"),
+        }
+    }
+
+    /// An erasure that an agent asks for over the memory server is refused, and the
+    /// refusal names the task that asks the owner. After the owner signed that task off
+    /// in person, the same call erases.
+    #[tokio::test]
+    async fn erase_over_mcp_waits_for_the_owner_s_approval_and_then_gives_the_receipt() {
+        let (_dir, s, owner) = agent_and_owner();
+        let id = entry_at(&owner, dm_core::Label::Internal, "The door code is 4417.").await;
+        let erase = |reason: &str| {
+            s.erase(Parameters(EraseParams {
+                id: id.clone(),
+                reason: reason.into(),
+            }))
+        };
+        let bad = refusal_text(erase("because").await);
+        assert!(bad.contains("reason: reason \"because\" is not"), "{bad}");
+        let why = refusal_text(erase("mistaken").await);
+        let named = why
+            .split_once("Task ")
+            .and_then(|(_, rest)| rest.split_once(" asks human:test:me for it."));
+        let Some((task, _)) = named else {
+            panic!("the refusal names no task: {why}")
+        };
+        // the reason that did not parse asked nobody: this is the one request
+        let asked = owner.tasks(None, dm_ledger::Status::Open).await.unwrap();
+        let asked: Vec<&str> = asked.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(asked, [task]);
+        assert!(
+            owner.get(&id).await.is_ok(),
+            "a refused erasure erases nothing"
+        );
+        owner.sign_off(task, None).await.unwrap();
+        let receipt = payload(&erase("mistaken").await.unwrap());
+        assert_eq!(receipt["id"], id.as_str());
+        assert_eq!(receipt["erased_by"], AGENT);
+        assert_eq!(receipt["reason"], "mistaken");
+        assert!(matches!(owner.get(&id).await, Err(Error::Gone(_))));
+    }
+
+    fn copy_at(id: &str, label: &str) -> Parameters<DeclassifyParams> {
+        Parameters(DeclassifyParams {
+            id: id.into(),
+            target_label: label.into(),
+            justification: "Every visitor gets the code at the door.".into(),
+        })
+    }
+
+    /// A declassification that an agent asks for over the memory server is `proposed`,
+    /// with the task for the guard. After the guard signed that task off in person, the
+    /// same call lands the copy at the label that the call named.
+    #[tokio::test]
+    async fn declassify_over_mcp_is_proposed_and_lands_after_the_guard_s_approval() {
+        let (_dir, s, owner) = agent_and_owner();
+        let id = entry_at(&owner, dm_core::Label::Restricted, "The door code is 4417.").await;
+        let bad = refusal_text(s.declassify(copy_at(&id, "secret")).await);
+        assert!(bad.contains("target_label: "), "{bad}");
+        let asked = payload(&s.declassify(copy_at(&id, "internal")).await.unwrap());
+        assert_eq!(asked["outcome"], "proposed", "{asked}");
+        let title = format!("Approve: copy of {id} at internal");
+        assert_eq!(asked["task"]["title"], title.as_str());
+        assert_eq!(asked["task"]["created_by"], AGENT);
+        let task = asked["task"]["id"].as_str().unwrap();
+        owner.sign_off(task, None).await.unwrap();
+        let landed = payload(&s.declassify(copy_at(&id, "internal")).await.unwrap());
+        assert_eq!(landed["outcome"], "declassified", "{landed}");
+        assert_eq!(landed["classification"], "internal");
+        let cites = landed["cites"].as_str().unwrap();
+        assert!(cites.starts_with(&format!("{id}@")), "{cites}");
+        let copy = owner.get(landed["id"].as_str().unwrap()).await.unwrap();
+        assert_eq!(copy.front.classification, dm_core::Label::Internal);
+        assert_eq!(copy.front.cites, [cites]);
+        // the approval was of a copy at internal: a copy at public is another request
+        let lower = payload(&s.declassify(copy_at(&id, "public")).await.unwrap());
+        assert_eq!(lower["outcome"], "proposed", "{lower}");
+        let title = format!("Approve: copy of {id} at public");
+        assert_eq!(lower["task"]["title"], title.as_str());
     }
 
     /// The same call made twice under one key, as after an answer that did not arrive.
@@ -2233,6 +2819,15 @@ mod tests {
         });
         assert_eq!(invalid.code, also.code);
         assert_eq!(invalid.code, ledger.code);
+        // a pin the caller got wrong, or does not fill, is the caller's to act on
+        let pinned = mcp_err(Error::Ledger(dm_ledger::Error::Pinned {
+            id: "t".into(),
+            position: "pos-a-qa".into(),
+        }));
+        assert_eq!(pinned.code, invalid.code);
+        assert!(pinned.message.contains("pinned to position pos-a-qa"));
+        let bad_pin = mcp_err(Error::Ledger(dm_ledger::Error::BadPin("no reason".into())));
+        assert_eq!(bad_pin.code, invalid.code);
         assert_ne!(invalid.code, internal.code);
         // a stopped session is told so in words it can act on, as a refusal is
         let stopped = mcp_err(Error::Stale("the grants changed".into()));
@@ -2376,6 +2971,349 @@ mod tests {
         );
         assert!(none["task"].is_null(), "{none}");
         assert_eq!(s.memory.label(), dm_core::Label::Public);
+    }
+
+    const RELEASE: &str = "pos-release";
+
+    /// Write the position `pos-release`, which `codex` fills, through the `write` tool,
+    /// and leave it as a person other than its proposer would: verified.
+    async fn release_position(s: &McpServer) -> String {
+        let block = "```position pos-release\n[charter]\norders = \"Each release is cut from main.\"\ncovers = []\nagent = \"codex\"\n\n[envelope]\ntools = []\nhandling = \"restricted\"\n```\n";
+        let written = payload(
+            &s.write(Parameters(WriteParams {
+                body: format!("# The release coordinator\n\n{block}"),
+                entry_type: Some("position".into()),
+                ..WriteParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        let id = written["id"].as_str().unwrap().to_string();
+        let mut e = s.memory.store.get("dom-me", &id).await.unwrap().unwrap();
+        e.front.trust_tier = dm_core::TrustTier::Verified;
+        s.memory.store.put(&e).await.unwrap();
+        id
+    }
+
+    fn pinned(title: &str, position: Option<&str>, reason: Option<&str>) -> CreateTaskParams {
+        CreateTaskParams {
+            title: title.into(),
+            body: "Do it.".into(),
+            position: position.map(str::to_string),
+            pin_reason: reason.map(str::to_string),
+            ..CreateTaskParams::default()
+        }
+    }
+
+    /// File a task pinned to `pos-release` for continuity, and admit it.
+    async fn admitted_pinned(s: &McpServer, title: &str) -> String {
+        let filed = s
+            .create_task(Parameters(pinned(title, Some(RELEASE), Some("continuity"))))
+            .await
+            .unwrap();
+        let filed = payload(&filed);
+        assert_eq!(filed["task"]["position"], RELEASE, "{filed}");
+        assert_eq!(filed["task"]["pin_reason"], "continuity", "{filed}");
+        let id = filed["task"]["id"].as_str().unwrap().to_string();
+        s.admit_task(Parameters(TaskIdParams { id: id.clone() }))
+            .await
+            .unwrap();
+        id
+    }
+
+    fn refusal<T>(r: Result<T, McpError>) -> McpError {
+        match r {
+            Err(e) => e,
+            Ok(_) => panic!("it was allowed"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_task_refuses_half_a_pin_and_an_unknown_reason_as_invalid_params() {
+        let (_dir, s) = server().await;
+        release_position(&s).await;
+        let invalid = McpError::invalid_params("x", None).code;
+        let no_reason = refusal(
+            s.create_task(Parameters(pinned("Announce", Some(RELEASE), None)))
+                .await,
+        );
+        assert_eq!(no_reason.code, invalid);
+        assert!(
+            no_reason
+                .message
+                .contains("a pin names a position and gives a reason"),
+            "{}",
+            no_reason.message
+        );
+        let unknown = refusal(
+            s.create_task(Parameters(pinned("Announce", Some(RELEASE), Some("habit"))))
+                .await,
+        );
+        assert_eq!(unknown.code, invalid);
+        assert!(
+            unknown.message.starts_with("pin_reason:") && unknown.message.contains("\"habit\""),
+            "{}",
+            unknown.message
+        );
+        let none = payload(
+            &s.list_tasks(Parameters(ListTasksParams {
+                status: Some("proposed".into()),
+                ..ListTasksParams::default()
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(none["tasks"], json!([]), "a refused task is not filed");
+    }
+
+    #[tokio::test]
+    async fn a_pinned_task_is_refused_to_a_claim_from_outside_its_position() {
+        let (_dir, s) = server().await;
+        release_position(&s).await;
+        let id = admitted_pinned(&s, "Announce release 1.4").await;
+        let refused = refusal(
+            s.claim(Parameters(LeaseParams {
+                id: id.clone(),
+                lease_seconds: Some(60),
+            }))
+            .await,
+        );
+        assert_eq!(refused.code, McpError::invalid_params("x", None).code);
+        assert!(
+            refused.message.contains("pinned to position pos-release"),
+            "{}",
+            refused.message
+        );
+        let next = payload(
+            &s.claim_next(Parameters(ClaimNextParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert!(next["task"].is_null(), "{next}");
+    }
+
+    #[tokio::test]
+    async fn positions_lists_a_verified_position_with_what_waits_on_it() {
+        let (_dir, s) = server().await;
+        let entry = release_position(&s).await;
+        let id = admitted_pinned(&s, "Announce release 1.4").await;
+        let listed = payload(
+            &s.positions(Parameters(PositionsParams::default()))
+                .await
+                .unwrap(),
+        );
+        let row = &listed["positions"][0];
+        assert_eq!(listed["positions"].as_array().map(Vec::len), Some(1));
+        assert_eq!(row["name"], RELEASE, "{listed}");
+        assert_eq!(row["entry"], entry, "{listed}");
+        assert_eq!(row["state"], "active", "{listed}");
+        assert_eq!(row["agent"], "codex", "{listed}");
+        assert_eq!(row["pinned"], 1, "{listed}");
+        assert_eq!(row["waiting"], json!([id]), "{listed}");
+        assert_eq!(row["wake"], true, "{listed}");
+        // both tools only read the record: a re-run that diverged still serves them
+        assert_eq!(kind_of("position"), tape::Kind::Read);
+        assert_eq!(kind_of("positions"), tape::Kind::Read);
+        assert_eq!(kind_of("retire_position"), tape::Kind::Mutation);
+    }
+
+    #[tokio::test]
+    async fn position_shows_a_verified_position_with_its_commitments() {
+        let (_dir, s) = server().await;
+        let entry = release_position(&s).await;
+        let id = admitted_pinned(&s, "Announce release 1.4").await;
+        let view = payload(
+            &s.position(Parameters(PositionParams {
+                name: RELEASE.into(),
+                domain: Some("dom-me".into()),
+            }))
+            .await
+            .unwrap(),
+        );
+        assert_eq!(view["name"], RELEASE, "{view}");
+        assert_eq!(view["entry"], entry, "{view}");
+        assert_eq!(view["charter"]["agent"], "codex", "{view}");
+        assert_eq!(view["envelope"]["handling"], "restricted", "{view}");
+        assert_eq!(view["commitments"][0]["id"], id, "{view}");
+        assert_eq!(view["handoffs"], json!([]), "{view}");
+        assert!(view.get("seat").is_none(), "{view}");
+        let missing = refusal(
+            s.position(Parameters(PositionParams {
+                name: "pos-none".into(),
+                domain: None,
+            }))
+            .await,
+        );
+        assert!(missing.message.contains("pos-none"), "{}", missing.message);
+    }
+
+    #[tokio::test]
+    async fn retire_position_is_the_owner_s_and_unpins_the_tasks() {
+        let (dir, s) = server().await;
+        release_position(&s).await;
+        let id = admitted_pinned(&s, "Announce release 1.4").await;
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:codex (model: test-1)");
+        let agent = McpServer::new(Arc::new(agent));
+        let retire = || {
+            Parameters(RetirePositionParams {
+                name: RELEASE.into(),
+                why: "the release train ended".into(),
+                domain: None,
+            })
+        };
+        let refused = refusal(agent.retire_position(retire()).await);
+        assert_eq!(refused.code, McpError::invalid_params("x", None).code);
+        assert!(
+            refused.message.contains("only the owner"),
+            "{}",
+            refused.message
+        );
+        let retired = payload(&s.retire_position(retire()).await.unwrap());
+        assert_eq!(retired["position"], RELEASE, "{retired}");
+        assert_eq!(retired["unpinned"], json!([id]), "{retired}");
+        let listed = payload(
+            &s.positions(Parameters(PositionsParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(listed["positions"][0]["state"], "retired", "{listed}");
+        assert_eq!(listed["positions"][0]["entry"], retired["retired_by"]);
+        // the task returned to matching: a session in no position claims it
+        let claimed = payload(
+            &agent
+                .claim(Parameters(LeaseParams {
+                    id: id.clone(),
+                    lease_seconds: Some(60),
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(claimed["task"]["id"], id, "{claimed}");
+        assert!(claimed["task"].get("position").is_none(), "{claimed}");
+    }
+
+    const PLAN: &str = "preamble = \"Read the record. \"\n[plan]\nname = \"demo\"\ndomain = \"dom-me\"\nbaseline = \"no-memory\"\narms = [\"no-memory\", \"full\"]\nseeds = 2\nmargin = 0.1\njudge = \"regex\"\n[[task]]\nid = \"a\"\nprompt = \"What is A?\"\nexpect = \"A\"\n";
+
+    /// One run of the plan that keeps the head of its tape, as an outcome.
+    async fn evaluation_run(
+        dir: &std::path::Path,
+        seed: u32,
+        arm: crate::arms::Arm,
+    ) -> OutcomeParams {
+        let plan = crate::evaluation::Plan::parse(PLAN).unwrap();
+        let m = Memory::open(dir).unwrap().with_author("agent:claude");
+        let launched = crate::evaluation::Launched {
+            harness: "claude",
+            model: None,
+        };
+        let as_of = time::macros::datetime!(2020-01-01 00:00:00 UTC);
+        m.start_evaluation(&plan, ("a", seed, arm), as_of, launched)
+            .unwrap();
+        m.tape_start(tape::TapeStart {
+            harness: "claude".into(),
+            prompt: plan.prompt_of("a"),
+            ..tape::TapeStart::default()
+        })
+        .await
+        .unwrap();
+        OutcomeParams {
+            session: m.session_id().to_string(),
+            success: true,
+            cost: if arm == crate::arms::Arm::Full {
+                600
+            } else {
+                1000
+            },
+            judge: "regex".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn score_evaluation_scores_and_keeps_and_scorecards_reads_it_back() {
+        let (dir, _) = server().await;
+        let path = dir.path().join(crate::GRANTS_FILE);
+        let mut g = dm_policy::Grants::load(&path).unwrap();
+        g.platform = Some("dom-me".into());
+        std::fs::write(&path, g.render().unwrap()).unwrap();
+        let s = McpServer::new(Arc::new(Memory::open(dir.path()).unwrap()));
+        let none = payload(
+            &s.scorecards(Parameters(ScorecardsParams::default()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(none, json!({ "scorecards": [] }));
+        let mut outcomes = Vec::new();
+        for seed in [0, 1] {
+            outcomes.push(evaluation_run(dir.path(), seed, crate::arms::Arm::NoMemory).await);
+            outcomes.push(evaluation_run(dir.path(), seed, crate::arms::Arm::Full).await);
+        }
+        let params = |plan: &str, outcomes: Vec<OutcomeParams>, keep: bool| {
+            Parameters(ScoreEvaluationParams {
+                plan: plan.into(),
+                outcomes,
+                keep,
+            })
+        };
+        // a plan that is refused, and an evaluation that is refused, say why
+        let no_plan = refusal(
+            s.score_evaluation(params("preamble = \"x\"", Vec::new(), false))
+                .await,
+        );
+        assert!(
+            no_plan.message.contains("[plan] table"),
+            "{}",
+            no_plan.message
+        );
+        let no_outcome = refusal(s.score_evaluation(params(PLAN, Vec::new(), false)).await);
+        assert!(
+            no_outcome.message.contains("one outcome or more"),
+            "{}",
+            no_outcome.message
+        );
+        let scored = payload(
+            &s.score_evaluation(params(PLAN, outcomes, true))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(scored["scorecard"]["plan"], "demo", "{scored}");
+        assert_eq!(scored["scorecard"]["arms"][1]["pairs"], 2, "{scored}");
+        assert_eq!(
+            scored["scorecard"]["arms"][1]["finding"], "pays",
+            "{scored}"
+        );
+        // one task, with no task that failed and no frozen task: two traps are open
+        assert_eq!(
+            scored["scorecard"]["arms"][1]["verdict"]["inconclusive"]["traps"],
+            json!(["survivorship", "distribution-shift"]),
+            "{scored}"
+        );
+        let entry = scored["entry"].as_str().expect("kept").to_string();
+        let kept = payload(
+            &s.scorecards(Parameters(ScorecardsParams { limit: Some(5) }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(kept["scorecards"][0]["entry"], entry, "{kept}");
+        assert_eq!(kept["scorecards"][0]["scorecard"], scored["scorecard"]);
+        // scoring is the owner's; a re-run that diverged still reads the scorecards
+        let agent = Memory::open(dir.path())
+            .unwrap()
+            .with_author("agent:claude");
+        let agent = McpServer::new(Arc::new(agent));
+        let refused = refusal(
+            agent
+                .score_evaluation(params(PLAN, Vec::new(), false))
+                .await,
+        );
+        assert!(
+            refused.message.contains("the owner's"),
+            "{}",
+            refused.message
+        );
+        assert_eq!(kind_of("scorecards"), tape::Kind::Read);
+        assert_eq!(kind_of("score_evaluation"), tape::Kind::Mutation);
     }
 
     /// A server over the record at `dir`, for a session of `author`.
@@ -2895,5 +3833,282 @@ mod tests {
         assert_eq!(kind_of("log"), tape::Kind::Read);
         assert_eq!(kind_of("outside_readers"), tape::Kind::Read);
         assert_eq!(kind_of("write"), tape::Kind::Mutation);
+    }
+
+    /// The autonomy level, the grade and the gates over the memory server.
+    mod levels {
+        use super::*;
+        use crate::testing::{as_author, held_out_root, written, written_in, EVALUATOR};
+        use dm_ledger::{Autonomy, DefinitionChange, Status};
+        use std::path::Path;
+
+        const OWNER: &str = "human:test:me";
+
+        /// A definition whose text lets it earn the highest level.
+        const TIDY: &str = "# Tidy a module\n\n```platform task tidy\npurpose = \"Tidy one module.\"\nacceptance = [\"The handoff names each file that changed.\"]\noutputs = [\"handoff\"]\nautonomy = \"checks\"\n```\n";
+
+        /// One scenario, and a pass mark of one for `review` and for `checks`.
+        const SUITE: &str = "# The suite for tidy\n\n```platform suite tidy\n[pass]\nreview = 1\nchecks = 1\n\n[[scenario]]\nname = \"files question\"\nask = \"Which files changed?\"\nexpect = [\"src/importer\"]\n```\n";
+
+        /// A root with a held-out domain, and the definition `tidy` and its suite, both
+        /// verified: the owner in person, and the entry of the definition.
+        async fn tidy_root(dir: &Path) -> (Memory, String) {
+            let owner = held_out_root(dir);
+            let entry = written(&owner, TIDY, true).await;
+            written_in(&owner, "dom-held", SUITE, true).await;
+            (owner, entry)
+        }
+
+        /// A server over a new session of `author`.
+        fn server_of(dir: &Path, author: &str) -> McpServer {
+            McpServer::new(Arc::new(as_author(dir, author)))
+        }
+
+        /// A handoff in `dom-me` that passes the scenario of the suite.
+        async fn passing_handoff(s: &McpServer) -> String {
+            let h = WriteParams {
+                domain: Some("dom-me".into()),
+                ..handoff("Changed src/importer.rs.\n").0
+            };
+            let w = payload(&s.write(Parameters(h)).await.unwrap());
+            w["id"].as_str().unwrap().to_string()
+        }
+
+        /// A task under `tidy` that `worker` claimed and completed over the memory
+        /// server: the task and its handoff. The completion parks the task.
+        async fn handed_in(owner: &Memory, dir: &Path, worker: &str) -> (String, String) {
+            let spec = dm_ledger::TaskSpec {
+                domain: "dom-me".into(),
+                title: "Tidy the importer".into(),
+                body: "Do it.\n".into(),
+                definition: Some("tidy".into()),
+                ..dm_ledger::TaskSpec::default()
+            };
+            let task = owner.create_task(spec).await.unwrap().task;
+            if task.status == Status::Proposed {
+                owner.admit(&task.id).await.unwrap();
+            }
+            let s = server_of(dir, worker);
+            let lease = LeaseParams {
+                id: task.id.clone(),
+                lease_seconds: None,
+            };
+            s.claim(Parameters(lease)).await.unwrap();
+            let h = passing_handoff(&s).await;
+            let done = CompleteParams {
+                id: task.id.clone(),
+                handoff: h.clone(),
+                ..CompleteParams::default()
+            };
+            let parked = payload(&s.complete(Parameters(done)).await.unwrap());
+            assert_eq!(parked["task"]["status"], "blocked", "{parked}");
+            let event = format!("verdict:{}", task.id);
+            assert_eq!(parked["task"]["waiting_on"], event.as_str(), "{parked}");
+            (task.id, h)
+        }
+
+        fn accept(task: &str) -> Parameters<VerdictParams> {
+            Parameters(VerdictParams {
+                id: task.into(),
+                accept: true,
+            })
+        }
+
+        fn tidy() -> Parameters<DefinitionParams> {
+            Parameters(DefinitionParams {
+                definition: "tidy".into(),
+            })
+        }
+
+        fn run(level: &str, handoff: &str) -> Parameters<GradeParams> {
+            Parameters(GradeParams {
+                definition: "tidy".into(),
+                level: level.into(),
+                answers: vec![GradeAnswer {
+                    scenario: "files question".into(),
+                    handoff: handoff.into(),
+                }],
+            })
+        }
+
+        /// At the level `person`, the verdict is a person's in person. The memory
+        /// server serves a harness, so it refuses the verdict whatever the name of the
+        /// session is. The same person at the command line gives it.
+        #[tokio::test]
+        async fn a_verdict_at_person_is_refused_over_the_memory_server_whatever_the_name() {
+            let dir = tempfile::tempdir().unwrap();
+            let (owner, _) = tidy_root(dir.path()).await;
+            let (task, _) = handed_in(&owner, dir.path(), "agent:w").await;
+            for name in [OWNER, "agent:r"] {
+                let why = refusal_text(server_of(dir.path(), name).verdict(accept(&task)).await);
+                let said = "only a person gives the verdict on work at the level person";
+                assert!(why.contains(said), "{name}: {why}");
+            }
+            let waits = owner.get_task(&task).await.unwrap();
+            assert_eq!(waits.status, Status::Blocked);
+            let given = owner.verdict(&task, true).await.unwrap();
+            assert_eq!(given.task.status, Status::Done);
+        }
+
+        /// At the level `review`, the worker's own verdict is refused, and the verdict
+        /// of another agent over the memory server closes the task.
+        #[tokio::test]
+        async fn a_verdict_at_review_from_another_agent_closes_the_task() {
+            let dir = tempfile::tempdir().unwrap();
+            let (owner, _) = tidy_root(dir.path()).await;
+            let reference = owner.autonomy("tidy").await.unwrap().definition;
+            let raised = DefinitionChange::Raised {
+                to: Autonomy::Review,
+                run: "def-plat-test".into(),
+                signed_by: None,
+            };
+            {
+                let mut l = owner.ledger.lock().await;
+                l.record_definition("dom-plat", &reference, raised)
+                    .await
+                    .unwrap();
+            }
+            let (task, h) = handed_in(&owner, dir.path(), "agent:w").await;
+            let own = refusal_text(
+                server_of(dir.path(), "agent:w")
+                    .verdict(accept(&task))
+                    .await,
+            );
+            assert!(
+                own.contains("nobody gives the verdict on its own work"),
+                "{own}"
+            );
+            let reviewer = server_of(dir.path(), "agent:r");
+            let given = payload(&reviewer.verdict(accept(&task)).await.unwrap());
+            assert_eq!(given["accepted"], true, "{given}");
+            assert_eq!(given["level"], "review", "{given}");
+            assert_eq!(given["task"]["status"], "done", "{given}");
+            assert_eq!(given["task"]["handoff"], h.as_str(), "{given}");
+            let done = owner.get_task(&task).await.unwrap();
+            assert_eq!(done.status, Status::Done);
+        }
+
+        /// Only the evaluator grades over the memory server. The level is one of the
+        /// three names. The run that the tool gives is the record on the ledger.
+        #[tokio::test]
+        async fn grade_over_the_memory_server_is_the_evaluator_s_and_records_the_run() {
+            let dir = tempfile::tempdir().unwrap();
+            let (owner, _) = tidy_root(dir.path()).await;
+            let h = passing_handoff(&server_of(dir.path(), "agent:w")).await;
+            let other = refusal_text(
+                server_of(dir.path(), "agent:x")
+                    .grade(run("review", &h))
+                    .await,
+            );
+            assert!(
+                other.contains("only the evaluator grades a task definition"),
+                "{other}"
+            );
+            let evaluator = server_of(dir.path(), EVALUATOR);
+            let bad = refusal_text(evaluator.grade(run("expert", &h)).await);
+            assert!(
+                bad.contains("level: \"expert\" is not person, review or checks"),
+                "{bad}"
+            );
+            assert_eq!(owner.autonomy("tidy").await.unwrap().records, []);
+            let graded = payload(&evaluator.grade(run("review", &h)).await.unwrap());
+            assert_eq!(graded["pass"], true, "{graded}");
+            assert_eq!(graded["failed"], json!([]), "{graded}");
+            assert_eq!(graded["record"]["change"], "graded", "{graded}");
+            assert_eq!(graded["record"]["level"], "review", "{graded}");
+            assert_eq!(graded["record"]["by"], EVALUATOR, "{graded}");
+            let records = owner.autonomy("tidy").await.unwrap().records;
+            assert_eq!(
+                serde_json::to_value(&records).unwrap(),
+                json!([graded["record"]])
+            );
+        }
+
+        /// The evaluator takes the step to `review` over the memory server. The step
+        /// to `checks` is refused there, from the evaluator and from a session with
+        /// the name of the owner: the owner takes it in person.
+        #[tokio::test]
+        async fn raise_autonomy_takes_the_step_to_review_and_refuses_the_step_to_checks() {
+            let dir = tempfile::tempdir().unwrap();
+            let (owner, _) = tidy_root(dir.path()).await;
+            let reference = owner.autonomy("tidy").await.unwrap().definition;
+            let h = passing_handoff(&server_of(dir.path(), "agent:w")).await;
+            let evaluator = server_of(dir.path(), EVALUATOR);
+            evaluator.grade(run("review", &h)).await.unwrap();
+            let worker = refusal_text(
+                server_of(dir.path(), "agent:w")
+                    .raise_autonomy(tidy())
+                    .await,
+            );
+            assert!(
+                worker.contains("or the evaluator raises a task definition to the level review"),
+                "{worker}"
+            );
+            let raised = payload(&evaluator.raise_autonomy(tidy()).await.unwrap());
+            assert_eq!(raised["change"], "raised", "{raised}");
+            assert_eq!(raised["to"], "review", "{raised}");
+            assert_eq!(raised["definition"], reference.as_str(), "{raised}");
+            evaluator.grade(run("checks", &h)).await.unwrap();
+            for name in [EVALUATOR, OWNER] {
+                let why = refusal_text(server_of(dir.path(), name).raise_autonomy(tidy()).await);
+                let said = "only a person signs a task definition off for the level checks";
+                assert!(why.contains(said), "{name}: {why}");
+            }
+            let level = owner.level_of(&reference).await.unwrap();
+            assert_eq!(level, Autonomy::Review);
+            let signed = owner.raise("tidy").await.unwrap();
+            assert!(
+                matches!(&signed.change, DefinitionChange::Raised { to: Autonomy::Checks, signed_by: Some(by), .. } if by == OWNER),
+                "{signed:?}"
+            );
+        }
+
+        /// The two reads give what the library gives to the same principal.
+        #[tokio::test]
+        async fn autonomy_and_candidate_gates_give_what_the_library_gives() {
+            let dir = tempfile::tempdir().unwrap();
+            let (_owner, entry) = tidy_root(dir.path()).await;
+            let s = server_of(dir.path(), "agent:x");
+            let library = as_author(dir.path(), "agent:x");
+            let view = payload(&s.autonomy(tidy()).await.unwrap());
+            let same = library.autonomy("tidy").await.unwrap();
+            assert_eq!(view, serde_json::to_value(&same).unwrap());
+            assert_eq!(view["definition"], format!("tidy@{entry}").as_str());
+            assert_eq!(view["level"], "person", "{view}");
+            assert_eq!(view["ceiling"], "checks", "{view}");
+            let id = Parameters(GetParams { id: entry.clone() });
+            let gates = payload(&s.candidate_gates(id).await.unwrap());
+            let same = library.candidate_gates(&entry).await.unwrap();
+            assert_eq!(gates, serde_json::to_value(&same).unwrap());
+            assert_eq!(gates["entry"], entry.as_str(), "{gates}");
+            assert_eq!(gates["review"]["needed"], true, "{gates}");
+            assert_eq!(gates["review"]["met"], true, "{gates}");
+        }
+
+        /// A re-run serves the two reads from the record as it is, and captures the
+        /// other three as it captures a write. A work outcome is a person's at the
+        /// command line, and a list of who is flagged would tell an agent where the
+        /// threshold is: no tool does either. The tools `record_outcome` and `outcomes`
+        /// are for the outcome event of a task, which is on no definition and moves no
+        /// level.
+        #[test]
+        fn the_reads_are_reads_and_no_tool_records_a_work_outcome_or_lists_probing() {
+            for read in ["autonomy", "candidate_gates"] {
+                assert_eq!(kind_of(read), tape::Kind::Read, "{read}");
+            }
+            for change in ["verdict", "grade", "raise_autonomy"] {
+                assert_eq!(kind_of(change), tape::Kind::Mutation, "{change}");
+            }
+            let router = McpServer::tool_router();
+            let tools = router.list_all();
+            let names: Vec<&str> = tools.iter().map(|t| t.name.as_ref()).collect();
+            let of_an_outcome_event = ["record_outcome", "outcomes"];
+            let neither: Vec<&&str> = names
+                .iter()
+                .filter(|n| n.contains("outcome") || n.contains("probing"))
+                .filter(|n| !of_an_outcome_event.contains(n))
+                .collect();
+            assert!(neither.is_empty(), "a tool that should not be: {neither:?}");
+        }
     }
 }

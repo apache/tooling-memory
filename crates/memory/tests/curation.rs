@@ -429,6 +429,7 @@ fn a_curation_cycle_files_what_each_pass_finds_and_drift_once_the_model_is_repoi
     assert_eq!(log.lines().count(), 2, "{log}");
 
     the_ledger_holds_what_the_passes_filed(&f);
+    the_drift_opened_a_window(&f);
     // the curator's telemetry, read and filed
     let t = f.json(&["curator", "--domain", "dom-me", "--telemetry"]);
     assert_eq!(t["by_author"]["human:test:me"]["writes"], 6, "{t}");
@@ -659,6 +660,26 @@ fn a_qualification_decides_the_mode_and_the_model_of_the_auditor_in_a_cycle() {
     assert_eq!(cycle["auditor_mode"], "other-model", "{cycle}");
     assert_eq!(cycle["qualified"], true, "{cycle}");
     assert_eq!(cycle["human_review"], 1, "the other-model mode: {cycle}");
+}
+
+/// The drift that the second cycle confirmed opened one drift window, which starts at
+/// the run before the one that fired: the first cycle's run.
+fn the_drift_opened_a_window(f: &Fixture) {
+    let windows = f.json(&["drift", "window", "list"]);
+    let windows = windows.as_array().unwrap();
+    assert_eq!(windows.len(), 1, "{windows:?}");
+    let w = &windows[0];
+    let runs = f
+        .root
+        .join("state/drift")
+        .join(w["destination"].as_str().unwrap())
+        .join(format!("{}.jsonl", w["model"].as_str().unwrap()));
+    let runs = std::fs::read_to_string(&runs).unwrap();
+    let first: serde_json::Value = serde_json::from_str(runs.lines().next().unwrap()).unwrap();
+    assert_eq!(runs.lines().count(), 2, "one run for each cycle");
+    assert_eq!(w["from"], first["at"], "{w}");
+    assert_eq!(w["until"], serde_json::Value::Null, "{w}");
+    assert!(!w["detectors"].as_array().unwrap().is_empty(), "{w}");
 }
 
 #[test]

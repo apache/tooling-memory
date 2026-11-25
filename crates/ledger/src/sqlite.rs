@@ -4,11 +4,10 @@
 //! ledger under an async lock, so the mutex is never contended.
 
 use crate::{
-    check_holder, claimable, parse_time, Claimant, Error, Event, Held, PromotionRecord,
+    check_holder, claimable, parse_time, Claimer, Error, Event, Held, PromotionRecord,
     PromotionSpec, RawEvent, RawPromotion, RawTask, Redaction, Status, Taken, Task, TaskSpec,
     LEASE_KINDS, PROMOTION_COLUMNS, TASK_COLUMNS,
 };
-use dm_core::Label;
 use rusqlite::{params, Connection, OptionalExtension, Row};
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -296,6 +295,23 @@ impl Db {
         Ok(true)
     }
 
+    /// The payloads of the events of one kind that are records and no task's, such as
+    /// approvals, oldest first: those under `key` when it is given, else all of them,
+    /// whatever their domain.
+    pub(crate) fn record_payloads(
+        &self,
+        kind: &str,
+        key: Option<&str>,
+    ) -> Result<Vec<String>, Error> {
+        let conn = self.conn();
+        let mut stmt = conn.prepare(
+            "SELECT payload FROM events
+             WHERE kind = ?1 AND (?2 IS NULL OR task_id = ?2) ORDER BY seq",
+        )?;
+        let rows = stmt.query_map(params![kind, key], |r| r.get(0))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
     /// Remove the why from an entry's promotion events and rows in one transaction, with
     /// the space they leave overwritten, then rebuild the file without that space and
     /// fold the log into it, so the old text is in neither. Returns how many records of
@@ -389,10 +405,8 @@ impl Db {
         &mut self,
         domain: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<Option<Taken>, Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -432,23 +446,15 @@ impl Db {
             found
         };
         for task in candidates {
-            if !claimable(&task, now, manifest, handling)
+            if !claimable(&task, now, who)
                 || !deps_complete(&tx, &task.spec.depends_on)?
                 || awaits_continuation(&tx, &task)?
+                || resumes_unsettled(&tx, &task)?
             {
                 continue;
             }
-            apply(
-                &tx,
-                &task.id,
-                now,
-                &Event::Claimed {
-                    holder: who.holder.to_string(),
-                    until,
-                    generation: task.generation + 1,
-                    attempt: who.attempt.map(str::to_string),
-                },
-            )?;
+            let claimed = who.claimed(until, task.generation + 1);
+            apply(&tx, &task.id, now, &claimed)?;
             tx.commit()?;
             return Ok(Some(Taken::New(task.id)));
         }
@@ -459,17 +465,16 @@ impl Db {
         &mut self,
         id: &str,
         now: OffsetDateTime,
-        who: Claimant<'_>,
+        who: Claimer<'_>,
         until: OffsetDateTime,
-        manifest: &[String],
-        handling: Label,
     ) -> Result<(), Error> {
         let mut conn = self.conn();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let task = get_in(&tx, id)?;
-        if !claimable(&task, now, manifest, handling)
+        if !claimable(&task, now, who)
             || !deps_complete(&tx, &task.spec.depends_on)?
             || awaits_continuation(&tx, &task)?
+            || resumes_unsettled(&tx, &task)?
         {
             return Err(Error::WrongState {
                 id: id.to_string(),
@@ -477,17 +482,7 @@ impl Db {
                 op: "claim",
             });
         }
-        apply(
-            &tx,
-            id,
-            now,
-            &Event::Claimed {
-                holder: who.holder.to_string(),
-                until,
-                generation: task.generation + 1,
-                attempt: who.attempt.map(str::to_string),
-            },
-        )?;
+        apply(&tx, id, now, &who.claimed(until, task.generation + 1))?;
         tx.commit()?;
         Ok(())
     }
@@ -562,8 +557,9 @@ impl Db {
 
     /// The rows of `domain` after sequence number `after`, in order, and before them the
     /// rows that say who held the tasks those are of. The events table is one for all
-    /// domains: a task's row names its domain, and a promotion names its own in its
-    /// payload, so every promotion after `after` is given and the caller keeps its own.
+    /// domains: a task's row names its domain, and a promotion, an approval or a record of
+    /// a task definition names its own in its payload, so each of those after `after` is
+    /// given and the caller keeps its own.
     pub(crate) fn events_after(&self, domain: &str, after: u64) -> Result<Vec<RawEvent>, Error> {
         let conn = self.conn();
         let mut stmt = conn.prepare(&format!(
@@ -571,7 +567,7 @@ impl Db {
              FROM events e LEFT JOIN tasks t ON t.id = e.task_id
              WHERE (e.seq > ?1 OR (e.kind IN ({LEASE_KINDS})
                     AND e.task_id IN (SELECT task_id FROM events WHERE seq > ?1)))
-               AND (t.domain = ?2 OR e.kind = 'promoted')
+               AND (t.domain = ?2 OR e.kind IN ('promoted', 'approved', 'definition'))
              ORDER BY e.seq"
         ))?;
         let after = i64::try_from(after).unwrap_or(i64::MAX);
@@ -822,6 +818,29 @@ fn awaits_continuation(conn: &Connection, task: &Task) -> Result<bool, Error> {
         .is_some())
 }
 
+/// Whether the work of `task` is held by an effect that nobody has settled: an effect of
+/// the task it continues or retries, however far up. Such an effect holds the work
+/// under each of its names, so the task is nobody's to claim.
+fn resumes_unsettled(conn: &Connection, task: &Task) -> Result<bool, Error> {
+    let mut seen = std::collections::HashSet::new();
+    let mut up = crate::resumed(task).map(str::to_string);
+    while let Some(id) = up.take() {
+        if !seen.insert(id.clone()) {
+            break;
+        }
+        let above = match get_in(conn, &id) {
+            Ok(t) => t,
+            Err(Error::NotFound(_)) => break,
+            Err(e) => return Err(e),
+        };
+        if !above.effects.is_empty() {
+            return Ok(true);
+        }
+        up = crate::resumed(&above).map(str::to_string);
+    }
+    Ok(false)
+}
+
 /// Append the event and project it, in the caller's transaction.
 fn apply(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Result<(), Error> {
     conn.execute(
@@ -891,8 +910,8 @@ fn insert_promotion(
     Ok(())
 }
 
-/// The projection of the events that move a task between waiting and claimable, and of
-/// the two that only record something.
+/// The projection of the events that move a task between waiting and claimable, of the
+/// one that takes its pin off, and of those that only record something.
 fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
     let sql = match event {
         Event::Blocked { .. } => {
@@ -904,11 +923,42 @@ fn project_waiting(conn: &Connection, id: &str, event: &Event) -> Result<(), Err
         Event::Retriaged { .. } => {
             "UPDATE tasks SET status = 'proposed' WHERE id = ?1 AND status IN ('open', 'blocked')"
         }
-        // the record that someone tried, spoke after its claim, or judged the result: nothing
-        // of the task moves
+        // the pin leaves the row, so a replay leaves the task unpinned too. A row with
+        // no `extra` holds no pin
+        Event::Unpinned { .. } => {
+            "UPDATE tasks SET extra = json_remove(extra, '$.position', '$.pin_reason')
+             WHERE id = ?1 AND extra IS NOT NULL AND extra != ''"
+        }
+        // the record that someone tried, or spoke after its claim, or judged the result,
+        // or approved an action, or of what a task definition earned: no task moves
         _ => return Ok(()),
     };
     conn.execute(sql, params![id])?;
+    Ok(())
+}
+
+/// The projection of the events that hold a task back from a claim, or stop doing so:
+/// what it waits on and which effects are not settled live in `extra`.
+fn project_hold(conn: &Connection, id: &str, event: &Event) -> Result<(), Error> {
+    let extra: Option<String> = conn
+        .query_row("SELECT extra FROM tasks WHERE id = ?1", params![id], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .flatten();
+    if let Some(next) = crate::extra_after(id, extra.as_deref(), event)? {
+        conn.execute(
+            "UPDATE tasks SET extra = ?2 WHERE id = ?1",
+            params![id, next],
+        )?;
+    }
+    if matches!(event, Event::Waiting { .. }) {
+        conn.execute(
+            "UPDATE tasks SET status = 'blocked', holder = NULL, lease_until = NULL
+             WHERE id = ?1",
+            params![id],
+        )?;
+    }
     Ok(())
 }
 
@@ -926,9 +976,12 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
         Event::Blocked { .. }
         | Event::Unblocked { .. }
         | Event::Retriaged { .. }
+        | Event::Unpinned { .. }
         | Event::ClaimRefused { .. }
         | Event::LateHandoff { .. }
-        | Event::Outcome { .. } => project_waiting(conn, id, event)?,
+        | Event::Outcome { .. }
+        | Event::Approved(_)
+        | Event::Definition(_) => project_waiting(conn, id, event)?,
         Event::Claimed { holder, until, .. } => {
             conn.execute(
                 "UPDATE tasks SET status = 'claimed', holder = ?2, lease_until = ?3,
@@ -972,6 +1025,10 @@ fn project(conn: &Connection, id: &str, at: OffsetDateTime, event: &Event) -> Re
                 params![id, reason, superseded_by],
             )?;
         }
+        Event::Waiting { .. }
+        | Event::Arrived { .. }
+        | Event::EffectBegun { .. }
+        | Event::EffectSettled { .. } => project_hold(conn, id, event)?,
         Event::Posted { to } => {
             conn.execute(
                 "UPDATE tasks SET posted_to = ?2 WHERE id = ?1",

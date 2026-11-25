@@ -18,7 +18,9 @@
 //! the default `model` is read. An artifact is loaded only from an active entry a person
 //! verified, as a policy entry is enforced only once verified, so an agent cannot write
 //! the instructions the next agent runs under; the newest verified one wins. Everything
-//! else in the domain is listed, with why it is not loaded.
+//! else in the domain is listed, with why it is not loaded. One more kind is a record
+//! and is never loaded: a `scorecard`, JSON, the result of an evaluation
+//! ([`crate::evaluation`]).
 
 use crate::{Error, Memory};
 use dm_core::{Entry, TrustTier};
@@ -27,18 +29,7 @@ use serde::Serialize;
 /// The kinds of artifact the launcher reads.
 pub const KINDS: &[&str] = &["agent", "template", "eval", "harness", "task"];
 
-/// What a completion of a task needs before it counts.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Autonomy {
-    /// A person's verdict. Where every definition starts.
-    #[default]
-    Person,
-    /// A review by a session on another model than the author's.
-    Review,
-    /// The acceptance checks alone.
-    Checks,
-}
+pub use dm_ledger::Autonomy;
 
 /// A task definition: the record for one kind of work. A task names one, and what a
 /// session that claims the task may use comes from it.
@@ -73,7 +64,9 @@ pub struct TaskDefinition {
     /// What the work leaves behind.
     #[serde(default)]
     pub outputs: Vec<String>,
-    /// What a completion needs before it counts.
+    /// The highest autonomy level that the person who verified this text lets the
+    /// definition earn. The level that a version has earned is state on the ledger
+    /// ([`Memory::autonomy`]), and every version starts at the lowest.
     #[serde(default)]
     pub autonomy: Autonomy,
 }
@@ -92,6 +85,15 @@ fn definition_in(e: &Entry, name: &str) -> Option<Result<TaskDefinition, ()>> {
     if !e.is_active() || e.front.trust_tier != TrustTier::Verified {
         return None;
     }
+    definition_block(e, name)
+}
+
+/// The definition that the `platform task <name>` block of an entry gives, whatever the
+/// tier and the state of the entry: none when the entry has no such block, and an error
+/// when the block does not read as a definition. A definition is in force only from an
+/// active entry that a person verified ([`Memory::task_definition`]). A version that is
+/// not verified yet is read here to be graded, and for nothing else.
+pub(crate) fn definition_block(e: &Entry, name: &str) -> Option<Result<TaskDefinition, ()>> {
     let block = artifacts_in(e)
         .into_iter()
         .find(|a| a.kind == "task" && a.name == name)?;
@@ -196,6 +198,11 @@ pub fn artifacts_in(e: &Entry) -> Vec<Artifact> {
 
 /// Why an entry's artifacts are not loaded, if they are not.
 fn why_not(e: &Entry, kind: &str) -> Option<String> {
+    if kind == crate::evaluation::KIND {
+        return Some(
+            "a scorecard is a record of an evaluation; the launcher loads no scorecard".into(),
+        );
+    }
     if !KINDS.contains(&kind) {
         return Some(format!("{kind} is not a kind the launcher reads"));
     }
@@ -221,7 +228,9 @@ impl Memory {
             .filter(|d| self.grants.domains.contains_key(d))
     }
 
-    async fn platform_entries(&self) -> Result<Vec<Entry>, Error> {
+    /// Every entry of the platform's domain, as the record holds it, whatever its tier
+    /// and its state.
+    pub(crate) async fn platform_entries(&self) -> Result<Vec<Entry>, Error> {
         let Some(domain) = self.platform_domain() else {
             return Ok(Vec::new());
         };
@@ -365,31 +374,7 @@ impl Memory {
         let Some(named) = spec.definition.clone() else {
             return Ok(());
         };
-        let name = definition_name(&named);
-        let none = || {
-            Error::Denied(format!(
-                "no task definition {name} is in force: a verified entry of the platform's domain defines one"
-            ))
-        };
-        let Some(entry) = self.pinned_entry(&named).await? else {
-            return Err(none());
-        };
-        // under the filter every read is under, and before anything of the entry is told
-        let filter = self.session_filter()?;
-        let seen = self.index.lock().await.meta(&entry.front.id, &filter)?;
-        if seen.is_none() {
-            return Err(none());
-        }
-        let Some(Ok(def)) = definition_in(&entry, name) else {
-            return Err(unreadable(name));
-        };
-        // binding reads the entry that holds the definition
-        self.observe_entry(
-            &entry.front.domain,
-            &entry.front.id,
-            def.classification,
-            crate::reach::outside_content(&entry),
-        )?;
+        let def = self.readable_definition(&named).await?;
         spec.definition = Some(def.reference());
         spec.classification = spec.classification.max(def.classification);
         if spec.acceptance.is_empty() {
@@ -401,6 +386,43 @@ impl Memory {
             }
         }
         Ok(())
+    }
+
+    /// The definition that `named` names, as a bare name or as `<name>@<entry>`, for
+    /// this session: it must be in force, and the session must be one that may read its
+    /// entry. The session has then read the entry, and its label is no lower.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Denied`], as [`Memory::bind_definition`] gives it.
+    pub(crate) async fn readable_definition(&self, named: &str) -> Result<TaskDefinition, Error> {
+        let name = definition_name(named);
+        let none = || {
+            Error::Denied(format!(
+                "no task definition {name} is in force: a verified entry of the platform's domain defines one"
+            ))
+        };
+        let Some(entry) = self.pinned_entry(named).await? else {
+            return Err(none());
+        };
+        // under the filter the grants and the policy give, and before anything of the
+        // entry is told. Filing a task is a write: the session's settings do not narrow it
+        let filter = self.chained_filter()?;
+        let seen = self.index.lock().await.meta(&entry.front.id, &filter)?;
+        if seen.is_none() {
+            return Err(none());
+        }
+        let Some(Ok(def)) = definition_in(&entry, name) else {
+            return Err(unreadable(name));
+        };
+        // the session reads the entry that holds the definition
+        self.observe_entry(
+            &entry.front.domain,
+            &entry.front.id,
+            def.classification,
+            crate::reach::outside_content(&entry),
+        )?;
+        Ok(def)
     }
 
     /// Why triage does not admit a task on its own, when what it lacks is a definition
@@ -453,7 +475,7 @@ impl Memory {
             return Ok(());
         };
         let task = self.ledger.lock().await.get(&held).await?;
-        let Some(named) = task.spec.definition else {
+        let Some(named) = task.spec.definition.clone() else {
             return Ok(());
         };
         let Some(def) = self.pinned_definition(&named).await? else {
@@ -464,16 +486,24 @@ impl Memory {
         if def.tools.iter().any(|t| t == &format!("tool:{tool}")) {
             Ok(())
         } else {
-            Err(Error::Denied(format!(
-                "the task definition {named} does not declare tool:{tool}; a task reaches only the tools its definition declares"
-            )))
+            Err(self.refusal(
+                "tool",
+                &task.spec.domain,
+                format!(
+                    "the task definition {named} does not declare tool:{tool}; a task reaches only the tools its definition declares"
+                ),
+            ))
         }
     }
 
     /// What this session can do, as the ledger matches it to a task's requirements: the
-    /// manifest it was given, and each tool the grants give it.
-    #[must_use]
-    pub(crate) fn capabilities(&self) -> Vec<String> {
+    /// manifest it was given, and each tool the grants give it. A session that fills a
+    /// position presents no tool outside the position's authority envelope.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Stale`] when the position changed after this session filled it.
+    pub(crate) fn capabilities(&self) -> Result<Vec<String>, Error> {
         let mut all = self.manifest.clone();
         for (name, tap) in &self.grants.taps {
             let tool = format!("tool:{name}");
@@ -481,12 +511,13 @@ impl Memory {
                 all.push(tool);
             }
         }
-        all
+        self.narrow_to_envelope(&mut all)?;
+        Ok(all)
     }
 }
 
 /// The refusal for a block that is no task definition: its name, and nothing of its text.
-fn unreadable(name: &str) -> Error {
+pub(crate) fn unreadable(name: &str) -> Error {
     Error::Denied(format!(
         "the task definition {name} does not read as one: it has a key this code does not know, or a tool that is not `tool:<name>`"
     ))
@@ -495,6 +526,7 @@ fn unreadable(name: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{root, verify, written};
     use crate::WriteRequest;
 
     const BODY: &str = "# Claude here\n\nHow Claude works in this repository.\n\n\
@@ -502,38 +534,6 @@ mod tests {
 ```toml\nnot = \"an artifact\"\n```\n\n\
 ```platform harness claude\n{\"model\": \"claude-opus-5-5\"}\n```\n\n\
 ```platform eval unterminated\nnever closed\n";
-
-    /// A root whose platform is `dom-plat`, beside the owner's `dom-me`.
-    fn root(dir: &std::path::Path) -> Memory {
-        Memory::init(dir, "human:test:me", "dom-me").unwrap();
-        let path = dir.join(crate::GRANTS_FILE);
-        let mut g = dm_policy::Grants::load(&path).unwrap();
-        let d = g.domains["dom-me"].clone();
-        g.domains.insert("dom-plat".into(), d);
-        g.platform = Some("dom-plat".into());
-        std::fs::write(&path, g.render().unwrap()).unwrap();
-        Memory::open(dir).unwrap()
-    }
-
-    async fn written(m: &Memory, body: &str, verified: bool) -> String {
-        let id = m
-            .write(WriteRequest {
-                body: body.into(),
-                domain: Some("dom-plat".into()),
-                entry_type: dm_core::EntryType::Convention,
-                ..WriteRequest::default()
-            })
-            .await
-            .unwrap()
-            .id;
-        if verified {
-            // as a person other than its proposer would leave it
-            let mut e = m.store.get("dom-plat", &id).await.unwrap().unwrap();
-            e.front.trust_tier = TrustTier::Verified;
-            m.store.put(&e).await.unwrap();
-        }
-        id
-    }
 
     #[test]
     fn artifacts_are_the_platform_blocks_closed_in_the_body() {
@@ -622,12 +622,6 @@ mod tests {
             definition: definition.map(str::to_string),
             ..dm_ledger::TaskSpec::default()
         }
-    }
-
-    async fn verify(m: &Memory, id: &str) {
-        let mut e = m.store.get("dom-plat", id).await.unwrap().unwrap();
-        e.front.trust_tier = TrustTier::Verified;
-        m.store.put(&e).await.unwrap();
     }
 
     /// A session of this root that holds `id`.
@@ -842,6 +836,12 @@ mod tests {
             matches!(&undeclared, Err(Error::Denied(why)) if why.contains("does not declare tool:search")),
             "{undeclared:?}"
         );
+        // the refusal is a line of the decision log, so repeated ones count as probing
+        let logged = crate::testing::refused_actions(dir.path(), on_defined.author());
+        assert!(
+            logged.iter().any(|(action, _)| action == "tool"),
+            "{logged:?}"
+        );
         let declared = on_defined.use_tool("fetch", serde_json::json!({})).await;
         assert!(
             matches!(&declared, Err(Error::Denied(why)) if why.contains("no tool fetch is granted")),
@@ -914,7 +914,7 @@ mod tests {
         let m = Memory::open(dir.path())
             .unwrap()
             .with_manifest(vec!["human".into()]);
-        assert_eq!(m.capabilities(), ["human", "tool:fetch"]);
+        assert_eq!(m.capabilities().unwrap(), ["human", "tool:fetch"]);
         written(&m, REVIEW, true).await;
         // so a task that requires what its definition declares is one this session claims
         let t = m

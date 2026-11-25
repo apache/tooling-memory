@@ -104,11 +104,11 @@ pub async fn conventions(
     crate::json(&json!({ "failures": failures, "filed": filed, "already_filed": already }))
 }
 
-/// `amem task outcome`.
+/// `amem task outcome --kind`: an outcome event.
 pub async fn record_outcome(m: &Memory, task: &str, kind: &str, note: &str) -> Fallible {
     let kind =
         OutcomeKind::parse(kind).ok_or("--kind: accepted, corrected, rejected or reverted")?;
-    crate::json(&json!({ "outcomes": m.record_outcome(task, kind, note).await? }))
+    crate::json(&json!({ "outcomes": m.record_outcome_event(task, kind, note).await? }))
 }
 
 /// `amem task outcomes`.
